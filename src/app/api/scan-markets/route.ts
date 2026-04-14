@@ -13,17 +13,24 @@
  */
 
 import { NextResponse } from "next/server";
-import { fetchAllWeatherMarkets } from "@/lib/polymarket/gamma-api";
+import { fetchAllWeatherMarkets, fetchStockMarkets } from "@/lib/polymarket/gamma-api";
 import { fetchForecastForStation } from "@/lib/data-sources/weather-sources";
+import {
+  fetchStockData,
+  fetchPreMarketData,
+  calculateTechnicals,
+} from "@/lib/data-sources/finance-sources";
 import { analyzeMarket } from "@/lib/agents/weather-agent";
+import { analyzeStockMarket } from "@/lib/agents/finance-agent";
 import { sendDiscordNotification } from "@/lib/utils/discord";
 import { calculateHalfKelly, BANKROLL } from "@/lib/utils/kelly";
 import {
   saveOpportunity,
   getRecentOpportunities,
   incrementDailyOpportunities,
+  savePaperTrade,
 } from "@/lib/db/supabase";
-import type { WeatherMarket } from "@/lib/polymarket/gamma-api";
+import type { WeatherMarket, StockMarket } from "@/lib/polymarket/gamma-api";
 import type { Outcome } from "@/types";
 
 // ---------------------------------------------------------------------------
@@ -43,12 +50,14 @@ interface OpportunityResult {
   multiplier: number;
   suggestedBet: number;
   confidence: "high" | "medium" | "low" | undefined;
+  agent: "weather" | "finance";
 }
 
 interface SkippedMarket {
   marketId: string;
   question: string;
   reason: string;
+  agent: "weather" | "finance";
 }
 
 interface ScanResult {
@@ -56,6 +65,7 @@ interface ScanResult {
   total_markets: number;
   opportunities: OpportunityResult[];
   saved_to_db: number;
+  paper_trades_logged: number;
   skipped: SkippedMarket[];
   errors: { marketId: string; question: string; error: string }[];
 }
@@ -73,25 +83,47 @@ function hasStrongConsensus(market: WeatherMarket): boolean {
 }
 
 function outcomeToResult(
-  market: WeatherMarket,
+  base: { id: string; question: string; city: string; stationCode: string; targetDate: string },
   o: Outcome,
+  agent: "weather" | "finance",
   confidenceLevel?: "high" | "medium" | "low"
 ): OpportunityResult {
   const kelly = calculateHalfKelly(o.estimatedProbability, o.marketPrice, BANKROLL);
 
   return {
-    marketId: market.id,
-    question: market.question,
-    city: market.city,
-    stationCode: market.stationCode,
-    targetDate: market.targetDate.toISOString().slice(0, 10),
-    outcome: o.outcome,
-    marketPrice: round(o.marketPrice, 4),
+    marketId:             base.id,
+    question:             base.question,
+    city:                 base.city,
+    stationCode:          base.stationCode,
+    targetDate:           base.targetDate,
+    outcome:              o.outcome,
+    marketPrice:          round(o.marketPrice, 4),
     estimatedProbability: round(o.estimatedProbability, 4),
-    edge: round(o.edge, 4),
-    multiplier: round(o.multiplier, 2),
-    suggestedBet: kelly.betAmount,
-    confidence: confidenceLevel,
+    edge:                 round(o.edge, 4),
+    multiplier:           round(o.multiplier, 2),
+    suggestedBet:         kelly.betAmount,
+    confidence:           confidenceLevel,
+    agent,
+  };
+}
+
+function weatherBase(market: WeatherMarket) {
+  return {
+    id:          market.id,
+    question:    market.question,
+    city:        market.city,
+    stationCode: market.stationCode,
+    targetDate:  market.targetDate.toISOString().slice(0, 10),
+  };
+}
+
+function stockBase(market: StockMarket) {
+  return {
+    id:          market.id,
+    question:    market.question,
+    city:        market.ticker,
+    stationCode: market.ticker,
+    targetDate:  market.endDate.toISOString().slice(0, 10),
   };
 }
 
@@ -126,6 +158,7 @@ export async function GET(): Promise<NextResponse<ScanResult>> {
         total_markets: 0,
         opportunities: [],
         saved_to_db: 0,
+        paper_trades_logged: 0,
         skipped: [],
         errors: [{ marketId: "N/A", question: "N/A", error: msg }],
       },
@@ -142,7 +175,7 @@ export async function GET(): Promise<NextResponse<ScanResult>> {
       const dominant = market.outcomePrices.reduce((max, p) => Math.max(max, p), 0);
       const reason = `Consensus fort — prix dominant ${round(dominant * 100, 1)}%`;
       console.log(`${tag} ⏭ Ignoré : ${reason} — "${market.question}"`);
-      skipped.push({ marketId: market.id, question: market.question, reason });
+      skipped.push({ marketId: market.id, question: market.question, reason, agent: "weather" });
       continue;
     }
 
@@ -170,7 +203,7 @@ export async function GET(): Promise<NextResponse<ScanResult>> {
     } else {
       for (const opp of marketOpportunities) {
         const pct = (opp.edge * 100).toFixed(2);
-        const result = outcomeToResult(market, opp, forecast.confidenceLevel);
+        const result = outcomeToResult(weatherBase(market), opp, "weather", forecast.confidenceLevel);
         console.log(
           `${tag} ✅ OPPORTUNITÉ — outcome="${opp.outcome}"  ` +
             `marketPrice=${round(opp.marketPrice * 100, 1)}%  ` +
@@ -183,11 +216,71 @@ export async function GET(): Promise<NextResponse<ScanResult>> {
     }
   }
 
+  // ── Finance Agent ────────────────────────────────────────────────────────
+
+  let stockMarkets: StockMarket[] = [];
+  try {
+    stockMarkets = await fetchStockMarkets();
+    console.log(`[scan-markets] ${stockMarkets.length} marchés finance récupérés depuis Gamma`);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(`[scan-markets] ✗ Échec fetchStockMarkets : ${msg}`);
+  }
+
+  for (const market of stockMarkets) {
+    const tag = `[scan-markets][finance][${market.ticker}][${market.id.slice(0, 8)}]`;
+
+    if (market.outcomePrices.some((p) => p >= 0.9)) {
+      const dominant = market.outcomePrices.reduce((max, p) => Math.max(max, p), 0);
+      const reason = `Consensus fort — prix dominant ${round(dominant * 100, 1)}%`;
+      skipped.push({ marketId: market.id, question: market.question, reason, agent: "finance" });
+      continue;
+    }
+
+    let stockData, preMarket, technicals;
+    try {
+      [stockData, preMarket] = await Promise.all([
+        fetchStockData(market.ticker),
+        fetchPreMarketData(market.ticker),
+      ]);
+      technicals = calculateTechnicals(stockData.priceHistory);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`${tag} ✗ Erreur données finance : ${msg}`);
+      errors.push({ marketId: market.id, question: market.question, error: msg });
+      continue;
+    }
+
+    const marketOpportunities = analyzeStockMarket(market, stockData, preMarket, technicals);
+
+    if (marketOpportunities.length === 0) {
+      console.log(`${tag} — Aucune opportunité — "${market.question}"`);
+    } else {
+      for (const opp of marketOpportunities) {
+        const pct    = (opp.edge * 100).toFixed(2);
+        const result = outcomeToResult(
+          stockBase(market),
+          opp,
+          "finance",
+          opp.estimatedProbability >= 0.70 ? "high" : "medium"
+        );
+        console.log(
+          `${tag} ✅ OPPORTUNITÉ — outcome="${opp.outcome}"  ` +
+          `marketPrice=${round(opp.marketPrice * 100, 1)}%  ` +
+          `estimated=${round(opp.estimatedProbability * 100, 1)}%  ` +
+          `edge=+${pct}%  ½Kelly=$${result.suggestedBet.toFixed(2)}`
+        );
+        opportunities.push(result);
+      }
+    }
+  }
+
   // 3. Trier les opportunités par edge décroissant (meilleures en premier)
   opportunities.sort((a, b) => b.edge - a.edge);
 
   // 4. Persister dans Supabase — avec déduplication sur market_id + outcome
   let savedToDb = 0;
+  let paperTradesLogged = 0;
 
   if (opportunities.length > 0) {
     // 4a. Récupérer les opportunités déjà enregistrées dans les dernières 24h
@@ -242,6 +335,36 @@ export async function GET(): Promise<NextResponse<ScanResult>> {
           })
       );
 
+      // 4c. Paper trades — un par opportunité nouvelle, en parallèle des saves
+      const paperSaves = toSave.map((opp) => {
+        const potentialPnl = opp.marketPrice > 0
+          ? Math.round(opp.suggestedBet * (1 / opp.marketPrice - 1) * 100) / 100
+          : 0;
+        return savePaperTrade({
+          market_id:             opp.marketId,
+          question:              opp.question,
+          city:                  opp.city,
+          ticker:                opp.agent === "finance" ? opp.stationCode : null,
+          agent:                 opp.agent,
+          outcome:               opp.outcome,
+          market_price:          opp.marketPrice,
+          estimated_probability: opp.estimatedProbability,
+          edge:                  opp.edge,
+          suggested_bet:         opp.suggestedBet,
+          confidence:            opp.confidence ?? null,
+          resolution_date:       opp.targetDate,
+          potential_pnl:         potentialPnl,
+        })
+          .then(() => true as const)
+          .catch((err) => {
+            console.error(
+              `[scan-markets] ✗ Supabase savePaperTrade (${opp.marketId}/${opp.outcome}) :`,
+              err instanceof Error ? err.message : err
+            );
+            return false as const;
+          });
+      });
+
       const statsUpdate = incrementDailyOpportunities(toSave.length).catch((err) =>
         console.error(
           "[scan-markets] ✗ Supabase incrementDailyOpportunities :",
@@ -249,11 +372,16 @@ export async function GET(): Promise<NextResponse<ScanResult>> {
         )
       );
 
-      const results = await Promise.all([...saves, statsUpdate]);
-      savedToDb = (results as (boolean | void)[]).filter((r) => r === true).length;
+      const results = await Promise.all([...saves, ...paperSaves, statsUpdate]);
+      const boolResults = results as (boolean | void)[];
+      savedToDb         = boolResults.slice(0, saves.length).filter((r) => r === true).length;
+      paperTradesLogged = boolResults.slice(saves.length, saves.length + paperSaves.length).filter((r) => r === true).length;
 
       console.log(
         `[scan-markets] 💾 ${savedToDb}/${toSave.length} opportunité(s) sauvegardée(s) dans Supabase`
+      );
+      console.log(
+        `[scan-markets] 🃏 ${paperTradesLogged}/${toSave.length} paper trade(s) logué(s)`
       );
     }
   }
@@ -284,18 +412,21 @@ export async function GET(): Promise<NextResponse<ScanResult>> {
   }
 
   // 6. Résumé
+  const totalMarkets = markets.length + stockMarkets.length;
   const elapsed = Date.now() - startedAt.getTime();
   console.log(
     `[scan-markets] ■ Terminé en ${elapsed}ms — ` +
-      `${markets.length} marchés, ${opportunities.length} opportunités, ` +
+      `${markets.length} météo + ${stockMarkets.length} finance = ${totalMarkets} marchés, ` +
+      `${opportunities.length} opportunités, ${paperTradesLogged} paper trades, ` +
       `${skipped.length} ignorés, ${errors.length} erreurs`
   );
 
   const result: ScanResult = {
     scannedAt: startedAt.toISOString(),
-    total_markets: markets.length,
+    total_markets: totalMarkets,
     opportunities,
     saved_to_db: savedToDb,
+    paper_trades_logged: paperTradesLogged,
     skipped,
     errors,
   };

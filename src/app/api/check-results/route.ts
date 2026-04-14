@@ -20,7 +20,10 @@ import {
   getPendingOpportunities,
   updateOpportunityResult,
   updateDailyResultStats,
+  getPendingPaperTrades,
+  resolvePaperTrade,
   type OpportunityRow,
+  type PaperTradeRow,
 }                                        from "@/lib/db/supabase";
 import { calculateHalfKelly, BANKROLL }  from "@/lib/utils/kelly";
 import { sendResultsSummary, type ResultDetail } from "@/lib/utils/discord";
@@ -49,6 +52,15 @@ interface CheckDetail {
   pnl: number;
 }
 
+interface PaperTradeResolved {
+  id: string;
+  agent: string;
+  outcome: string;
+  actualResult: string;
+  won: boolean;
+  pnl: number;
+}
+
 interface CheckSummary {
   checkedAt: string;
   checked: number;
@@ -58,6 +70,9 @@ interface CheckSummary {
   winRate: number;
   totalPnL: number;
   details: CheckDetail[];
+  paper_trades_resolved: number;
+  paper_trades_wins: number;
+  paper_trades_pnl: number;
   errors: { id: string; question: string | null; error: string }[];
 }
 
@@ -272,6 +287,7 @@ export async function GET(): Promise<NextResponse<CheckSummary>> {
         checkedAt: checkedAt.toISOString(),
         checked: 0, wins: 0, losses: 0, skipped: 0,
         winRate: 0, totalPnL: 0, details: [],
+        paper_trades_resolved: 0, paper_trades_wins: 0, paper_trades_pnl: 0,
         errors: [{ id: "N/A", question: null, error: msg }],
       },
       { status: 502 }
@@ -373,6 +389,75 @@ export async function GET(): Promise<NextResponse<CheckSummary>> {
     );
   }
 
+  // 7b. Résoudre les paper trades en attente
+  const paperResolved: PaperTradeResolved[] = [];
+  let pendingPaperTrades: PaperTradeRow[] = [];
+
+  try {
+    pendingPaperTrades = await getPendingPaperTrades();
+    console.log(`[check-results] ${pendingPaperTrades.length} paper trade(s) à résoudre`);
+  } catch (err) {
+    console.error(
+      "[check-results] ✗ getPendingPaperTrades :",
+      err instanceof Error ? err.message : err
+    );
+  }
+
+  for (const trade of pendingPaperTrades) {
+    const tag = `[check-results][paper][${trade.agent}][${trade.id.slice(0, 8)}]`;
+
+    if (trade.agent === "weather") {
+      if (!trade.city) {
+        console.warn(`${tag} Pas de city — ignoré`);
+        continue;
+      }
+
+      const question   = trade.question ?? "";
+      const targetDate = trade.resolution_date ?? parseDateFromQuestion(question, trade.created_at);
+      const unit       = detectUnit(trade.outcome);
+
+      let highC: number, lowC: number;
+      try {
+        ({ highC, lowC } = await fetchActualTemperature(trade.city, targetDate));
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error(`${tag} ✗ fetchActualTemperature : ${msg}`);
+        errors.push({ id: trade.id, question, error: msg });
+        continue;
+      }
+
+      const actual     = selectTemp(trade.outcome, highC, lowC, unit);
+      const result     = resolveOutcome(trade.outcome, actual, question);
+      const won        = result === "WIN";
+      const { pnl }    = computePnl(result, trade.market_price, trade.estimated_probability);
+      const actualStr  = `high=${highC.toFixed(1)}°C low=${lowC.toFixed(1)}°C actual=${actual.toFixed(1)}°${unit}`;
+
+      console.log(`${tag} ${result} — outcome="${trade.outcome}"  ${actualStr}  pnl=${pnl >= 0 ? "+" : ""}${pnl.toFixed(2)}`);
+
+      try {
+        await resolvePaperTrade(trade.id, actualStr, won, pnl);
+        paperResolved.push({ id: trade.id, agent: trade.agent, outcome: trade.outcome, actualResult: actualStr, won, pnl });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error(`${tag} ✗ resolvePaperTrade : ${msg}`);
+        errors.push({ id: trade.id, question, error: msg });
+      }
+
+    } else if (trade.agent === "finance") {
+      // Finance paper trades: skip resolution (requires live stock data not available in archive)
+      console.log(`${tag} Finance paper trade — résolution manuelle requise, ignoré`);
+    }
+  }
+
+  if (paperResolved.length > 0) {
+    const paperWins = paperResolved.filter((p) => p.won).length;
+    const paperPnl  = Math.round(paperResolved.reduce((s, p) => s + p.pnl, 0) * 100) / 100;
+    console.log(
+      `[check-results] 🃏 ${paperResolved.length} paper trade(s) résolus — ` +
+      `${paperWins}W / ${paperResolved.length - paperWins}L  P&L ${paperPnl >= 0 ? "+" : ""}${paperPnl.toFixed(2)}`
+    );
+  }
+
   // 8. Notification Discord (fire-and-forget)
   if (checked > 0) {
     const discordDetails: ResultDetail[] = details.map((d) => ({
@@ -411,6 +496,9 @@ export async function GET(): Promise<NextResponse<CheckSummary>> {
     winRate:  Math.round(winRate * 1000) / 1000,
     totalPnL,
     details,
+    paper_trades_resolved: paperResolved.length,
+    paper_trades_wins:     paperResolved.filter((p) => p.won).length,
+    paper_trades_pnl:      Math.round(paperResolved.reduce((s, p) => s + p.pnl, 0) * 100) / 100,
     errors,
   });
 }

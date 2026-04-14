@@ -441,6 +441,174 @@ export async function fetchAllWeatherMarkets(): Promise<WeatherMarket[]> {
 }
 
 // ---------------------------------------------------------------------------
+// StockMarket — type public pour les marchés finance
+// ---------------------------------------------------------------------------
+
+/**
+ * Marché Polymarket de type stock (ex: "Will AAPL close higher on April 15?").
+ * Étend Market avec le ticker boursier et la direction prédite.
+ */
+export interface StockMarket extends Market {
+  /** Ticker boursier extrait de la question, ex: "AAPL". */
+  ticker: string;
+  /** Direction implicite du marché : "up", "down" ou "unknown". */
+  direction: "up" | "down" | "unknown";
+}
+
+// ---------------------------------------------------------------------------
+// fetchStockMarkets — /events?tag_slug=stocks
+// ---------------------------------------------------------------------------
+
+/** Mots anglais en majuscules courants à ignorer lors du parsing du ticker. */
+const TICKER_SKIP = new Set([
+  "WILL", "THE", "ON", "AT", "UP", "DOWN", "OR", "AND", "FOR", "IN", "BY",
+  "IS", "IT", "TO", "BE", "AS", "AN", "IF", "OF", "DO", "SO", "NO", "YES",
+  "CAN", "MAY", "HAS", "ITS", "ETF", "IPO", "CEO", "CFO",
+]);
+
+/**
+ * Extrait le ticker boursier depuis la question d'un event Polymarket.
+ * Priorité :
+ *   1. Ticker entre parenthèses — ex: "Tesla (TSLA) close…" → "TSLA"
+ *   2. Premier mot majuscule 2–5 lettres hors mots courants
+ */
+function extractTicker(question: string): string | null {
+  const parenM = question.match(/\(([A-Z]{1,5})\)/);
+  if (parenM) return parenM[1];
+
+  const words = question.match(/\b[A-Z]{2,5}\b/g);
+  if (words) {
+    return words.find((w) => !TICKER_SKIP.has(w)) ?? null;
+  }
+  return null;
+}
+
+/**
+ * Déduit la direction (up/down) depuis la question.
+ * Ex: "close higher" / "end up" → "up" ; "close lower" / "end down" → "down".
+ */
+function extractDirection(question: string): "up" | "down" | "unknown" {
+  const q = question.toLowerCase();
+  if (/higher|above|gain|up|rise|rally|bull/i.test(q)) return "up";
+  if (/lower|below|drop|down|fall|decline|bear/i.test(q)) return "down";
+  return "unknown";
+}
+
+/**
+ * Récupère les marchés financiers (stocks) actifs pour aujourd'hui et demain.
+ *
+ *   GET /events?tag_slug=stocks&active=true&closed=false&order=endDate&ascending=true&limit=100
+ *
+ * Tente aussi tag_slug=finance en parallèle pour maximiser la couverture.
+ * Filtre strict en JS sur la date (identique à fetchRealMarkets).
+ */
+export async function fetchStockMarkets(): Promise<StockMarket[]> {
+  const startTime = Date.now();
+  const nowUtc    = new Date();
+  const today     = nowUtc.toISOString().split("T")[0];
+  const tomorrow  = new Date(nowUtc.getTime() + 86_400_000).toISOString().split("T")[0];
+
+  console.log(`[gamma-api] fetchStockMarkets — today=${today} tomorrow=${tomorrow}`);
+
+  // Fetch les deux tags en parallèle
+  const tags = ["stocks", "finance"] as const;
+  const fetchTag = async (tag: string): Promise<GammaEvent[]> => {
+    const url =
+      `${GAMMA_BASE}/events?tag_slug=${tag}&active=true&closed=false` +
+      `&order=endDate&ascending=true&limit=100`;
+    try {
+      const res = await fetchWithRetry(url);
+      const raw: unknown = await res.json();
+      return Array.isArray(raw)
+        ? raw
+        : ((raw as Record<string, unknown>).data as GammaEvent[] | undefined) ?? [];
+    } catch (err) {
+      console.warn(
+        `[gamma-api] ⚠ tag_slug=${tag} indisponible :`,
+        err instanceof Error ? err.message : err
+      );
+      return [];
+    }
+  };
+
+  const [stockEvents, financeEvents] = await Promise.all([
+    fetchTag("stocks"),
+    fetchTag("finance"),
+  ]);
+
+  // Dédupliquer par id
+  const seen = new Set<string>();
+  const allEvents: GammaEvent[] = [];
+  for (const ev of [...stockEvents, ...financeEvents]) {
+    if (ev.id && !seen.has(ev.id)) {
+      seen.add(ev.id);
+      allEvents.push(ev);
+    }
+  }
+
+  console.log(`[gamma-api] fetchStockMarkets — ${allEvents.length} events bruts (stocks+finance)`);
+
+  // Filtre sur la date
+  const events = allEvents.filter((ev) => {
+    if (!ev.endDate) return false;
+    return ev.endDate.includes(today) || ev.endDate.includes(tomorrow);
+  });
+
+  console.log(`[gamma-api] fetchStockMarkets — ${events.length} events pour ${today}-${tomorrow}`);
+
+  const results: StockMarket[] = [];
+  const seenMarkets = new Set<string>();
+
+  for (const event of events) {
+    const title    = event.title ?? "";
+    const endDateStr = event.endDate ?? "";
+    const ticker   = extractTicker(title);
+    const direction = extractDirection(title);
+
+    if (!ticker) {
+      console.log(`[gamma-api] ⏭ Ticker introuvable : "${title.slice(0, 60)}" — ignoré`);
+      continue;
+    }
+
+    const markets = event.markets ?? [];
+    if (markets.length === 0) continue;
+
+    for (const m of markets) {
+      if (seenMarkets.has(m.id)) continue;
+      seenMarkets.add(m.id);
+
+      const outcomes     = parseJsonField<string>(m.outcomes);
+      const rawPrices    = parseJsonField<string>(m.outcomePrices);
+      const outcomePrices = rawPrices.map(Number);
+
+      if (outcomes.length === 0 || outcomes.length !== outcomePrices.length) continue;
+
+      results.push({
+        id:           m.id,
+        question:     m.question ?? title,
+        slug:         m.slug ?? event.slug ?? m.id,
+        category:     "finance",
+        outcomes,
+        outcomePrices,
+        volume:       parseFloat(toNumberStr(m.volume)),
+        liquidity:    parseFloat(toNumberStr(m.liquidity)),
+        endDate:      new Date(m.endDate ?? endDateStr),
+        ticker,
+        direction,
+      });
+
+      console.log(
+        `[gamma-api] ✓ ${ticker} (${direction}) — "${(m.question ?? title).slice(0, 70)}"`
+      );
+    }
+  }
+
+  const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+  console.log(`[gamma-api] fetchStockMarkets — ${results.length} marchés finance (${elapsed}s)`);
+  return results;
+}
+
+// ---------------------------------------------------------------------------
 // parseMarketRules — export public (utilisé par les tests et le mock)
 // ---------------------------------------------------------------------------
 

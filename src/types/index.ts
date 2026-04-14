@@ -38,6 +38,8 @@ export interface Outcome {
   edge: number;
   /** Multiplicateur de gain potentiel = 1 / marketPrice. */
   multiplier: number;
+  /** Agent ayant produit cet outcome. */
+  agent?: "weather" | "finance";
 }
 
 /** Recommandation de pari émise par un agent spécialisé. */

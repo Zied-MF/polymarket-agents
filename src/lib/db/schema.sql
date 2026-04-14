@@ -80,3 +80,36 @@ CREATE TABLE IF NOT EXISTS daily_stats (
 );
 
 CREATE INDEX IF NOT EXISTS daily_stats_date_idx ON daily_stats (date DESC);
+
+-- ------------------------------------------------------------
+-- Paper trades — bets virtuels pour backtesting / paper mode
+-- Chaque ligne = un bet virtuel sur une opportunité détectée.
+-- resolved quand won IS NOT NULL.
+-- ------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS paper_trades (
+  id                    UUID         DEFAULT gen_random_uuid() PRIMARY KEY,
+  market_id             TEXT         NOT NULL,
+  question              TEXT,
+  city                  TEXT,
+  ticker                TEXT,
+  agent                 TEXT         NOT NULL CHECK (agent IN ('weather', 'finance')),
+  outcome               TEXT         NOT NULL,
+  market_price          DECIMAL      NOT NULL,
+  estimated_probability DECIMAL      NOT NULL,
+  edge                  DECIMAL      NOT NULL,
+  suggested_bet         DECIMAL      NOT NULL,
+  confidence            TEXT,
+  created_at            TIMESTAMPTZ  DEFAULT NOW(),
+  resolution_date       DATE,
+  -- Remplis par check-results lors de la résolution
+  actual_result         TEXT,        -- ex: "high=22.3°C" ou "close=+1.2%"
+  won                   BOOLEAN,
+  potential_pnl         DECIMAL,     -- gain potentiel si won (calculé à la création)
+  resolved_at           TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS paper_trades_market_id_idx   ON paper_trades (market_id);
+CREATE INDEX IF NOT EXISTS paper_trades_created_at_idx  ON paper_trades (created_at DESC);
+CREATE INDEX IF NOT EXISTS paper_trades_resolution_idx  ON paper_trades (resolution_date);
+CREATE INDEX IF NOT EXISTS paper_trades_agent_idx       ON paper_trades (agent);
+CREATE INDEX IF NOT EXISTS paper_trades_won_idx         ON paper_trades (won) WHERE won IS NULL;

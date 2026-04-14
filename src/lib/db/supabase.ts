@@ -95,6 +95,32 @@ export type SaveOpportunityInput = Omit<
   "id" | "detected_at" | "status" | "actual_result" | "pnl"
 >;
 
+export interface PaperTradeRow {
+  id: string;
+  market_id: string;
+  question: string | null;
+  city: string | null;
+  ticker: string | null;
+  agent: "weather" | "finance";
+  outcome: string;
+  market_price: number;
+  estimated_probability: number;
+  edge: number;
+  suggested_bet: number;
+  confidence: string | null;
+  created_at: string;
+  resolution_date: string | null;
+  actual_result: string | null;
+  won: boolean | null;
+  potential_pnl: number | null;
+  resolved_at: string | null;
+}
+
+export type SavePaperTradeInput = Omit<
+  PaperTradeRow,
+  "id" | "created_at" | "actual_result" | "won" | "resolved_at"
+>;
+
 export type SaveBetInput = {
   opportunity_id: string;
   amount: number;
@@ -365,6 +391,112 @@ export async function updateDailyResultStats(
     );
   }
 }
+
+// ---------------------------------------------------------------------------
+// Paper Trades
+// ---------------------------------------------------------------------------
+
+/**
+ * Persiste un paper trade (bet virtuel).
+ * Retourne la ligne insérée avec son UUID généré par la DB.
+ */
+export async function savePaperTrade(
+  input: SavePaperTradeInput
+): Promise<PaperTradeRow> {
+  const db = getClient();
+  return execute<PaperTradeRow>(
+    "savePaperTrade",
+    db
+      .from("paper_trades")
+      .insert({
+        market_id:             input.market_id,
+        question:              input.question,
+        city:                  input.city,
+        ticker:                input.ticker,
+        agent:                 input.agent,
+        outcome:               input.outcome,
+        market_price:          input.market_price,
+        estimated_probability: input.estimated_probability,
+        edge:                  input.edge,
+        suggested_bet:         input.suggested_bet,
+        confidence:            input.confidence,
+        resolution_date:       input.resolution_date,
+        potential_pnl:         input.potential_pnl,
+      })
+      .select()
+      .single()
+  );
+}
+
+/**
+ * Retourne les paper trades créés dans les derniers `days` jours.
+ * Passer `null` pour récupérer tous les trades sans filtre de date.
+ * Triés par created_at décroissant (les plus récents en premier).
+ */
+export async function getPaperTrades(days: number | null = 7): Promise<PaperTradeRow[]> {
+  const db = getClient();
+
+  let query = db
+    .from("paper_trades")
+    .select("*")
+    .order("created_at", { ascending: false });
+
+  if (days !== null) {
+    const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
+    query = query.gte("created_at", since);
+  }
+
+  const { data, error } = await query;
+  if (error) throw new Error(`[supabase][getPaperTrades] ${error.message}`);
+  return data ?? [];
+}
+
+/**
+ * Retourne les paper trades non résolus (won IS NULL) dont la resolution_date
+ * est passée (< aujourd'hui). Utilisé par check-results.
+ */
+export async function getPendingPaperTrades(): Promise<PaperTradeRow[]> {
+  const db = getClient();
+  const today = new Date().toISOString().split("T")[0];
+
+  const { data, error } = await db
+    .from("paper_trades")
+    .select("*")
+    .is("won", null)
+    .lt("resolution_date", today)
+    .order("resolution_date", { ascending: true });
+
+  if (error) throw new Error(`[supabase][getPendingPaperTrades] ${error.message}`);
+  return data ?? [];
+}
+
+/**
+ * Résout un paper trade après vérification du résultat réel.
+ * Met à jour actual_result, won, potential_pnl et resolved_at.
+ */
+export async function resolvePaperTrade(
+  id: string,
+  actualResult: string,
+  won: boolean,
+  pnl: number
+): Promise<void> {
+  const db = getClient();
+  const { error } = await db
+    .from("paper_trades")
+    .update({
+      actual_result: actualResult,
+      won,
+      potential_pnl: pnl,
+      resolved_at:   new Date().toISOString(),
+    })
+    .eq("id", id);
+
+  if (error) throw new Error(`[supabase][resolvePaperTrade] ${error.message}`);
+}
+
+// ---------------------------------------------------------------------------
+// Daily Stats
+// ---------------------------------------------------------------------------
 
 /**
  * Incrémente les compteurs de la ligne daily_stats du jour.

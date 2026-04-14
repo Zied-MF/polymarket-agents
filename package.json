@@ -9,9 +9,13 @@
     "lint": "eslint"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.88.0",
+    "@supabase/supabase-js": "^2.103.0",
     "next": "16.2.3",
+    "node-cron": "^4.2.1",
     "react": "19.2.4",
-    "react-dom": "19.2.4"
+    "react-dom": "19.2.4",
+    "viem": "^2.47.16"
   },
   "devDependencies": {
     "@tailwindcss/postcss": "^4",

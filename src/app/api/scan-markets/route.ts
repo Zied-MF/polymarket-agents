@@ -42,6 +42,7 @@ interface OpportunityResult {
   edge: number;
   multiplier: number;
   suggestedBet: number;
+  confidence: "high" | "medium" | "low" | undefined;
 }
 
 interface SkippedMarket {
@@ -71,7 +72,11 @@ function hasStrongConsensus(market: WeatherMarket): boolean {
   return market.outcomePrices.some((p) => p >= 0.9);
 }
 
-function outcomeToResult(market: WeatherMarket, o: Outcome): OpportunityResult {
+function outcomeToResult(
+  market: WeatherMarket,
+  o: Outcome,
+  confidenceLevel?: "high" | "medium" | "low"
+): OpportunityResult {
   const kelly = calculateHalfKelly(o.estimatedProbability, o.marketPrice, BANKROLL);
 
   return {
@@ -86,6 +91,7 @@ function outcomeToResult(market: WeatherMarket, o: Outcome): OpportunityResult {
     edge: round(o.edge, 4),
     multiplier: round(o.multiplier, 2),
     suggestedBet: kelly.betAmount,
+    confidence: confidenceLevel,
   };
 }
 
@@ -164,7 +170,7 @@ export async function GET(): Promise<NextResponse<ScanResult>> {
     } else {
       for (const opp of marketOpportunities) {
         const pct = (opp.edge * 100).toFixed(2);
-        const result = outcomeToResult(market, opp);
+        const result = outcomeToResult(market, opp, forecast.confidenceLevel);
         console.log(
           `${tag} ✅ OPPORTUNITÉ — outcome="${opp.outcome}"  ` +
             `marketPrice=${round(opp.marketPrice * 100, 1)}%  ` +

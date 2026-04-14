@@ -3,7 +3,8 @@
     "allow": [
       "Bash(npx tsc:*)",
       "Bash(pkill -f \"next dev\")",
-      "Bash(npm run:*)"
+      "Bash(npm run:*)",
+      "Bash(node -e \"const p = require\\('./package.json'\\); console.log\\(p.dependencies?.tailwindcss || p.devDependencies?.tailwindcss\\)\")"
     ]
   }
 }

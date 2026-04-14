@@ -1,0 +1,12 @@
+{
+  "crons": [
+    {
+      "path": "/api/scan-markets",
+      "schedule": "*/15 * * * *"
+    },
+    {
+      "path": "/api/check-results",
+      "schedule": "0 8 * * *"
+    }
+  ]
+}

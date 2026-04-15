@@ -436,6 +436,14 @@ async function fetchRealMarkets(): Promise<WeatherMarket[]> {
         continue;
       }
 
+      // Skip les marchés résolus ou invalides : tous les prix à 0 ou 1
+      if (outcomePrices.every((p) => p <= 0.01 || p >= 0.99)) {
+        console.log(
+          `[gamma-api] ⏭ Marché probablement résolu (tous les prix à 0 ou 1) : ${m.id} — ignoré`
+        );
+        continue;
+      }
+
       const market: WeatherMarket = {
         id:            m.id,
         question:      m.question ?? title,
@@ -635,6 +643,14 @@ export async function fetchStockMarkets(): Promise<StockMarket[]> {
       const outcomePrices = rawPrices.map(Number);
 
       if (outcomes.length === 0 || outcomes.length !== outcomePrices.length) continue;
+
+      // Skip les marchés résolus ou invalides : tous les prix à 0 ou 1
+      if (outcomePrices.every((p) => p <= 0.01 || p >= 0.99)) {
+        console.log(
+          `[gamma-api] ⏭ Marché finance probablement résolu (tous les prix à 0 ou 1) : ${m.id} — ignoré`
+        );
+        continue;
+      }
 
       results.push({
         id:           m.id,

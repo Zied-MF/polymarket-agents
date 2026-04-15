@@ -198,10 +198,26 @@ export function analyzeStockMarket(
     const label       = market.outcomes[i];
     const marketPrice = market.outcomePrices[i];
 
+    // Ignorer les prix invalides (marché résolu ou données corrompues)
+    if (marketPrice < 0.01 || marketPrice > 0.99) {
+      console.log(`[finance-agent] Skipping outcome with invalid price: ${marketPrice} — "${label}"`);
+      continue;
+    }
+
     const outcomeDir = resolveOutcomeDirection(label, market.direction);
     if (outcomeDir !== dominantDirection) continue;
 
     const edge = estimatedProbability - marketPrice;
+
+    // Edge > 50% : probablement une erreur de données, pas un signal réel
+    if (edge > 0.50) {
+      console.warn(
+        `[finance-agent] ${market.ticker}: Edge suspect (${(edge * 100).toFixed(1)}% > 50%) ` +
+        `pour "${label}" — ignoré`
+      );
+      continue;
+    }
+
     if (edge < MIN_EDGE) {
       console.log(
         `[finance-agent] ${market.ticker}: outcome="${label}" — edge=${(edge * 100).toFixed(2)}% < ${(MIN_EDGE * 100).toFixed(2)}% — skip`

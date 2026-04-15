@@ -170,7 +170,15 @@ export async function GET(): Promise<NextResponse<ScanResult>> {
   for (const market of markets) {
     const tag = `[scan-markets][${market.stationCode}][${market.id.slice(0, 8)}]`;
 
-    // 2a. Ignorer les marchés avec consensus fort (>90% sur un outcome)
+    // 2a. Ignorer les marchés avec liquidité insuffisante (< $100)
+    if (market.liquidity < 100) {
+      const reason = `Liquidité insuffisante — $${round(market.liquidity, 2)} < $100`;
+      console.log(`${tag} ⏭ Ignoré : ${reason} — "${market.question}"`);
+      skipped.push({ marketId: market.id, question: market.question, reason, agent: "weather" });
+      continue;
+    }
+
+    // 2b. Ignorer les marchés avec consensus fort (>90% sur un outcome)
     if (hasStrongConsensus(market)) {
       const dominant = market.outcomePrices.reduce((max, p) => Math.max(max, p), 0);
       const reason = `Consensus fort — prix dominant ${round(dominant * 100, 1)}%`;
@@ -179,7 +187,7 @@ export async function GET(): Promise<NextResponse<ScanResult>> {
       continue;
     }
 
-    // 2b. Récupérer la prévision météo
+    // 2c. Récupérer la prévision météo
     let forecast;
     try {
       forecast = await fetchForecastForStation(market.stationCode, market.targetDate);
@@ -204,7 +212,7 @@ export async function GET(): Promise<NextResponse<ScanResult>> {
         `confidence=${forecast.confidence}`
     );
 
-    // 2c. Analyser avec le Weather Agent
+    // 2d. Analyser avec le Weather Agent
     const marketOpportunities = analyzeMarket(market, forecast);
 
     if (marketOpportunities.length === 0) {
@@ -213,6 +221,10 @@ export async function GET(): Promise<NextResponse<ScanResult>> {
       for (const opp of marketOpportunities) {
         const pct = (opp.edge * 100).toFixed(2);
         const result = outcomeToResult(weatherBase(market), opp, "weather", forecast.confidenceLevel);
+        console.log(
+          `[scan-markets] Valid market: ${market.city} ${opp.outcome}, ` +
+            `price=${round(opp.marketPrice, 2)}, edge=${round(opp.edge, 2)}`
+        );
         console.log(
           `${tag} ✅ OPPORTUNITÉ — outcome="${opp.outcome}"  ` +
             `marketPrice=${round(opp.marketPrice * 100, 1)}%  ` +
@@ -238,6 +250,13 @@ export async function GET(): Promise<NextResponse<ScanResult>> {
 
   for (const market of stockMarkets) {
     const tag = `[scan-markets][finance][${market.ticker}][${market.id.slice(0, 8)}]`;
+
+    if (market.liquidity < 100) {
+      const reason = `Liquidité insuffisante — $${round(market.liquidity, 2)} < $100`;
+      console.log(`${tag} ⏭ Ignoré : ${reason} — "${market.question}"`);
+      skipped.push({ marketId: market.id, question: market.question, reason, agent: "finance" });
+      continue;
+    }
 
     if (market.outcomePrices.some((p) => p >= 0.9)) {
       const dominant = market.outcomePrices.reduce((max, p) => Math.max(max, p), 0);
@@ -267,6 +286,10 @@ export async function GET(): Promise<NextResponse<ScanResult>> {
     } else {
       for (const opp of marketOpportunities) {
         const pct    = (opp.edge * 100).toFixed(2);
+        console.log(
+          `[scan-markets] Valid market: ${market.ticker} ${opp.outcome}, ` +
+            `price=${round(opp.marketPrice, 2)}, edge=${round(opp.edge, 2)}`
+        );
         const result = outcomeToResult(
           stockBase(market),
           opp,

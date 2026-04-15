@@ -221,7 +221,7 @@ function PnLChart({ data }: { data: DailyPnL[] }) {
 // Tableau des trades
 // ---------------------------------------------------------------------------
 
-function TradeTable({ trades }: { trades: ResultsResponse["trades"] }) {
+function TradeTable({ trades }: { trades: ResultsResponse["recentTrades"] }) {
   return (
     <div className="overflow-x-auto rounded-xl border border-gray-800">
       <table className="w-full text-sm">

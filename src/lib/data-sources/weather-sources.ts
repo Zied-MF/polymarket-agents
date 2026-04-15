@@ -1,20 +1,18 @@
 /**
- * Sources météo - Open-Meteo multi-modèles
+ * Sources météo - Open-Meteo endpoint standard
  *
  * Expose deux fonctions publiques :
- *   - fetchForecast(lat, lon, date, timezone) : appelle Open-Meteo avec
- *     trois modèles (GFS, ECMWF, Icon) et retourne un WeatherForecast enrichi :
- *       • highTemp / lowTemp : moyenne des modèles disponibles (°C)
- *       • modelHighTemps     : températures max par modèle
- *       • modelSpread        : écart max entre modèles (°C)
- *       • dynamicSigma       : sigma calculé depuis spread + délai temporel
- *       • confidenceLevel    : "high" | "medium" | "low" selon spread
- *   - fetchForecastForStation(stationCode, date) : raccourci ICAO → coordonnées
+ *   - fetchForecast(lat, lon, date, timezone) : appelle Open-Meteo (endpoint
+ *     standard, pas multi-modèles) et retourne un WeatherForecast avec :
+ *       • highTemp / lowTemp  : températures du jour cible (°C)
+ *       • dynamicSigma        : sigma basé sur le délai de prévision
+ *       • confidenceLevel     : "high" (J+1) | "medium" (J+2) | "low" (J+3+)
+ *   - fetchForecastForStation(cityOrCode, date) : raccourci ICAO → coordonnées
  *
- * Sigma dynamique :
- *   spread = max(|GFS - ECMWF|, |GFS - Icon|, |ECMWF - Icon|)
- *   timeFactor : < 24h → 1.0 / < 48h → 1.5 / sinon → 2.0
- *   sigma = max(1.5, spread / 2 + timeFactor)
+ * Sigma simplifié (sans multi-modèles) :
+ *   J+1 (demain)  → sigma = 1.5°C, confidence = "high"
+ *   J+2           → sigma = 2.5°C, confidence = "medium"
+ *   J+3+          → sigma = 3.5°C, confidence = "low"
  */
 
 import { STATION_MAPPING }                    from "@/lib/data/station-mapping";
@@ -23,19 +21,16 @@ import type { WeatherForecast, ModelTemps }   from "@/types";
 
 const OPEN_METEO_BASE = "https://api.open-meteo.com/v1/forecast";
 
-// Modèles à interroger — les trois sont disponibles mondialement
-const MODELS = ["gfs_seamless", "ecmwf_ifs04", "icon_seamless"] as const;
-type ModelKey = typeof MODELS[number];
-
 // ---------------------------------------------------------------------------
 // Types internes
 // ---------------------------------------------------------------------------
 
-/** Réponse brute Open-Meteo multi-modèles */
-interface MultiModelResponse {
+/** Réponse brute Open-Meteo endpoint standard */
+interface StandardForecastResponse {
   daily?: {
-    time?: string[];
-    [key: string]: unknown; // clés dynamiques: "{model}_temperature_2m_max"
+    time?:                string[];
+    temperature_2m_max?:  (number | null)[];
+    temperature_2m_min?:  (number | null)[];
   };
 }
 
@@ -48,95 +43,45 @@ function toDateString(date: Date): string {
 }
 
 /**
- * Confiance temporelle [0, 1] basée sur le délai de prévision.
- * Utilisée pour la compatibilité avec le champ `confidence` (numérique).
+ * Nombre de jours entiers entre aujourd'hui (minuit local) et la date cible.
+ * J+0 = aujourd'hui, J+1 = demain, etc.
  */
-function forecastConfidence(targetDate: Date): number {
+function daysUntil(targetDate: Date): number {
   const today = new Date();
   today.setHours(0, 0, 0, 0);
   const target = new Date(targetDate);
   target.setHours(0, 0, 0, 0);
-  const diffDays = Math.round((target.getTime() - today.getTime()) / 86_400_000);
+  return Math.round((target.getTime() - today.getTime()) / 86_400_000);
+}
 
-  if (diffDays <= 1) return 0.9;
-  if (diffDays <= 3) return 0.8;
-  if (diffDays <= 6) return 0.7;
-  if (diffDays <= 10) return 0.6;
+/**
+ * Confiance numérique [0, 1] basée sur le délai de prévision.
+ * Utilisée pour remplir le champ `confidence` (compatibilité avec les agents).
+ */
+function forecastConfidence(targetDate: Date): number {
+  const days = daysUntil(targetDate);
+  if (days <= 1) return 0.9;
+  if (days <= 3) return 0.8;
+  if (days <= 6) return 0.7;
+  if (days <= 10) return 0.6;
   return 0.5;
 }
 
 /**
- * Heures entre maintenant et la date cible (à minuit UTC).
- * Utilisé pour le time factor du sigma dynamique.
+ * Sigma dynamique simplifié (°C) basé sur le délai de prévision.
+ *   J+1 → 1.5  J+2 → 2.5  J+3+ → 3.5
  */
-function hoursUntil(targetDate: Date): number {
-  const now = Date.now();
-  const target = new Date(targetDate);
-  target.setUTCHours(23, 59, 0, 0); // fin de journée cible
-  return Math.max(0, (target.getTime() - now) / (1000 * 60 * 60));
+function computeDynamicSigma(targetDate: Date): number {
+  const days = daysUntil(targetDate);
+  if (days <= 1) return 1.5;
+  if (days <= 2) return 2.5;
+  return 3.5;
 }
 
-/**
- * Extrait la valeur d'une clé "{model}_temperature_2m_{type}" depuis la
- * réponse brute pour une date donnée.
- * Retourne null si absent ou invalide.
- */
-function extractModelTemp(
-  daily: MultiModelResponse["daily"],
-  dateStr: string,
-  model: ModelKey,
-  type: "max" | "min"
-): number | null {
-  if (!daily) return null;
-  const times = (daily.time as string[] | undefined) ?? [];
-  const idx = times.indexOf(dateStr);
-  if (idx === -1) return null;
-
-  const key = `${model}_temperature_2m_${type}`;
-  const series = daily[key];
-  if (!Array.isArray(series)) return null;
-  const val = series[idx];
-  return typeof val === "number" && isFinite(val) ? val : null;
-}
-
-/**
- * Moyenne d'un tableau de valeurs non-null.
- * Retourne null si le tableau est vide.
- */
-function average(values: number[]): number | null {
-  if (values.length === 0) return null;
-  return values.reduce((s, v) => s + v, 0) / values.length;
-}
-
-/**
- * Écart max entre toutes les paires d'un tableau de valeurs.
- * Retourne 0 si moins de 2 valeurs.
- */
-function maxSpread(values: number[]): number {
-  if (values.length < 2) return 0;
-  let spread = 0;
-  for (let i = 0; i < values.length; i++) {
-    for (let j = i + 1; j < values.length; j++) {
-      spread = Math.max(spread, Math.abs(values[i] - values[j]));
-    }
-  }
-  return spread;
-}
-
-/**
- * Sigma dynamique en °C :
- *   timeFactor : < 24h → 1.0 / < 48h → 1.5 / sinon → 2.0
- *   sigma = max(1.5, modelSpread / 2 + timeFactor)
- */
-function computeDynamicSigma(spreadC: number, targetDate: Date): number {
-  const hours = hoursUntil(targetDate);
-  const timeFactor = hours < 24 ? 1.0 : hours < 48 ? 1.5 : 2.0;
-  return Math.max(1.5, spreadC / 2 + timeFactor);
-}
-
-function computeConfidenceLevel(spreadC: number): "high" | "medium" | "low" {
-  if (spreadC < 1) return "high";
-  if (spreadC <= 3) return "medium";
+function computeConfidenceLevel(targetDate: Date): "high" | "medium" | "low" {
+  const days = daysUntil(targetDate);
+  if (days <= 1) return "high";
+  if (days <= 2) return "medium";
   return "low";
 }
 
@@ -149,8 +94,7 @@ export function getStationCoordinates(stationCode: string) {
 }
 
 /**
- * Appelle Open-Meteo avec GFS + ECMWF + Icon et retourne un WeatherForecast
- * enrichi avec sigma dynamique et niveau de confiance basé sur l'accord des modèles.
+ * Appelle l'endpoint standard Open-Meteo et retourne un WeatherForecast.
  *
  * @param lat       Latitude décimale
  * @param lon       Longitude décimale
@@ -163,70 +107,68 @@ export async function fetchForecast(
   date: Date,
   timezone = "auto"
 ): Promise<WeatherForecast> {
-  const dateStr = toDateString(date);
+  const dateStr    = toDateString(date);
 
+  // Demander 16 jours pour couvrir tous les marchés Polymarket actifs
   const url = new URL(OPEN_METEO_BASE);
-  url.searchParams.set("latitude",   String(lat));
-  url.searchParams.set("longitude",  String(lon));
-  url.searchParams.set("daily",      "temperature_2m_max,temperature_2m_min");
-  url.searchParams.set("models",     MODELS.join(","));
-  url.searchParams.set("timezone",   timezone);
-  url.searchParams.set("start_date", dateStr);
-  url.searchParams.set("end_date",   dateStr);
+  url.searchParams.set("latitude",      String(lat));
+  url.searchParams.set("longitude",     String(lon));
+  url.searchParams.set("daily",         "temperature_2m_max,temperature_2m_min");
+  url.searchParams.set("timezone",      timezone);
+  url.searchParams.set("forecast_days", "16");
 
   const res = await fetch(url.toString());
   if (!res.ok) {
     throw new Error(`Open-Meteo error ${res.status}: ${await res.text()}`);
   }
 
-  const data: MultiModelResponse = await res.json();
+  const data: StandardForecastResponse = await res.json();
 
-  // --- Extraction des températures max par modèle ---
-  const gfsHigh  = extractModelTemp(data.daily, dateStr, "gfs_seamless",   "max");
-  const ecmwfHigh = extractModelTemp(data.daily, dateStr, "ecmwf_ifs04",    "max");
-  const iconHigh = extractModelTemp(data.daily, dateStr, "icon_seamless",  "max");
+  // --- Trouver l'index de la date cible ---
+  const times = data.daily?.time ?? [];
+  const idx   = times.indexOf(dateStr);
 
-  const gfsLow   = extractModelTemp(data.daily, dateStr, "gfs_seamless",   "min");
-  const ecmwfLow  = extractModelTemp(data.daily, dateStr, "ecmwf_ifs04",    "min");
-  const iconLow  = extractModelTemp(data.daily, dateStr, "icon_seamless",  "min");
-
-  // --- Moyennes (au moins un modèle requis) ---
-  const highValues = [gfsHigh, ecmwfHigh, iconHigh].filter((v): v is number => v !== null);
-  const lowValues  = [gfsLow,  ecmwfLow,  iconLow ].filter((v): v is number => v !== null);
-
-  if (highValues.length === 0 || lowValues.length === 0) {
+  if (idx === -1) {
     throw new Error(
-      `Open-Meteo: aucune donnée de température pour ${dateStr} ` +
-      `à (${lat}, ${lon}). Modèles: ${MODELS.join(", ")}`
+      `Open-Meteo: date ${dateStr} absente de la réponse ` +
+      `(plage disponible: ${times[0] ?? "?"} → ${times[times.length - 1] ?? "?"}) ` +
+      `pour (${lat}, ${lon})`
     );
   }
 
-  const highTemp = average(highValues)!;
-  const lowTemp  = average(lowValues)!;
+  // --- Extraction des températures ---
+  const rawHigh = data.daily?.temperature_2m_max?.[idx] ?? null;
+  const rawLow  = data.daily?.temperature_2m_min?.[idx] ?? null;
 
-  // --- Spread et sigma dynamique ---
-  const spreadC        = maxSpread(highValues);
-  const dynamicSigma   = computeDynamicSigma(spreadC, date);
-  const confidenceLevel = computeConfidenceLevel(spreadC);
+  if (rawHigh === null || !isFinite(rawHigh)) {
+    throw new Error(`Open-Meteo: température max manquante pour ${dateStr} à (${lat}, ${lon})`);
+  }
+  if (rawLow === null || !isFinite(rawLow)) {
+    throw new Error(`Open-Meteo: température min manquante pour ${dateStr} à (${lat}, ${lon})`);
+  }
 
-  const modelHighTemps: ModelTemps = {
-    ...(gfsHigh   !== null && { gfs:   gfsHigh   }),
-    ...(ecmwfHigh !== null && { ecmwf: ecmwfHigh }),
-    ...(iconHigh  !== null && { icon:  iconHigh  }),
-  };
+  const highTemp = Math.round(rawHigh * 10) / 10;
+  const lowTemp  = Math.round(rawLow  * 10) / 10;
+
+  // --- Sigma et confiance basés sur le délai ---
+  const dynamicSigma    = computeDynamicSigma(date);
+  const confidenceLevel = computeConfidenceLevel(date);
+
+  // modelHighTemps vide (pas de multi-modèles dans cet endpoint)
+  const modelHighTemps: ModelTemps = {};
 
   return {
-    city:            "", // rempli par fetchForecastForStation
-    country:         "",
+    city:           "", // rempli par fetchForecastForStation
+    country:        "",
     highTemp,
     lowTemp,
-    confidence:      forecastConfidence(date),
+    confidence:     forecastConfidence(date),
     confidenceLevel,
     dynamicSigma,
-    modelSpread:     Math.round(spreadC * 10) / 10,
+    modelSpread:    0,
     modelHighTemps,
-    source:          `open-meteo(${Object.keys(modelHighTemps).join("+")})`,
-    fetchedAt:       new Date(),
+    source:         "open-meteo",
+    fetchedAt:      new Date(),
   };
 }
 
@@ -248,7 +190,15 @@ export async function fetchForecastForStation(
   const station = getStationCoordinates(cityOrCode);
   if (station) {
     const forecast = await fetchForecast(station.lat, station.lon, date, station.timezone);
-    return { ...forecast, city: station.city, country: station.country };
+    const result   = { ...forecast, city: station.city, country: station.country };
+
+    console.log(
+      `[weather-sources] ${station.city} ${date.toISOString().slice(0, 10)}: ` +
+      `high=${result.highTemp}°C, low=${result.lowTemp}°C, ` +
+      `sigma=${result.dynamicSigma}, confidence=${result.confidenceLevel}`
+    );
+
+    return result;
   }
 
   // --- Fallback : géocodage dynamique ---
@@ -259,5 +209,110 @@ export async function fetchForecastForStation(
   }
 
   const forecast = await fetchForecast(geo.lat, geo.lon, date, "auto");
-  return { ...forecast, city: cityOrCode, country: geo.country };
+  const result   = { ...forecast, city: cityOrCode, country: geo.country };
+
+  console.log(
+    `[weather-sources] ${cityOrCode} ${date.toISOString().slice(0, 10)}: ` +
+    `high=${result.highTemp}°C, low=${result.lowTemp}°C, ` +
+    `sigma=${result.dynamicSigma}, confidence=${result.confidenceLevel}`
+  );
+
+  return result;
 }
+
+// ---------------------------------------------------------------------------
+// ANCIEN CODE MULTI-MODÈLES — conservé pour réactivation éventuelle
+// ---------------------------------------------------------------------------
+//
+// const MODELS = ["gfs_seamless", "ecmwf_ifs04", "icon_seamless"] as const;
+// type ModelKey = typeof MODELS[number];
+//
+// interface MultiModelResponse {
+//   daily?: {
+//     time?: string[];
+//     [key: string]: unknown;
+//   };
+// }
+//
+// function extractModelTemp(
+//   daily: MultiModelResponse["daily"],
+//   dateStr: string,
+//   model: ModelKey,
+//   type: "max" | "min"
+// ): number | null {
+//   if (!daily) return null;
+//   const times = (daily.time as string[] | undefined) ?? [];
+//   const idx = times.indexOf(dateStr);
+//   if (idx === -1) return null;
+//   const key = `${model}_temperature_2m_${type}`;
+//   const series = daily[key];
+//   if (!Array.isArray(series)) return null;
+//   const val = series[idx];
+//   return typeof val === "number" && isFinite(val) ? val : null;
+// }
+//
+// function average(values: number[]): number | null {
+//   if (values.length === 0) return null;
+//   return values.reduce((s, v) => s + v, 0) / values.length;
+// }
+//
+// function maxSpread(values: number[]): number {
+//   if (values.length < 2) return 0;
+//   let spread = 0;
+//   for (let i = 0; i < values.length; i++) {
+//     for (let j = i + 1; j < values.length; j++) {
+//       spread = Math.max(spread, Math.abs(values[i] - values[j]));
+//     }
+//   }
+//   return spread;
+// }
+//
+// Pour réactiver, remplacer l'appel fetchForecast par fetchForecastMultiModel :
+//
+// export async function fetchForecastMultiModel(
+//   lat: number, lon: number, date: Date, timezone = "auto"
+// ): Promise<WeatherForecast> {
+//   const dateStr = toDateString(date);
+//   const url = new URL(OPEN_METEO_BASE);
+//   url.searchParams.set("latitude",   String(lat));
+//   url.searchParams.set("longitude",  String(lon));
+//   url.searchParams.set("daily",      "temperature_2m_max,temperature_2m_min");
+//   url.searchParams.set("models",     MODELS.join(","));
+//   url.searchParams.set("timezone",   timezone);
+//   url.searchParams.set("start_date", dateStr);
+//   url.searchParams.set("end_date",   dateStr);
+//
+//   const res = await fetch(url.toString());
+//   if (!res.ok) throw new Error(`Open-Meteo error ${res.status}: ${await res.text()}`);
+//   const data: MultiModelResponse = await res.json();
+//
+//   const gfsHigh   = extractModelTemp(data.daily, dateStr, "gfs_seamless",  "max");
+//   const ecmwfHigh = extractModelTemp(data.daily, dateStr, "ecmwf_ifs04",   "max");
+//   const iconHigh  = extractModelTemp(data.daily, dateStr, "icon_seamless", "max");
+//   const gfsLow    = extractModelTemp(data.daily, dateStr, "gfs_seamless",  "min");
+//   const ecmwfLow  = extractModelTemp(data.daily, dateStr, "ecmwf_ifs04",   "min");
+//   const iconLow   = extractModelTemp(data.daily, dateStr, "icon_seamless", "min");
+//
+//   const highValues = [gfsHigh, ecmwfHigh, iconHigh].filter((v): v is number => v !== null);
+//   const lowValues  = [gfsLow,  ecmwfLow,  iconLow ].filter((v): v is number => v !== null);
+//
+//   if (highValues.length === 0 || lowValues.length === 0)
+//     throw new Error(`Open-Meteo: aucune donnée pour ${dateStr} à (${lat}, ${lon})`);
+//
+//   const highTemp       = average(highValues)!;
+//   const lowTemp        = average(lowValues)!;
+//   const spreadC        = maxSpread(highValues);
+//   const dynamicSigma   = Math.max(1.5, spreadC / 2 + (hoursUntil(date) < 24 ? 1.0 : hoursUntil(date) < 48 ? 1.5 : 2.0));
+//   const confidenceLevel = spreadC < 1 ? "high" : spreadC <= 3 ? "medium" : "low";
+//   const modelHighTemps: ModelTemps = {
+//     ...(gfsHigh !== null && { gfs: gfsHigh }),
+//     ...(ecmwfHigh !== null && { ecmwf: ecmwfHigh }),
+//     ...(iconHigh !== null && { icon: iconHigh }),
+//   };
+//   return {
+//     city: "", country: "", highTemp, lowTemp,
+//     confidence: forecastConfidence(date), confidenceLevel, dynamicSigma,
+//     modelSpread: Math.round(spreadC * 10) / 10, modelHighTemps,
+//     source: `open-meteo(${Object.keys(modelHighTemps).join("+")})`, fetchedAt: new Date(),
+//   };
+// }

@@ -345,75 +345,74 @@ export async function GET(): Promise<NextResponse<ScanResult>> {
     }
 
     if (toSave.length > 0) {
-      const saves = toSave.map((opp) =>
-        saveOpportunity({
-          market_id:             opp.marketId,
-          question:              opp.question,
-          city:                  opp.city,
-          station_code:          opp.stationCode,
-          outcome:               opp.outcome,
-          market_price:          opp.marketPrice,
-          estimated_probability: opp.estimatedProbability,
-          edge:                  opp.edge,
-          multiplier:            opp.multiplier,
-        })
-          .then(() => true as const)
-          .catch((err) => {
-            console.error(
-              `[scan-markets] ✗ Supabase saveOpportunity (${opp.marketId}/${opp.outcome}) :`,
-              err instanceof Error ? err.message : err
-            );
-            return false as const;
-          })
-      );
+      // 4c. Sauvegarder les opportunités dans la table opportunities
+      for (const opp of toSave) {
+        try {
+          await saveOpportunity({
+            market_id:             opp.marketId,
+            question:              opp.question,
+            city:                  opp.city,
+            station_code:          opp.stationCode,
+            outcome:               opp.outcome,
+            market_price:          opp.marketPrice,
+            estimated_probability: opp.estimatedProbability,
+            edge:                  opp.edge,
+            multiplier:            opp.multiplier,
+          });
+          savedToDb++;
+          console.log(`[scan-markets] 💾 Opportunité sauvegardée : ${opp.marketId}/${opp.outcome}`);
+        } catch (err) {
+          console.error(
+            `[scan-markets] ✗ saveOpportunity failed (${opp.marketId}/${opp.outcome}) :`,
+            err instanceof Error ? err.message : err
+          );
+        }
+      }
 
-      // 4c. Paper trades — un par opportunité nouvelle, en parallèle des saves
-      const paperSaves = toSave.map((opp) => {
+      // 4d. Sauvegarder les paper trades (séquentiellement pour tracer chaque erreur)
+      for (const opp of toSave) {
         const potentialPnl = opp.marketPrice > 0
           ? Math.round(opp.suggestedBet * (1 / opp.marketPrice - 1) * 100) / 100
           : 0;
-        return savePaperTrade({
-          market_id:             opp.marketId,
-          question:              opp.question,
-          city:                  opp.city,
-          ticker:                opp.agent === "finance" ? opp.stationCode : null,
-          agent:                 opp.agent,
-          outcome:               opp.outcome,
-          market_price:          opp.marketPrice,
-          estimated_probability: opp.estimatedProbability,
-          edge:                  opp.edge,
-          suggested_bet:         opp.suggestedBet,
-          confidence:            opp.confidence ?? null,
-          resolution_date:       opp.targetDate,
-          potential_pnl:         potentialPnl,
-        })
-          .then(() => true as const)
-          .catch((err) => {
-            console.error(
-              `[scan-markets] ✗ Supabase savePaperTrade (${opp.marketId}/${opp.outcome}) :`,
-              err instanceof Error ? err.message : err
-            );
-            return false as const;
+        try {
+          await savePaperTrade({
+            market_id:             opp.marketId,
+            question:              opp.question,
+            city:                  opp.city,
+            ticker:                opp.agent === "finance" ? opp.stationCode : null,
+            agent:                 opp.agent,
+            outcome:               opp.outcome,
+            market_price:          opp.marketPrice,
+            estimated_probability: opp.estimatedProbability,
+            edge:                  opp.edge,
+            suggested_bet:         opp.suggestedBet,
+            confidence:            opp.confidence ?? null,
+            resolution_date:       opp.targetDate,
+            potential_pnl:         potentialPnl,
           });
-      });
-
-      const statsUpdate = incrementDailyOpportunities(toSave.length).catch((err) =>
-        console.error(
-          "[scan-markets] ✗ Supabase incrementDailyOpportunities :",
-          err instanceof Error ? err.message : err
-        )
-      );
-
-      const results = await Promise.all([...saves, ...paperSaves, statsUpdate]);
-      const boolResults = results as (boolean | void)[];
-      savedToDb         = boolResults.slice(0, saves.length).filter((r) => r === true).length;
-      paperTradesLogged = boolResults.slice(saves.length, saves.length + paperSaves.length).filter((r) => r === true).length;
+          paperTradesLogged++;
+          console.log(`[scan-markets] 🃏 Paper trade sauvegardé : ${opp.marketId}/${opp.outcome}`);
+        } catch (err) {
+          console.error(
+            `[scan-markets] ✗ savePaperTrade failed (${opp.marketId}/${opp.outcome}) :`,
+            err instanceof Error ? err.message : err
+          );
+        }
+      }
 
       console.log(
         `[scan-markets] 💾 ${savedToDb}/${toSave.length} opportunité(s) sauvegardée(s) dans Supabase`
       );
       console.log(
         `[scan-markets] 🃏 ${paperTradesLogged}/${toSave.length} paper trade(s) logué(s)`
+      );
+
+      // 4e. Stats journalières (best-effort, non bloquant)
+      incrementDailyOpportunities(toSave.length).catch((err) =>
+        console.error(
+          "[scan-markets] ✗ incrementDailyOpportunities :",
+          err instanceof Error ? err.message : err
+        )
       );
     }
   }

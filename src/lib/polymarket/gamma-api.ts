@@ -12,9 +12,10 @@
  * directement du titre via CITY_ALIASES (ex: "NYC" → KLGA).
  */
 
-import { STATION_MAPPING } from "@/lib/data/station-mapping";
-import { MOCK_WEATHER_MARKETS } from "@/lib/polymarket/mock-data";
-import type { Market } from "@/types";
+import { STATION_MAPPING }                    from "@/lib/data/station-mapping";
+import { normalizeCity }                      from "@/lib/data-sources/geocoding";
+import { MOCK_WEATHER_MARKETS }               from "@/lib/polymarket/mock-data";
+import type { Market }                        from "@/types";
 
 // ---------------------------------------------------------------------------
 // Constantes
@@ -54,8 +55,10 @@ const CITY_ALIASES: Record<string, string> = {
   "Las Vegas":     "KLAS",
   "Vegas":         "KLAS",
   "Atlanta":       "KATL",
+  "Toronto":       "CYYZ",
   "Tokyo":         "RJTT",
   "Paris":         "LFPO",
+  "Seoul":         "RKSS",
   "Sydney":        "YSSY",
 };
 
@@ -173,6 +176,42 @@ function extractCityFromTitle(title: string): { city: string; stationCode: strin
       return { city: alias.trim(), stationCode };
     }
   }
+  return null;
+}
+
+/**
+ * Extrait le nom d'une ville depuis une phrase naturelle anglaise.
+ * Exemples :
+ *   "Highest temperature in Atlanta on April 14?"   → "Atlanta"
+ *   "Will the high temp in New York City exceed 70°F?" → "New York City"
+ *   "Low temperature in San Francisco for April 16" → "San Francisco"
+ *
+ * Stratégie :
+ *   1. Cherche le pattern "in {City}" (1–3 mots en Title Case)
+ *      suivi d'un marqueur temporel ou d'un indicateur de condition.
+ *   2. Fallback : cherche simplement "in {CityWord}" sans contrainte de fin.
+ *   3. Normalise via normalizeCity() pour résoudre les abbréviations.
+ */
+function extractCityFromSentence(title: string): string | null {
+  // Pattern 1 : "in {City}" suivi d'un contexte temporel / conditionnel
+  const strict = title.match(
+    /\bin\s+([A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+){0,2})\s+(?:on|for|be|above|below|exceed|at|during)\b/i
+  );
+  if (strict) return normalizeCity(strict[1].trim());
+
+  // Pattern 2 : "in {City}" plus souple (fin de phrase ou ponctuation)
+  const loose = title.match(
+    /\bin\s+([A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+){0,2})\b/i
+  );
+  if (loose) {
+    const candidate = loose[1].trim();
+    // Écarter les faux positifs courants (articles, prépositions)
+    const STOPWORDS = new Set(["the", "a", "an", "this", "that", "which", "its"]);
+    if (!STOPWORDS.has(candidate.toLowerCase())) {
+      return normalizeCity(candidate);
+    }
+  }
+
   return null;
 }
 
@@ -350,8 +389,22 @@ async function fetchRealMarkets(): Promise<WeatherMarket[]> {
       }
     }
 
+    // 3. Fallback : extraction depuis la phrase (ex: "temperature in Atlanta on April 14")
+    //    La valeur retournée est le nom de ville normalisé — le géocodage se chargera
+    //    de le résoudre en coordonnées si STATION_MAPPING ne le connaît pas.
     if (!stationCode) {
-      console.log(`[gamma-api] ⏭ Station introuvable pour "${title.slice(0, 60)}" — ignoré`);
+      const cityFromSentence = extractCityFromSentence(title);
+      if (cityFromSentence) {
+        stationCode  = cityFromSentence;
+        resolvedCity = cityFromSentence;
+        console.log(
+          `[gamma-api] 🏙 Ville extraite depuis la phrase : "${cityFromSentence}" — "${title.slice(0, 60)}"`
+        );
+      }
+    }
+
+    if (!stationCode) {
+      console.log(`[gamma-api] ⏭ Ville introuvable pour "${title.slice(0, 60)}" — ignoré`);
       continue;
     }
 

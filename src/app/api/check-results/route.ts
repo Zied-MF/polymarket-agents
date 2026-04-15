@@ -16,6 +16,7 @@
 
 import { NextResponse }                  from "next/server";
 import { STATION_MAPPING }               from "@/lib/data/station-mapping";
+import { getCoordinates }               from "@/lib/data-sources/geocoding";
 import {
   getPendingOpportunities,
   updateOpportunityResult,
@@ -131,8 +132,12 @@ interface ArchiveResponse {
 }
 
 /**
- * Récupère la température max/min observée pour une station et une date.
+ * Récupère la température max/min observée pour une station/ville et une date.
  * Utilise Open-Meteo Archive (ERA5 — données réelles, délai ~5 jours).
+ *
+ * Résolution des coordonnées :
+ *   1. STATION_MAPPING (lookup immédiat)
+ *   2. getCoordinates() — geocoding avec cache (mémoire + Supabase + API)
  *
  * @returns { highC, lowC } en °Celsius
  */
@@ -140,12 +145,25 @@ async function fetchActualTemperature(
   stationCode: string,
   dateStr: string
 ): Promise<{ highC: number; lowC: number }> {
+  // Chemin rapide : mapping statique (ICAO ou alias nom de ville)
+  let lat: number;
+  let lon: number;
+
   const station = STATION_MAPPING[stationCode];
-  if (!station) throw new Error(`Station inconnue : ${stationCode}`);
+  if (station) {
+    lat = station.lat;
+    lon = station.lon;
+  } else {
+    // Fallback : géocodage dynamique
+    const geo = await getCoordinates(stationCode);
+    if (!geo) throw new Error(`Station/ville inconnue : "${stationCode}"`);
+    lat = geo.lat;
+    lon = geo.lon;
+  }
 
   const url = new URL(ARCHIVE_BASE);
-  url.searchParams.set("latitude",   String(station.lat));
-  url.searchParams.set("longitude",  String(station.lon));
+  url.searchParams.set("latitude",   String(lat));
+  url.searchParams.set("longitude",  String(lon));
   url.searchParams.set("start_date", dateStr);
   url.searchParams.set("end_date",   dateStr);
   url.searchParams.set("daily",      "temperature_2m_max,temperature_2m_min");

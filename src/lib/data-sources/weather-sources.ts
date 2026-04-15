@@ -17,7 +17,8 @@
  *   sigma = max(1.5, spread / 2 + timeFactor)
  */
 
-import { STATION_MAPPING, type StationInfo } from "@/lib/data/station-mapping";
+import { STATION_MAPPING }                    from "@/lib/data/station-mapping";
+import { getCoordinates }                     from "@/lib/data-sources/geocoding";
 import type { WeatherForecast, ModelTemps }   from "@/types";
 
 const OPEN_METEO_BASE = "https://api.open-meteo.com/v1/forecast";
@@ -143,8 +144,8 @@ function computeConfidenceLevel(spreadC: number): "high" | "medium" | "low" {
 // Fonctions publiques
 // ---------------------------------------------------------------------------
 
-export function getStationCoordinates(stationCode: string): StationInfo | undefined {
-  return STATION_MAPPING[stationCode.toUpperCase()];
+export function getStationCoordinates(stationCode: string) {
+  return STATION_MAPPING[stationCode] ?? STATION_MAPPING[stationCode.toUpperCase()];
 }
 
 /**
@@ -230,19 +231,33 @@ export async function fetchForecast(
 }
 
 /**
- * Raccourci : récupère coordonnées + prévision en une seule étape
- * à partir d'un code de station ICAO.
- * Throws si la station est inconnue.
+ * Raccourci : récupère coordonnées + prévision en une seule étape.
+ *
+ * Accepte un code ICAO (ex: "KLGA") ou un nom de ville (ex: "Atlanta").
+ * Résolution en deux étapes :
+ *   1. STATION_MAPPING (lookup immédiat, pas d'I/O)
+ *   2. getCoordinates() — geocoding avec cache mémoire + Supabase + API
+ *
+ * Retourne null si la ville est introuvable (le marché sera ajouté à skipped[]).
  */
 export async function fetchForecastForStation(
-  stationCode: string,
+  cityOrCode: string,
   date: Date
-): Promise<WeatherForecast> {
-  const info = getStationCoordinates(stationCode);
-  if (!info) {
-    throw new Error(`Station inconnue : ${stationCode}. Ajoutez-la dans station-mapping.ts.`);
+): Promise<WeatherForecast | null> {
+  // --- Chemin rapide : mapping statique ---
+  const station = getStationCoordinates(cityOrCode);
+  if (station) {
+    const forecast = await fetchForecast(station.lat, station.lon, date, station.timezone);
+    return { ...forecast, city: station.city, country: station.country };
   }
 
-  const forecast = await fetchForecast(info.lat, info.lon, date, info.timezone);
-  return { ...forecast, city: info.city, country: info.country };
+  // --- Fallback : géocodage dynamique ---
+  const geo = await getCoordinates(cityOrCode);
+  if (!geo) {
+    // Le log "[geocoding] Unknown city: …" est déjà émis par getCoordinates
+    return null;
+  }
+
+  const forecast = await fetchForecast(geo.lat, geo.lon, date, "auto");
+  return { ...forecast, city: cityOrCode, country: geo.country };
 }

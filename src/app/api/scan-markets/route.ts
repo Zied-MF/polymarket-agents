@@ -183,17 +183,26 @@ export async function GET(): Promise<NextResponse<ScanResult>> {
     let forecast;
     try {
       forecast = await fetchForecastForStation(market.stationCode, market.targetDate);
-      console.log(
-        `${tag} 🌡 Prévision ${market.city} le ${market.targetDate.toISOString().slice(0, 10)} : ` +
-          `high=${forecast.highTemp.toFixed(1)}°C  low=${forecast.lowTemp.toFixed(1)}°C  ` +
-          `confidence=${forecast.confidence}`
-      );
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       console.error(`${tag} ✗ Erreur prévision : ${msg}`);
       errors.push({ marketId: market.id, question: market.question, error: msg });
       continue;
     }
+
+    // Station inconnue → skipped (pas une erreur, juste non couvert)
+    if (!forecast) {
+      const reason = `Station inconnue : ${market.stationCode} — ajoutez-la dans station-mapping.ts`;
+      console.warn(`${tag} ⏭ ${reason}`);
+      skipped.push({ marketId: market.id, question: market.question, reason, agent: "weather" });
+      continue;
+    }
+
+    console.log(
+      `${tag} 🌡 Prévision ${market.city} le ${market.targetDate.toISOString().slice(0, 10)} : ` +
+        `high=${forecast.highTemp.toFixed(1)}°C  low=${forecast.lowTemp.toFixed(1)}°C  ` +
+        `confidence=${forecast.confidence}`
+    );
 
     // 2c. Analyser avec le Weather Agent
     const marketOpportunities = analyzeMarket(market, forecast);

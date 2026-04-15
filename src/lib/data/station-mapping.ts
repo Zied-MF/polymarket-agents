@@ -1,127 +1,131 @@
 /**
- * Mapping ICAO station code → coordonnées géographiques + métadonnées
+ * Mapping station/ville → coordonnées géographiques + métadonnées
  *
- * Utilisé par weather-sources.ts pour convertir un code de station
- * extrait des règles d'un marché Polymarket en coordonnées exploitables
- * par l'API Open-Meteo.
+ * Deux types de clés dans STATION_MAPPING :
+ *   • Codes ICAO  (ex: "KLGA") — utilisés quand la résolution Polymarket cite
+ *     un code aéroport dans l'URL Wunderground.
+ *   • Noms de ville (ex: "Atlanta") — utilisés par check-results pour la
+ *     résolution des paper trades (qui stockent trade.city, pas station_code).
  *
- * Les 10 stations correspondent aux villes les plus actives sur les
- * marchés météo Polymarket (classement par volume observé).
+ * Les coordonnées sont celles du centre-ville (pas de l'aéroport) pour que
+ * l'API Open-Meteo retourne une température représentative de la ville entière.
+ * Open-Meteo interpole à partir d'une grille ERA5 — quelques km de décalage
+ * n'ont pas d'impact significatif sur la température prévue.
  */
 
 export interface StationInfo {
-  lat: number;
-  lon: number;
-  city: string;
-  country: string;
+  lat:      number;
+  lon:      number;
+  city:     string;
+  country:  string;
   /** Timezone IANA, nécessaire pour que Open-Meteo retourne les bonnes dates. */
   timezone: string;
 }
 
-/** Toutes les stations météo connues, indexées par code ICAO. */
+// ---------------------------------------------------------------------------
+// Stations de référence (définies une fois, réutilisées par les deux indexes)
+// ---------------------------------------------------------------------------
+
+function s(
+  lat: number, lon: number,
+  city: string, country: string,
+  timezone: string
+): StationInfo {
+  return { lat, lon, city, country, timezone };
+}
+
+const NYC     = s( 40.7769,   -73.8740,  "New York City",  "US", "America/New_York");
+const LAX     = s( 33.9425,  -118.4081,  "Los Angeles",    "US", "America/Los_Angeles");
+const LON     = s( 51.5074,    -0.1278,  "London",         "GB", "Europe/London");
+const MIA     = s( 25.7959,   -80.2870,  "Miami",          "US", "America/New_York");
+const CHI     = s( 41.7868,   -87.7522,  "Chicago",        "US", "America/Chicago");
+const DAL     = s( 32.8998,   -97.0403,  "Dallas",         "US", "America/Chicago");
+const HOU     = s( 29.7604,   -95.3698,  "Houston",        "US", "America/Chicago");
+const PHX     = s( 33.4373,  -112.0078,  "Phoenix",        "US", "America/Phoenix");
+const LAS     = s( 36.0800,  -115.1522,  "Las Vegas",      "US", "America/Los_Angeles");
+const ATL     = s( 33.7490,   -84.3880,  "Atlanta",        "US", "America/New_York");
+const TKY     = s( 35.6762,   139.6503,  "Tokyo",          "JP", "Asia/Tokyo");
+const PAR     = s( 48.8566,     2.3522,  "Paris",          "FR", "Europe/Paris");
+const SYD     = s(-33.8688,   151.2093,  "Sydney",         "AU", "Australia/Sydney");
+const TOR     = s( 43.6532,   -79.3832,  "Toronto",        "CA", "America/Toronto");
+const SEO     = s( 37.5665,   126.9780,  "Seoul",          "KR", "Asia/Seoul");
+
+// ---------------------------------------------------------------------------
+// Index principal — clé ICAO (utilisé par scan-markets via stationCode)
+// ---------------------------------------------------------------------------
+
+/** Toutes les stations connues. Supporte deux types de clés :
+ *  - code ICAO (ex: "KLGA") pour les lookups depuis gamma-api / weather-sources
+ *  - nom de ville (ex: "Atlanta") pour la résolution des paper trades
+ */
 export const STATION_MAPPING: Record<string, StationInfo> = {
-  // 1. New York City — LaGuardia (station de référence Polymarket pour NYC)
-  KLGA: {
-    lat: 40.7769,
-    lon: -73.874,
-    city: "New York City",
-    country: "US",
-    timezone: "America/New_York",
-  },
-  // 2. Los Angeles — LAX
-  KLAX: {
-    lat: 33.9425,
-    lon: -118.4081,
-    city: "Los Angeles",
-    country: "US",
-    timezone: "America/Los_Angeles",
-  },
-  // 3. London — London City Airport (utilisé par Polymarket pour les marchés UK)
-  EGLC: {
-    lat: 51.5053,
-    lon: 0.0553,
-    city: "London",
-    country: "GB",
-    timezone: "Europe/London",
-  },
-  // 4. Miami — Miami International
-  KMIA: {
-    lat: 25.7959,
-    lon: -80.287,
-    city: "Miami",
-    country: "US",
-    timezone: "America/New_York",
-  },
-  // 5. Chicago — Midway (station Polymarket pour Chicago, non O'Hare)
-  KMDW: {
-    lat: 41.7868,
-    lon: -87.7522,
-    city: "Chicago",
-    country: "US",
-    timezone: "America/Chicago",
-  },
-  // 6. Dallas/Fort Worth
-  KDFW: {
-    lat: 32.8998,
-    lon: -97.0403,
-    city: "Dallas",
-    country: "US",
-    timezone: "America/Chicago",
-  },
-  // 7. Houston — George Bush Intercontinental
-  KIAH: {
-    lat: 29.9902,
-    lon: -95.3368,
-    city: "Houston",
-    country: "US",
-    timezone: "America/Chicago",
-  },
-  // 8. Phoenix — Sky Harbor
-  KPHX: {
-    lat: 33.4373,
-    lon: -112.0078,
-    city: "Phoenix",
-    country: "US",
-    timezone: "America/Phoenix",
-  },
-  // 9. Las Vegas — Harry Reid International
-  KLAS: {
-    lat: 36.08,
-    lon: -115.1522,
-    city: "Las Vegas",
-    country: "US",
-    timezone: "America/Los_Angeles",
-  },
-  // 10. Atlanta — Hartsfield-Jackson
-  KATL: {
-    lat: 33.6407,
-    lon: -84.4277,
-    city: "Atlanta",
-    country: "US",
-    timezone: "America/New_York",
-  },
-  // 11. Tokyo — Haneda (RJTT, station de référence pour les marchés Polymarket Japan)
-  RJTT: {
-    lat: 35.5494,
-    lon: 139.7798,
-    city: "Tokyo",
-    country: "JP",
-    timezone: "Asia/Tokyo",
-  },
-  // 12. Paris — Orly (LFPO, plus proche du centre que CDG)
-  LFPO: {
-    lat: 48.7233,
-    lon: 2.3794,
-    city: "Paris",
-    country: "FR",
-    timezone: "Europe/Paris",
-  },
-  // 13. Sydney — Kingsford Smith
-  YSSY: {
-    lat: -33.9461,
-    lon: 151.1772,
-    city: "Sydney",
-    country: "AU",
-    timezone: "Australia/Sydney",
-  },
+  // ── USA ───────────────────────────────────────────────────────────────────
+  // New York — LaGuardia (station de référence Polymarket pour NYC)
+  KLGA:  NYC,
+
+  // Los Angeles — LAX
+  KLAX:  LAX,
+
+  // Miami — Miami International
+  KMIA:  MIA,
+
+  // Chicago — Midway (station Polymarket pour Chicago, non O'Hare)
+  KMDW:  CHI,
+
+  // Dallas/Fort Worth
+  KDFW:  DAL,
+
+  // Houston — George Bush Intercontinental
+  KIAH:  HOU,
+
+  // Phoenix — Sky Harbor
+  KPHX:  PHX,
+
+  // Las Vegas — Harry Reid International
+  KLAS:  LAS,
+
+  // Atlanta — Hartsfield-Jackson
+  KATL:  ATL,
+
+  // ── Canada ───────────────────────────────────────────────────────────────
+  // Toronto — Pearson International
+  CYYZ:  TOR,
+
+  // ── Europe ───────────────────────────────────────────────────────────────
+  // London — London City Airport (code ICAO utilisé par Polymarket)
+  EGLC:  LON,
+
+  // Paris — Orly (LFPO, plus proche du centre que CDG)
+  LFPO:  PAR,
+
+  // ── Asia-Pacific ─────────────────────────────────────────────────────────
+  // Tokyo — Haneda
+  RJTT:  TKY,
+
+  // Seoul — Gimpo International (plus proche du centre que Incheon)
+  RKSS:  SEO,
+
+  // Sydney — Kingsford Smith
+  YSSY:  SYD,
+
+  // ── Aliases par nom de ville ──────────────────────────────────────────────
+  // Utilisés par check-results pour résoudre les paper trades via trade.city
+  "New York City":  NYC,
+  "New York":       NYC,
+  "NYC":            NYC,
+  "Los Angeles":    LAX,
+  "Miami":          MIA,
+  "Chicago":        CHI,
+  "Dallas":         DAL,
+  "Houston":        HOU,
+  "Phoenix":        PHX,
+  "Las Vegas":      LAS,
+  "Vegas":          LAS,
+  "Atlanta":        ATL,
+  "Toronto":        TOR,
+  "London":         LON,
+  "Paris":          PAR,
+  "Tokyo":          TKY,
+  "Seoul":          SEO,
+  "Sydney":         SYD,
 };

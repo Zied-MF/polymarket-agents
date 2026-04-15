@@ -113,3 +113,21 @@ CREATE INDEX IF NOT EXISTS paper_trades_created_at_idx  ON paper_trades (created
 CREATE INDEX IF NOT EXISTS paper_trades_resolution_idx  ON paper_trades (resolution_date);
 CREATE INDEX IF NOT EXISTS paper_trades_agent_idx       ON paper_trades (agent);
 CREATE INDEX IF NOT EXISTS paper_trades_won_idx         ON paper_trades (won) WHERE won IS NULL;
+
+-- ------------------------------------------------------------
+-- Cache géocodage — coordonnées persistées par nom de ville
+-- Évite des appels répétés à l'API Open-Meteo Geocoding.
+-- Pré-peuplé automatiquement depuis station-mapping.ts au
+-- démarrage de l'application (cache mémoire) ; les nouvelles
+-- villes découvertes via l'API sont insérées ici pour survivre
+-- aux redémarrages du serveur.
+-- ------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS city_coordinates (
+  city_name   TEXT         PRIMARY KEY,   -- nom normalisé en minuscules
+  latitude    DECIMAL      NOT NULL,
+  longitude   DECIMAL      NOT NULL,
+  country     TEXT,
+  created_at  TIMESTAMPTZ  DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS city_coordinates_created_at_idx ON city_coordinates (created_at DESC);

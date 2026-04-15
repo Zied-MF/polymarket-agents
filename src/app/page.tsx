@@ -87,7 +87,7 @@ export default function Dashboard() {
         <div className="flex items-center justify-between mb-8">
           <div>
             <h1 className="text-3xl font-bold flex items-center gap-3">
-              🌡️ Polymarket Weather Agent
+              📊 Polymarket Trading Agent
             </h1>
             <p className="text-gray-400 mt-1">
               {data?.scannedAt
@@ -251,8 +251,8 @@ export default function Dashboard() {
 
         {/* Footer */}
         <div className="mt-12 text-center text-gray-500 text-sm">
-          <p>Polymarket Weather Agent v1.0 — Cron toutes les 15 minutes</p>
-          <p>Budget: 10€ | Kelly Criterion: Half-Kelly</p>
+          <p>Polymarket Trading Agent v1.0 — Cron toutes les 15 minutes</p>
+          <p>Weather + Finance Agents | Budget: 10€ | Kelly Criterion: Half-Kelly</p>
         </div>
       </div>
     </div>

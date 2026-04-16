@@ -1,14 +1,16 @@
 /**
- * Finance data sources — Yahoo Finance (gratuit, sans clé API)
+ * Finance data sources — Finnhub (gratuit, 60 req/min)
  *
- * Expose trois fonctions :
- *   - fetchStockData(ticker)         : prix, volume, historique 30j
- *   - fetchPreMarketData(ticker)     : données pré-marché (si disponibles)
- *   - calculateTechnicals(history)   : RSI(14), SMA(20), tendance
+ * Expose trois fonctions publiques :
+ *   - fetchStockData(ticker)       : prix, variation, open/high/low via /quote
+ *   - fetchPreMarketData(ticker)   : toujours null (non disponible plan gratuit)
+ *   - calculateTechnicals(history) : no-op — retourne neutral (RSI/SMA indisponibles)
  *
- * Endpoints Yahoo Finance v8 utilisés (serveur → pas de CORS) :
- *   /v8/finance/chart/{ticker}?interval=1d&range=30d
- *   /v8/finance/chart/{ticker}?interval=1m&range=1d&prepost=true
+ * Endpoint Finnhub utilisé :
+ *   GET /quote?symbol={ticker}&token={key}
+ *   → { c: current, d: change, dp: change%, h: high, l: low, o: open, pc: previousClose }
+ *
+ * Rate limit : 60 req/min → délai 100ms entre requêtes.
  */
 
 // ---------------------------------------------------------------------------
@@ -16,19 +18,25 @@
 // ---------------------------------------------------------------------------
 
 export interface StockData {
-  /** Dernier prix en séance (ou clôture si marché fermé). */
+  /** Dernier prix en séance. */
   currentPrice: number;
   /** Clôture précédente. */
   previousClose: number;
+  /** Prix d'ouverture du jour. */
+  open: number;
+  /** Plus haut du jour. */
+  high: number;
+  /** Plus bas du jour. */
+  low: number;
   /** Variation absolue en USD. */
   change: number;
   /** Variation relative en %. */
   changePercent: number;
-  /** Volume du jour. */
+  /** Volume du jour — 0 (non disponible sur /quote gratuit). */
   volume: number;
-  /** Volume moyen sur 10 jours. */
+  /** Volume moyen — 0 (non disponible sur /quote gratuit). */
   avgVolume: number;
-  /** Historique de clôtures (jusqu'à 30j) pour les indicateurs techniques. */
+  /** Historique de clôtures — vide (pas de /stock/candle sur plan gratuit). */
   priceHistory: number[];
 }
 
@@ -40,11 +48,11 @@ export interface PreMarketData {
 }
 
 export interface Technicals {
-  /** RSI sur 14 périodes — null si historique insuffisant (< 15 points). */
+  /** RSI — null (historique indisponible). */
   rsi: number | null;
-  /** Moyenne mobile simple 20j — null si historique insuffisant. */
+  /** SMA20 — null (historique indisponible). */
   sma20: number | null;
-  /** Tendance déduite du positionnement par rapport à la SMA20. */
+  /** Tendance — toujours neutral (sans historique). */
   trend: "bullish" | "bearish" | "neutral";
 }
 
@@ -52,73 +60,46 @@ export interface Technicals {
 // Constantes
 // ---------------------------------------------------------------------------
 
-const YAHOO_BASE = "https://query1.finance.yahoo.com/v8/finance/chart";
+const FINNHUB_BASE    = "https://finnhub.io/api/v1";
+const FINNHUB_API_KEY = process.env.FINNHUB_API_KEY ?? "demo";
 
-const YAHOO_HEADERS: HeadersInit = {
-  "User-Agent":
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 " +
-    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-  Accept: "application/json",
-};
+/** Délai entre requêtes pour rester sous 60 req/min. */
+const INTER_REQUEST_DELAY_MS = 100;
 
 // ---------------------------------------------------------------------------
-// Types internes — réponse brute Yahoo Finance v8
+// Types internes — réponse brute Finnhub /quote
 // ---------------------------------------------------------------------------
 
-interface YahooMeta {
-  regularMarketPrice?: number;
-  chartPreviousClose?: number;
-  previousClose?: number;
-  regularMarketVolume?: number;
-  averageDailyVolume10Day?: number;
-  preMarketPrice?: number;
-  preMarketChange?: number;
-  preMarketChangePercent?: number;
-}
-
-interface YahooQuote {
-  close?: (number | null)[];
-}
-
-interface YahooResult {
-  meta?: YahooMeta;
-  indicators?: {
-    quote?: YahooQuote[];
-  };
-}
-
-interface YahooResponse {
-  chart?: {
-    result?: YahooResult[];
-    error?: { code: string; description: string } | null;
-  };
+interface FinnhubQuote {
+  c:  number; // current price
+  d:  number; // change
+  dp: number; // change percent
+  h:  number; // high of day
+  l:  number; // low of day
+  o:  number; // open of day
+  pc: number; // previous close
 }
 
 // ---------------------------------------------------------------------------
 // Helper HTTP
 // ---------------------------------------------------------------------------
 
-async function fetchYahoo(url: string): Promise<YahooResult> {
-  const res = await fetch(url, { headers: YAHOO_HEADERS });
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+async function fetchFinnhub<T>(path: string): Promise<T> {
+  await sleep(INTER_REQUEST_DELAY_MS);
+
+  const url = `${FINNHUB_BASE}${path}`;
+  const res  = await fetch(url, { headers: { Accept: "application/json" } });
 
   if (!res.ok) {
-    throw new Error(`Yahoo Finance HTTP ${res.status}: ${await res.text().catch(() => "")}`);
+    const body = await res.text().catch(() => "");
+    throw new Error(`Finnhub HTTP ${res.status} — ${path.split("?")[0]} : ${body}`);
   }
 
-  const data: YahooResponse = await res.json();
-
-  if (data.chart?.error) {
-    throw new Error(
-      `Yahoo Finance API error: ${data.chart.error.code} — ${data.chart.error.description}`
-    );
-  }
-
-  const result = data.chart?.result?.[0];
-  if (!result) {
-    throw new Error(`Yahoo Finance: réponse vide pour ${url}`);
-  }
-
-  return result;
+  return res.json() as Promise<T>;
 }
 
 // ---------------------------------------------------------------------------
@@ -126,139 +107,46 @@ async function fetchYahoo(url: string): Promise<YahooResult> {
 // ---------------------------------------------------------------------------
 
 /**
- * Récupère les données boursières d'un ticker sur 30 jours (clôtures quotidiennes).
- * Utilisé pour calculer RSI, SMA20 et observer la tendance.
- *
- * @throws si le ticker est invalide ou si Yahoo Finance est indisponible.
+ * Récupère le prix actuel, variation et range du jour via /quote.
+ * @throws si le ticker est invalide ou si Finnhub est indisponible.
  */
 export async function fetchStockData(ticker: string): Promise<StockData> {
-  const url = `${YAHOO_BASE}/${encodeURIComponent(ticker)}?interval=1d&range=30d`;
-  const result = await fetchYahoo(url);
-
-  const meta = result.meta ?? {};
-  const closes = (result.indicators?.quote?.[0]?.close ?? []).filter(
-    (v): v is number => v !== null && v !== undefined && isFinite(v)
+  const sym   = encodeURIComponent(ticker);
+  const quote = await fetchFinnhub<FinnhubQuote>(
+    `/quote?symbol=${sym}&token=${FINNHUB_API_KEY}`
   );
 
-  if (closes.length === 0) {
-    throw new Error(`Yahoo Finance: pas d'historique de clôture pour ${ticker}`);
+  if (!quote.c || quote.c === 0) {
+    throw new Error(`Finnhub: ticker inconnu ou marché fermé pour "${ticker}"`);
   }
 
-  const currentPrice  = meta.regularMarketPrice ?? closes[closes.length - 1];
-  const previousClose =
-    meta.chartPreviousClose ?? meta.previousClose ?? closes[closes.length - 2] ?? currentPrice;
-  const change        = currentPrice - previousClose;
-  const changePercent = previousClose !== 0 ? (change / previousClose) * 100 : 0;
-
   return {
-    currentPrice:  Math.round(currentPrice  * 100) / 100,
-    previousClose: Math.round(previousClose * 100) / 100,
-    change:        Math.round(change        * 100) / 100,
-    changePercent: Math.round(changePercent * 100) / 100,
-    volume:        meta.regularMarketVolume ?? 0,
-    avgVolume:     meta.averageDailyVolume10Day ?? 0,
-    priceHistory:  closes,
+    currentPrice:  Math.round(quote.c  * 100) / 100,
+    previousClose: Math.round(quote.pc * 100) / 100,
+    open:          Math.round(quote.o  * 100) / 100,
+    high:          Math.round(quote.h  * 100) / 100,
+    low:           Math.round(quote.l  * 100) / 100,
+    change:        Math.round(quote.d  * 100) / 100,
+    changePercent: Math.round(quote.dp * 100) / 100,
+    // Non disponibles sur /quote gratuit — conservés pour compatibilité
+    volume:        0,
+    avgVolume:     0,
+    priceHistory:  [],
   };
 }
 
 /**
- * Récupère les données pré-marché si disponibles (avant 9h30 ET).
- * Retourne null pour tous les champs si le pré-marché n'est pas actif.
+ * Données pré-marché — indisponibles sur le plan gratuit Finnhub.
+ * Retourne toujours null : le Finance Agent traitera le signal comme neutre (0 pts).
  */
-export async function fetchPreMarketData(ticker: string): Promise<PreMarketData> {
-  const url =
-    `${YAHOO_BASE}/${encodeURIComponent(ticker)}` +
-    `?interval=1m&range=1d&prepost=true`;
-
-  try {
-    const result = await fetchYahoo(url);
-    const meta = result.meta ?? {};
-
-    const preMarketPrice  = meta.preMarketPrice  ?? null;
-    const preMarketChange = meta.preMarketChange ?? null;
-    // Yahoo retourne le % en décimal (0.0125 = 1.25%) — on convertit en %
-    const raw = meta.preMarketChangePercent ?? null;
-    const preMarketChangePercent =
-      raw !== null ? Math.round(raw * 100 * 100) / 100 : null;
-
-    return { preMarketPrice, preMarketChange, preMarketChangePercent };
-  } catch (err) {
-    console.warn(
-      `[finance-sources] Pré-marché indisponible pour ${ticker} :`,
-      err instanceof Error ? err.message : err
-    );
-    return { preMarketPrice: null, preMarketChange: null, preMarketChangePercent: null };
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Indicateurs techniques
-// ---------------------------------------------------------------------------
-
-/**
- * RSI de Wilder sur N périodes.
- * Retourne null si l'historique contient moins de N+1 points.
- */
-function computeRsi(closes: number[], period = 14): number | null {
-  if (closes.length < period + 1) return null;
-
-  const changes = closes.slice(1).map((c, i) => c - closes[i]);
-
-  // Moyennes initiales (simple) sur les `period` premiers changements
-  let avgGain = 0;
-  let avgLoss = 0;
-  for (let i = 0; i < period; i++) {
-    if (changes[i] > 0) avgGain += changes[i];
-    else                 avgLoss += Math.abs(changes[i]);
-  }
-  avgGain /= period;
-  avgLoss /= period;
-
-  // Lissage de Wilder pour les périodes restantes
-  for (let i = period; i < changes.length; i++) {
-    const gain = changes[i] > 0 ? changes[i] : 0;
-    const loss = changes[i] < 0 ? Math.abs(changes[i]) : 0;
-    avgGain = (avgGain * (period - 1) + gain) / period;
-    avgLoss = (avgLoss * (period - 1) + loss) / period;
-  }
-
-  if (avgLoss === 0) return 100;
-  const rs  = avgGain / avgLoss;
-  const rsi = 100 - 100 / (1 + rs);
-  return Math.round(rsi * 100) / 100;
+export async function fetchPreMarketData(_ticker: string): Promise<PreMarketData> {
+  return { preMarketPrice: null, preMarketChange: null, preMarketChangePercent: null };
 }
 
 /**
- * SMA sur N périodes (dernières N valeurs de l'historique).
- * Retourne null si l'historique est insuffisant.
+ * Indicateurs techniques — RSI/SMA indisponibles sans historique.
+ * Retourne toujours neutral : le Finance Agent utilise désormais changePercent et range.
  */
-function computeSma(closes: number[], period = 20): number | null {
-  if (closes.length < period) return null;
-  const slice = closes.slice(-period);
-  const sum   = slice.reduce((s, v) => s + v, 0);
-  return Math.round((sum / period) * 100) / 100;
-}
-
-/**
- * Calcule RSI(14), SMA(20) et la tendance à partir d'un historique de clôtures.
- *
- * Tendance :
- *   bullish  si prix actuel > SMA20 de plus de +0.5%
- *   bearish  si prix actuel < SMA20 de plus de -0.5%
- *   neutral  sinon
- */
-export function calculateTechnicals(priceHistory: number[]): Technicals {
-  const rsi   = computeRsi(priceHistory, 14);
-  const sma20 = computeSma(priceHistory, 20);
-
-  const lastPrice = priceHistory[priceHistory.length - 1];
-  let trend: "bullish" | "bearish" | "neutral" = "neutral";
-
-  if (sma20 !== null && lastPrice !== undefined) {
-    const deviation = (lastPrice - sma20) / sma20;
-    if (deviation >  0.005) trend = "bullish";
-    if (deviation < -0.005) trend = "bearish";
-  }
-
-  return { rsi, sma20, trend };
+export function calculateTechnicals(_priceHistory: number[]): Technicals {
+  return { rsi: null, sma20: null, trend: "neutral" };
 }

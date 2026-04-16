@@ -1,22 +1,19 @@
 /**
  * Finance Agent — détection d'opportunités sur les marchés stocks Polymarket
  *
- * Analyse chaque marché de type "Will AAPL close higher on April 15?"
- * via un système de scoring à points :
+ * Scoring basé sur les données Finnhub /quote :
  *
- *   Pré-marché > +1%      → +20 pts UP   | < -1% → +20 pts DOWN
- *   RSI < 30 (survendu)   → +15 pts UP   | RSI > 70 → +15 pts DOWN
- *   Prix > SMA20 (bullish)→ +10 pts UP   | Prix < SMA20 → +10 pts DOWN
- *   Volume > avg × 1.5   → +5 pts (confirme la tendance dominante)
+ *   changePercent ≥ 2%   → +25 UP   | ≤ -2%  → +25 DOWN
+ *   changePercent ≥ 1%   → +15 UP   | ≤ -1%  → +15 DOWN
+ *   changePercent ≥ 0.5% → +10 UP   | ≤ -0.5%→ +10 DOWN
+ *   Position dans range  → +10 UP (> 70%) ou DOWN (< 30%)
  *
- *   Score > 30  → HIGH,   estimatedProbability = 0.70
- *   Score 20-30 → MEDIUM, estimatedProbability = 0.62
- *   Score < 20  → skip
- *
- * Retourne les Outcome[] dont l'edge >= MIN_EDGE (7.98%), triés par edge desc.
+ *   Score ≥ 15 → bet, probabilité estimée = 0.5 + (upScore - downScore) / 100
+ *   Clampée entre 0.55 et 0.85.
+ *   Edge = estimatedProbability - marketPrice ≥ 7.98% pour valider.
  */
 
-import type { StockMarket }                         from "@/lib/polymarket/gamma-api";
+import type { StockMarket }                          from "@/lib/polymarket/gamma-api";
 import type { StockData, PreMarketData, Technicals } from "@/lib/data-sources/finance-sources";
 import type { Outcome }                              from "@/types";
 
@@ -24,113 +21,92 @@ import type { Outcome }                              from "@/types";
 // Constantes
 // ---------------------------------------------------------------------------
 
-const MIN_EDGE = 0.0798;
-
-/** Seuil de score pour chaque niveau de confiance. */
-const SCORE_HIGH   = 30;
-const SCORE_MEDIUM = 20;
-
-/** Probabilité estimée associée à chaque niveau de confiance. */
-const PROB_HIGH   = 0.70;
-const PROB_MEDIUM = 0.62;
+const MIN_EDGE        = 0.0798;
+const MIN_SCORE       = 10;
+const PROB_BASE       = 0.5;
+const PROB_MIN        = 0.55;
+const PROB_MAX        = 0.85;
 
 // ---------------------------------------------------------------------------
 // Scoring
 // ---------------------------------------------------------------------------
 
 interface ScoreBreakdown {
-  upScore: number;
+  upScore:   number;
   downScore: number;
-  details: string[];
+  signals:   string[];
 }
 
-function computeScore(
-  stockData:  StockData,
-  preMarket:  PreMarketData,
-  technicals: Technicals
-): ScoreBreakdown {
+function computeScore(data: StockData): ScoreBreakdown {
   let upScore   = 0;
   let downScore = 0;
-  const details: string[] = [];
+  const signals: string[] = [];
 
-  // --- Pré-marché ---
-  const pmPct = preMarket.preMarketChangePercent;
-  if (pmPct !== null) {
-    if (pmPct > 1) {
-      upScore += 20;
-      details.push(`preMarket=+${pmPct.toFixed(2)}% → +20 UP`);
-    } else if (pmPct < -1) {
-      downScore += 20;
-      details.push(`preMarket=${pmPct.toFixed(2)}% → +20 DOWN`);
-    } else {
-      details.push(`preMarket=${pmPct.toFixed(2)}% (neutre)`);
-    }
-  } else {
-    details.push("preMarket=N/A");
-  }
-
-  // --- RSI ---
-  const rsi = technicals.rsi;
-  if (rsi !== null) {
-    if (rsi < 30) {
-      upScore += 15;
-      details.push(`RSI=${rsi.toFixed(0)} (survendu) → +15 UP`);
-    } else if (rsi > 70) {
-      downScore += 15;
-      details.push(`RSI=${rsi.toFixed(0)} (suracheté) → +15 DOWN`);
-    } else {
-      details.push(`RSI=${rsi.toFixed(0)} (neutre)`);
-    }
-  } else {
-    details.push("RSI=N/A (historique insuffisant)");
-  }
-
-  // --- SMA20 ---
-  if (technicals.trend === "bullish") {
+  // --- Variation journalière ---
+  const cp = data.changePercent;
+  if (cp >= 2) {
+    upScore += 25;
+    signals.push(`changePercent=+${cp.toFixed(2)}% → UP +25`);
+  } else if (cp >= 1) {
+    upScore += 15;
+    signals.push(`changePercent=+${cp.toFixed(2)}% → UP +15`);
+  } else if (cp >= 0.5) {
     upScore += 10;
-    details.push(`trend=bullish (prix > SMA20) → +10 UP`);
-  } else if (technicals.trend === "bearish") {
+    signals.push(`changePercent=+${cp.toFixed(2)}% → UP +10`);
+  } else if (cp <= -2) {
+    downScore += 25;
+    signals.push(`changePercent=${cp.toFixed(2)}% → DOWN +25`);
+  } else if (cp <= -1) {
+    downScore += 15;
+    signals.push(`changePercent=${cp.toFixed(2)}% → DOWN +15`);
+  } else if (cp <= -0.5) {
     downScore += 10;
-    details.push(`trend=bearish (prix < SMA20) → +10 DOWN`);
+    signals.push(`changePercent=${cp.toFixed(2)}% → DOWN +10`);
   } else {
-    details.push("trend=neutral");
+    signals.push(`changePercent=${cp.toFixed(2)}% → neutral`);
   }
 
-  // --- Volume ---
-  if (stockData.avgVolume > 0 && stockData.volume > stockData.avgVolume * 1.5) {
-    // Le volume confirme la tendance dominante
-    if (upScore >= downScore) {
-      upScore += 5;
-      details.push(`volume=${(stockData.volume / 1e6).toFixed(1)}M > avg×1.5 → +5 UP`);
+  // --- Position dans le range du jour ---
+  if (data.high > data.low) {
+    const position = (data.currentPrice - data.low) / (data.high - data.low);
+    if (position > 0.7) {
+      upScore += 10;
+      signals.push(`range position=${(position * 100).toFixed(0)}% (haut) → UP +10`);
+    } else if (position < 0.3) {
+      downScore += 10;
+      signals.push(`range position=${(position * 100).toFixed(0)}% (bas) → DOWN +10`);
     } else {
-      downScore += 5;
-      details.push(`volume=${(stockData.volume / 1e6).toFixed(1)}M > avg×1.5 → +5 DOWN`);
+      signals.push(`range position=${(position * 100).toFixed(0)}% (neutre)`);
     }
+  } else {
+    signals.push("range=N/A (high = low)");
   }
 
-  return { upScore, downScore, details };
+  return { upScore, downScore, signals };
 }
 
 // ---------------------------------------------------------------------------
-// Résolution de la direction du marché
+// Probabilité estimée
 // ---------------------------------------------------------------------------
 
-/**
- * Détermine quel outcome d'un marché binaire correspond à "UP" ou "DOWN".
- * Pour un marché "Will AAPL close higher?", les outcomes sont souvent
- * ["Yes", "No"] ou ["Higher", "Lower"].
- */
+function estimateProbability(upScore: number, downScore: number): number {
+  const raw = PROB_BASE + (upScore - downScore) / 100;
+  return Math.min(PROB_MAX, Math.max(PROB_MIN, raw));
+}
+
+// ---------------------------------------------------------------------------
+// Résolution de la direction d'un outcome
+// ---------------------------------------------------------------------------
+
 function resolveOutcomeDirection(
-  outcomeLabel: string,
+  outcomeLabel:    string,
   marketDirection: "up" | "down" | "unknown"
 ): "up" | "down" | "unknown" {
   const o = outcomeLabel.toLowerCase().trim();
 
   if (/^yes$|higher|above|gain|up|rise/.test(o)) return "up";
-  if (/^no$|lower|below|drop|down|fall/.test(o)) return "down";
+  if (/^no$|lower|below|drop|down|fall/.test(o))  return "down";
 
-  // Si le marché est directionnel et qu'on n'a qu'un seul outcome ambigu,
-  // on suppose que "Yes" = sens du marché
   if (marketDirection !== "unknown") return marketDirection;
   return "unknown";
 }
@@ -139,68 +115,85 @@ function resolveOutcomeDirection(
 // Fonction principale
 // ---------------------------------------------------------------------------
 
-/**
- * Analyse un marché stock Polymarket et retourne les Outcome[] exploitables.
- *
- * @param market     Marché Polymarket (StockMarket)
- * @param stockData  Données Yahoo Finance (prix, volume, historique)
- * @param preMarket  Données pré-marché
- * @param technicals RSI, SMA20, tendance
- * @returns Outcomes avec edge >= 7.98%, triés par edge décroissant
- */
 export function analyzeStockMarket(
-  market:     StockMarket,
-  stockData:  StockData,
-  preMarket:  PreMarketData,
-  technicals: Technicals
+  market:      StockMarket,
+  stockData:   StockData,
+  _preMarket:  PreMarketData,
+  _technicals: Technicals
 ): Outcome[] {
-  const { upScore, downScore, details } = computeScore(stockData, preMarket, technicals);
+  // Scoring inline — changePercent lu directement depuis Finnhub /quote
+  let upScore   = 0;
+  let downScore = 0;
+  const signals: string[] = [];
+
+  const change = stockData.changePercent || 0;
+
+  if (change >= 2) {
+    upScore = 25;
+    signals.push(`change=+${change.toFixed(2)}% → UP +25`);
+  } else if (change >= 1) {
+    upScore = 15;
+    signals.push(`change=+${change.toFixed(2)}% → UP +15`);
+  } else if (change >= 0.5) {
+    upScore = 10;
+    signals.push(`change=+${change.toFixed(2)}% → UP +10`);
+  } else if (change <= -2) {
+    downScore = 25;
+    signals.push(`change=${change.toFixed(2)}% → DOWN +25`);
+  } else if (change <= -1) {
+    downScore = 15;
+    signals.push(`change=${change.toFixed(2)}% → DOWN +15`);
+  } else if (change <= -0.5) {
+    downScore = 10;
+    signals.push(`change=${change.toFixed(2)}% → DOWN +10`);
+  } else {
+    signals.push(`change=${change.toFixed(2)}% → neutral`);
+  }
+
+  // Position dans le range du jour
+  if (stockData.high > stockData.low) {
+    const position = (stockData.currentPrice - stockData.low) / (stockData.high - stockData.low);
+    if (position > 0.7) {
+      upScore += 10;
+      signals.push(`range position=${(position * 100).toFixed(0)}% (haut) → UP +10`);
+    } else if (position < 0.3) {
+      downScore += 10;
+      signals.push(`range position=${(position * 100).toFixed(0)}% (bas) → DOWN +10`);
+    } else {
+      signals.push(`range position=${(position * 100).toFixed(0)}% (neutre)`);
+    }
+  }
+
+  console.log(`[finance-agent] ${market.ticker}: change=${change}%, upScore=${upScore}, downScore=${downScore}`);
 
   const dominantScore     = Math.max(upScore, downScore);
   const dominantDirection = upScore >= downScore ? "up" : "down";
 
-  // Niveau de confiance
-  let confidence: "high" | "medium" | "low";
-  let estimatedProbability: number;
-
-  if (dominantScore >= SCORE_HIGH) {
-    confidence           = "high";
-    estimatedProbability = PROB_HIGH;
-  } else if (dominantScore >= SCORE_MEDIUM) {
-    confidence           = "medium";
-    estimatedProbability = PROB_MEDIUM;
-  } else {
-    confidence = "low";
-    console.log(
-      `[finance-agent] ${market.ticker}: score=${dominantScore} (${dominantDirection}) — skip (< ${SCORE_MEDIUM})`
-    );
+  if (dominantScore < MIN_SCORE) {
+    console.log(`[finance-agent] ${market.ticker}: score=${dominantScore} < ${MIN_SCORE} — skip`);
     return [];
   }
 
-  const pmStr = preMarket.preMarketChangePercent !== null
-    ? `${preMarket.preMarketChangePercent > 0 ? "+" : ""}${preMarket.preMarketChangePercent.toFixed(2)}%`
-    : "N/A";
-  const rsiStr = technicals.rsi !== null ? technicals.rsi.toFixed(0) : "N/A";
+  const estimatedProbability = estimateProbability(
+    dominantDirection === "up" ? upScore : 0,
+    dominantDirection === "up" ? 0 : downScore
+  );
 
   console.log(
-    `[finance-agent] ${market.ticker}: preMarket=${pmStr}, RSI=${rsiStr}, ` +
-    `score=${dominantScore}, confidence=${confidence.toUpperCase()}, ` +
-    `direction=${dominantDirection}`
+    `[finance-agent] ${market.ticker}: dominantScore=${dominantScore} → ${dominantDirection.toUpperCase()}, estimatedP=${estimatedProbability.toFixed(3)}`
   );
-  for (const d of details) {
-    console.log(`[finance-agent]   ${d}`);
+  for (const s of signals) {
+    console.log(`[finance-agent]   ${s}`);
   }
 
-  // Construire les Outcome[] pour les outcomes correspondant à la direction dominante
   const results: Outcome[] = [];
 
   for (let i = 0; i < market.outcomes.length; i++) {
     const label       = market.outcomes[i];
     const marketPrice = market.outcomePrices[i];
 
-    // Ignorer les prix invalides (marché résolu ou données corrompues)
     if (marketPrice < 0.01 || marketPrice > 0.99) {
-      console.log(`[finance-agent] Skipping outcome with invalid price: ${marketPrice} — "${label}"`);
+      console.log(`[finance-agent] ${market.ticker}: prix invalide ${marketPrice} — "${label}" ignoré`);
       continue;
     }
 
@@ -209,21 +202,24 @@ export function analyzeStockMarket(
 
     const edge = estimatedProbability - marketPrice;
 
-    // Edge > 50% : probablement une erreur de données, pas un signal réel
     if (edge > 0.50) {
       console.warn(
-        `[finance-agent] ${market.ticker}: Edge suspect (${(edge * 100).toFixed(1)}% > 50%) ` +
-        `pour "${label}" — ignoré`
+        `[finance-agent] ${market.ticker}: edge suspect (${(edge * 100).toFixed(1)}% > 50%) pour "${label}" — ignoré`
       );
       continue;
     }
 
     if (edge < MIN_EDGE) {
       console.log(
-        `[finance-agent] ${market.ticker}: outcome="${label}" — edge=${(edge * 100).toFixed(2)}% < ${(MIN_EDGE * 100).toFixed(2)}% — skip`
+        `[finance-agent] ${market.ticker}: outcome="${label}" — edge=${(edge * 100).toFixed(2)}% < ${(MIN_EDGE * 100).toFixed(2)}% ` +
+        `(estimé=${(estimatedProbability * 100).toFixed(1)}%, marché=${(marketPrice * 100).toFixed(1)}%) — skip`
       );
       continue;
     }
+
+    console.log(
+      `[finance-agent] ${market.ticker}: outcome="${label}" — edge=+${(edge * 100).toFixed(2)}% ✅`
+    );
 
     results.push({
       market,

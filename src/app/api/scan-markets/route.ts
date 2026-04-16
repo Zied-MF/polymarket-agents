@@ -258,12 +258,21 @@ export async function GET(): Promise<NextResponse<ScanResult>> {
       continue;
     }
 
-    if (market.outcomePrices.some((p) => p >= 0.9)) {
+    if (market.outcomePrices.some((p) => p >= 0.95)) {
       const dominant = market.outcomePrices.reduce((max, p) => Math.max(max, p), 0);
       const reason = `Consensus fort — prix dominant ${round(dominant * 100, 1)}%`;
+      console.log(
+        `[finance-agent] ${market.ticker}: consensus ${round(dominant * 100, 1)}% → skipped`
+      );
       skipped.push({ marketId: market.id, question: market.question, reason, agent: "finance" });
       continue;
     }
+
+    const upPct   = round(market.outcomePrices[0] * 100, 1);
+    const downPct = round((market.outcomePrices[1] ?? 1 - market.outcomePrices[0]) * 100, 1);
+    console.log(
+      `[finance-agent] ${market.ticker}: Up=${upPct}%, Down=${downPct}% → analyzing...`
+    );
 
     let stockData, preMarket, technicals;
     try {

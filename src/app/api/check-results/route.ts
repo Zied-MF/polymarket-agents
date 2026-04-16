@@ -23,6 +23,7 @@ import {
   resolvePaperTrade,
   type PaperTradeRow,
 }                                        from "@/lib/db/supabase";
+import { getPositionByPaperTradeId }    from "@/lib/db/positions";
 import { sendResultsSummary, type ResultDetail } from "@/lib/utils/discord";
 
 // ---------------------------------------------------------------------------
@@ -327,6 +328,33 @@ export async function GET(): Promise<NextResponse<CheckSummary>> {
 
   for (const trade of pendingPaperTrades) {
     const tag = `[check-results][paper][${trade.agent}][${trade.id.slice(0, 8)}]`;
+
+    // Vérifier si le trade a été vendu par le Position Manager
+    // (cas où markPaperTradeSold a échoué silencieusement mais la position est bien sold)
+    try {
+      const position = await getPositionByPaperTradeId(trade.id);
+      if (position?.status === "sold" && position.sell_pnl !== null) {
+        console.log(
+          `${tag} Trade vendu via Position Manager — sell_pnl=${position.sell_pnl >= 0 ? "+" : ""}${position.sell_pnl}`
+        );
+        await resolvePaperTrade(trade.id, {
+          actual_result: "sold",
+          won:           position.sell_pnl >= 0,
+          potential_pnl: position.sell_pnl,
+        });
+        paperResolved.push({
+          id:           trade.id,
+          agent:        trade.agent,
+          outcome:      trade.outcome,
+          actualResult: "sold",
+          won:          position.sell_pnl >= 0,
+          pnl:          position.sell_pnl,
+        });
+        continue;
+      }
+    } catch (err) {
+      console.warn(`${tag} getPositionByPaperTradeId échoué — résolution normale :`, err instanceof Error ? err.message : err);
+    }
 
     if (trade.agent === "weather") {
       if (!trade.city) {

@@ -243,7 +243,10 @@ export async function executeSell(
   suggestedBet: number,
   reason: string
 ): Promise<number> {
-  const sellPnl = Math.round((sellPrice - entryPrice) * suggestedBet * 100) / 100;
+  // P&L de vente simulée : gain/perte proportionnel au mouvement de prix
+  // (sellPrice - entryPrice) / entryPrice × suggestedBet
+  // Ex: entrée 0.40, sortie 0.60, bet 1 USDC → +0.50 USDC
+  const sellPnl = Math.round(((sellPrice - entryPrice) / entryPrice) * suggestedBet * 100) / 100;
   const now     = new Date().toISOString();
 
   const db = getClient();
@@ -283,4 +286,20 @@ export async function markPaperTradeSold(paperTradeId: string, sellPnl: number):
     .eq("id", paperTradeId);
 
   if (error) throw new Error(`[positions][markPaperTradeSold] ${error.message}`);
+}
+
+/**
+ * Retourne la position associée à un paper trade donné.
+ * Retourne null si introuvable ou en cas d'erreur (best-effort).
+ */
+export async function getPositionByPaperTradeId(paperTradeId: string): Promise<PositionRow | null> {
+  const db = getClient();
+  const { data, error } = await db
+    .from("positions")
+    .select("*")
+    .eq("paper_trade_id", paperTradeId)
+    .single();
+
+  if (error) return null;
+  return data as PositionRow;
 }

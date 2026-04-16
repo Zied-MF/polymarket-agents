@@ -90,7 +90,7 @@ export const cryptoAdapter: AgentConfig = {
       return { skipReason: `Edge net ${(edgeNet * 100).toFixed(1)}% < 5% (spread≈${(spreadEstimate * 100).toFixed(1)}%)` };
     }
 
-    const kelly = calculateHalfKelly(best.estimatedProbability, best.marketPrice, BANKROLL);
+    const kelly = calculateHalfKelly(best.estimatedProbability, best.marketPrice, BANKROLL, spreadEstimate);
 
     return {
       dominated: {

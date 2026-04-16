@@ -238,17 +238,57 @@ function resolveOutcome(
 }
 
 // ---------------------------------------------------------------------------
+// Helpers — résultat officiel Polymarket
+// ---------------------------------------------------------------------------
+
+/**
+ * Fetch le résultat officiel d'un marché résolu via la Gamma API.
+ * Retourne le libellé de l'outcome gagnant, ou null si le marché n'est pas
+ * encore résolu ou si l'API ne répond pas.
+ *
+ * Champs Gamma examinés (par ordre de priorité) :
+ *   data.outcome          — outcome JSON (format récent)
+ *   data.winningOutcome   — ancien champ
+ *   data.resolution       — certains endpoints
+ */
+async function fetchPolymarketOutcome(marketId: string): Promise<string | null> {
+  try {
+    const res = await fetch(
+      `https://gamma-api.polymarket.com/markets/${marketId}`,
+      { headers: { Accept: "application/json" }, signal: AbortSignal.timeout(8_000) }
+    );
+    if (!res.ok) {
+      console.warn(`[check-results] Gamma API ${res.status} pour market ${marketId}`);
+      return null;
+    }
+    const data = await res.json() as Record<string, unknown>;
+    const outcome =
+      (data.outcome         as string | undefined) ??
+      (data.winningOutcome  as string | undefined) ??
+      (data.resolution      as string | undefined) ??
+      null;
+    return outcome ?? null;
+  } catch (err) {
+    console.warn(
+      `[check-results] fetchPolymarketOutcome(${marketId}) failed:`,
+      err instanceof Error ? err.message : err
+    );
+    return null;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Helpers — P&L
 // ---------------------------------------------------------------------------
 
 // P&L calculé avec le bet HISTORIQUE (trade.suggested_bet), pas recalculé avec Kelly
 function computePnl(
-  result: "WIN" | "LOSS",
+  won: boolean,
   marketPrice: number,
   suggestedBet: number
 ): number {
   if (suggestedBet === 0) return 0;
-  return result === "WIN"
+  return won
     ? Math.round(((1 / marketPrice - 1) * suggestedBet) * 100) / 100
     : -suggestedBet;
 }
@@ -309,18 +349,35 @@ export async function GET(): Promise<NextResponse<CheckSummary>> {
       }
 
       const actual    = selectTemp(trade.outcome, highC, lowC, unit);
-      const result    = resolveOutcome(trade.outcome, actual, question);
-      const won       = result === "WIN";
-      const pnl       = computePnl(result, trade.market_price, trade.suggested_bet);
+      const ourResult = resolveOutcome(trade.outcome, actual, question);
       const actualStr = `high=${highC.toFixed(1)}°C low=${lowC.toFixed(1)}°C actual=${actual.toFixed(1)}°${unit}`;
 
+      // Fetch le résultat officiel Polymarket (best-effort)
+      const polymarketOutcome = await fetchPolymarketOutcome(trade.market_id);
+
+      // outcome_match : est-ce que Polymarket confirme notre outcome prédit ?
+      // Si Polymarket n'a pas encore résolu, on revient à notre calcul.
+      const outcomeMatch: boolean | null = polymarketOutcome !== null
+        ? polymarketOutcome.toLowerCase() === trade.outcome.toLowerCase()
+        : null;
+
+      const won = outcomeMatch !== null ? outcomeMatch : ourResult === "WIN";
+      const pnl = computePnl(won, trade.market_price, trade.suggested_bet);
+
       console.log(
-        `${tag} ${result} — outcome="${trade.outcome}"  ${actualStr}  ` +
+        `${tag} our=${ourResult}, polymarket=${polymarketOutcome ?? "N/A"}, ` +
+        `match=${outcomeMatch ?? "unknown"} — outcome="${trade.outcome}"  ${actualStr}  ` +
         `bet=${trade.suggested_bet}, pnl=${pnl >= 0 ? "+" : ""}${pnl.toFixed(2)}`
       );
 
       try {
-        await resolvePaperTrade(trade.id, actualStr, won, pnl);
+        await resolvePaperTrade(trade.id, {
+          actual_result:      actualStr,
+          won,
+          potential_pnl:      pnl,
+          polymarket_outcome: polymarketOutcome,
+          outcome_match:      outcomeMatch,
+        });
         paperResolved.push({ id: trade.id, agent: trade.agent, outcome: trade.outcome, actualResult: actualStr, won, pnl });
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);

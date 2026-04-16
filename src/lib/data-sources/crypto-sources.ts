@@ -68,15 +68,57 @@ export interface CryptoData {
 // Constantes
 // ---------------------------------------------------------------------------
 
-const COINGECKO_BASE       = "https://api.coingecko.com/api/v3";
-const INTER_REQUEST_DELAY  = 200; // ms — plan gratuit ~30 req/min
+const COINGECKO_BASE      = "https://api.coingecko.com/api/v3";
+const INTER_REQUEST_DELAY = 200; // ms — plan gratuit ~30 req/min
+const MAX_RETRIES         = 3;
 
 // ---------------------------------------------------------------------------
-// Helper HTTP
+// Helpers HTTP
 // ---------------------------------------------------------------------------
 
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+/**
+ * Fetch avec exponential backoff sur 429 et erreurs réseau.
+ * Délais : 1 s → 2 s → 4 s.
+ */
+async function fetchWithRetry<T>(
+  url:        string,
+  options?:   RequestInit,
+  maxRetries  = MAX_RETRIES
+): Promise<T> {
+  let lastError: Error | null = null;
+
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    try {
+      const res = await fetch(url, options);
+
+      if (res.status === 429) {
+        const delay = Math.pow(2, attempt) * 1_000;
+        console.log(`[crypto-sources] Rate limited (429), retry in ${delay}ms…`);
+        await sleep(delay);
+        continue;
+      }
+
+      if (!res.ok) {
+        const body = await res.text().catch(() => "");
+        throw new Error(`HTTP ${res.status} : ${body}`);
+      }
+
+      return (await res.json()) as T;
+    } catch (err) {
+      lastError = err instanceof Error ? err : new Error(String(err));
+      if (attempt < maxRetries - 1) {
+        const delay = Math.pow(2, attempt) * 1_000;
+        console.log(`[crypto-sources] Error: ${lastError.message}, retry in ${delay}ms…`);
+        await sleep(delay);
+      }
+    }
+  }
+
+  throw lastError ?? new Error("Max retries exceeded");
 }
 
 // ---------------------------------------------------------------------------
@@ -124,17 +166,10 @@ export async function fetchCryptoData(token: string): Promise<CryptoData> {
     `?ids=${id}&vs_currencies=usd` +
     `&include_24hr_change=true&include_24hr_vol=true`;
 
-  const res = await fetch(url, { headers: { Accept: "application/json" } });
-
-  if (!res.ok) {
-    const body = await res.text().catch(() => "");
-    throw new Error(`CoinGecko HTTP ${res.status} pour "${id}" : ${body}`);
-  }
-
-  const data = (await res.json()) as Record<
-    string,
-    { usd: number; usd_24h_change: number; usd_24h_vol: number }
-  >;
+  const data = await fetchWithRetry<Record<string, { usd: number; usd_24h_change: number; usd_24h_vol: number }>>(
+    url,
+    { headers: { Accept: "application/json" } }
+  );
 
   const entry = data[id];
   if (!entry || !entry.usd) {

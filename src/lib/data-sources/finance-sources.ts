@@ -60,11 +60,10 @@ export interface Technicals {
 // Constantes
 // ---------------------------------------------------------------------------
 
-const FINNHUB_BASE    = "https://finnhub.io/api/v1";
-const FINNHUB_API_KEY = process.env.FINNHUB_API_KEY ?? "demo";
-
-/** Délai entre requêtes pour rester sous 60 req/min. */
-const INTER_REQUEST_DELAY_MS = 100;
+const FINNHUB_BASE         = "https://finnhub.io/api/v1";
+const FINNHUB_API_KEY      = process.env.FINNHUB_API_KEY ?? "demo";
+const INTER_REQUEST_DELAY_MS = 100; // ms — plan gratuit 60 req/min
+const MAX_RETRIES            = 3;
 
 // ---------------------------------------------------------------------------
 // Types internes — réponse brute Finnhub /quote
@@ -81,25 +80,58 @@ interface FinnhubQuote {
 }
 
 // ---------------------------------------------------------------------------
-// Helper HTTP
+// Helpers HTTP
 // ---------------------------------------------------------------------------
 
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-async function fetchFinnhub<T>(path: string): Promise<T> {
-  await sleep(INTER_REQUEST_DELAY_MS);
+/**
+ * Fetch avec exponential backoff sur 429 et erreurs réseau.
+ * Délais : 1 s → 2 s → 4 s.
+ */
+async function fetchWithRetry<T>(
+  url:       string,
+  options?:  RequestInit,
+  maxRetries = MAX_RETRIES
+): Promise<T> {
+  let lastError: Error | null = null;
 
-  const url = `${FINNHUB_BASE}${path}`;
-  const res  = await fetch(url, { headers: { Accept: "application/json" } });
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    try {
+      const res = await fetch(url, options);
 
-  if (!res.ok) {
-    const body = await res.text().catch(() => "");
-    throw new Error(`Finnhub HTTP ${res.status} — ${path.split("?")[0]} : ${body}`);
+      if (res.status === 429) {
+        const delay = Math.pow(2, attempt) * 1_000;
+        console.log(`[finance-sources] Rate limited (429), retry in ${delay}ms…`);
+        await sleep(delay);
+        continue;
+      }
+
+      if (!res.ok) {
+        const body = await res.text().catch(() => "");
+        throw new Error(`HTTP ${res.status} : ${body}`);
+      }
+
+      return (await res.json()) as T;
+    } catch (err) {
+      lastError = err instanceof Error ? err : new Error(String(err));
+      if (attempt < maxRetries - 1) {
+        const delay = Math.pow(2, attempt) * 1_000;
+        console.log(`[finance-sources] Error: ${lastError.message}, retry in ${delay}ms…`);
+        await sleep(delay);
+      }
+    }
   }
 
-  return res.json() as Promise<T>;
+  throw lastError ?? new Error("Max retries exceeded");
+}
+
+async function fetchFinnhub<T>(path: string): Promise<T> {
+  await sleep(INTER_REQUEST_DELAY_MS);
+  const url = `${FINNHUB_BASE}${path}`;
+  return fetchWithRetry<T>(url, { headers: { Accept: "application/json" } });
 }
 
 // ---------------------------------------------------------------------------

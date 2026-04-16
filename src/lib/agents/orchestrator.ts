@@ -85,9 +85,10 @@ export interface ScanResult {
 class Orchestrator {
   private agents: AgentConfig[] = [];
 
-  private readonly maxPositionsPerAgent = 15;
-  private readonly minEdge              = 0.0798; // 7.98 %
-  private readonly batchSize            = 10;
+  private readonly maxPositionsPerAgent  = 15;
+  private readonly maxPositionsPerSector = 5;   // anti-corrélation
+  private readonly minEdge               = 0.0798; // 7.98 %
+  private readonly batchSize             = 10;
 
   /**
    * Enregistre un agent. Idempotent : un même `agent.name` n'est ajouté qu'une fois.
@@ -216,23 +217,51 @@ class Orchestrator {
   }
 
   /**
-   * Tri par edge décroissant + limite maxPositionsPerAgent par agent.
+   * Tri par edge décroissant + limites par agent et par secteur.
+   *
+   * Secteurs :
+   *   crypto  → tous les tokens forment un seul secteur (corrélés entre eux)
+   *   stocks  → toutes les actions forment un seul secteur
+   *   weather → une ville = un secteur (pas de corrélation entre villes)
    */
   private applyRiskLimits(opps: Opportunity[]): Opportunity[] {
     const sorted = [...opps].sort((a, b) => b.edge - a.edge);
-    const counts: Record<string, number> = {};
+    const countByAgent:  Record<string, number> = {};
+    const countBySector: Record<string, number> = {};
 
     return sorted.filter((opp) => {
-      const count = counts[opp.agent] ?? 0;
-      if (count >= this.maxPositionsPerAgent) {
+      // Limite par agent
+      const agentCount = countByAgent[opp.agent] ?? 0;
+      if (agentCount >= this.maxPositionsPerAgent) {
         console.log(
-          `[orchestrator] Risk limit: skipping ${opp.agent} opportunity (max ${this.maxPositionsPerAgent} reached)`
+          `[orchestrator] Risk limit (agent): skipping ${opp.agent} opportunity ` +
+          `(max ${this.maxPositionsPerAgent} reached)`
         );
         return false;
       }
-      counts[opp.agent] = count + 1;
+
+      // Limite par secteur (anti-corrélation)
+      const sector      = this.getSector(opp);
+      const sectorCount = countBySector[sector] ?? 0;
+      if (sectorCount >= this.maxPositionsPerSector) {
+        console.log(
+          `[orchestrator] Risk limit (sector): skipping ${opp.marketId} — ` +
+          `sector "${sector}" already at ${this.maxPositionsPerSector} positions`
+        );
+        return false;
+      }
+
+      countByAgent[opp.agent]   = agentCount + 1;
+      countBySector[sector]     = sectorCount + 1;
       return true;
     });
+  }
+
+  private getSector(opp: Opportunity): string {
+    if (opp.agent === "crypto")   return "crypto";          // tous corrélés
+    if (opp.agent === "finance")  return "stocks";          // toutes actions corrélées
+    if (opp.agent === "weather")  return `weather_${opp.city ?? "unknown"}`; // par ville
+    return "other";
   }
 }
 

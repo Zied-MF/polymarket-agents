@@ -8,8 +8,13 @@
  *   f* = (p·b − q) / b
  *
  * Si f* ≤ 0 → espérance négative, on ne mise pas.
- * Plafond à maxBetPercent × bankroll pour maîtriser le risque.
+ * Plafond à 10 % × bankroll pour maîtriser le risque.
  * Minimum à MIN_BET_AMOUNT : en dessous les frais mangent le gain.
+ *
+ * Frais intégrés dans calculateHalfKelly :
+ *   GAS_FEE      — ~1 centime de gas Polygon par transaction
+ *   PLATFORM_FEE — 2 % prélevés par Polymarket sur les gains nets
+ *   spreadEstimate — edge perdu à l'entrée (bid/ask), passé par les adapters
  */
 
 // ---------------------------------------------------------------------------
@@ -19,8 +24,14 @@
 /** Capital total disponible pour les bets de test (en USDC). */
 export const BANKROLL = 10;
 
+/** Gas Polygon estimé par transaction (en USDC). */
+const GAS_FEE = 0.01;
+
+/** Frais de plateforme Polymarket sur les gains nets. */
+const PLATFORM_FEE = 0.02;
+
 /** En dessous de ce montant la mise n'est pas suggérée (frais > edge). */
-const MIN_BET_AMOUNT = 0.05;
+const MIN_BET_AMOUNT = 0.10;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -87,37 +98,76 @@ export function calculateKellyBet(
 }
 
 /**
- * Variante demi-Kelly : mise la moitié de la fraction Kelly optimale.
- * Réduit la variance ~50% pour une perte d'espérance de croissance ~25%.
- * Recommandé en phase de test ou sur marchés peu liquides.
+ * Variante demi-Kelly avec intégration des frais réels (spread, gas, plateforme).
  *
- * Paramètres identiques à calculateKellyBet.
+ * Pipeline :
+ *   1. effectiveProbability = probability − spreadEstimate  (edge perdu au spread)
+ *   2. netOdds = grossOdds × (1 − PLATFORM_FEE)           (frais sur les gains)
+ *   3. Kelly = (p·b − q) / b  sur effectiveProbability + netOdds
+ *   4. Half-Kelly : diviser par 2
+ *   5. Cap à 10 % du bankroll
+ *   6. betAmount = bankroll × fraction − GAS_FEE
+ *   7. Si betAmount < 0.10€ → 0 (pas rentable)
+ *
+ * @param probability      Notre P(outcome) estimée        ex: 0.65
+ * @param marketPrice      Prix Polymarket [0, 1]          ex: 0.50
+ * @param bankroll         Capital disponible (USDC)       ex: 10
+ * @param spreadEstimate   Spread estimé [0, 1] (defaut 0) ex: 0.03
  */
 export function calculateHalfKelly(
-  probability: number,
-  marketPrice: number,
-  bankroll: number,
-  maxBetPercent = 0.1
+  probability:    number,
+  marketPrice:    number,
+  bankroll:       number,
+  spreadEstimate: number = 0
 ): KellyResult {
-  const full = calculateKellyBet(probability, marketPrice, bankroll, maxBetPercent);
+  if (marketPrice <= 0 || marketPrice >= 1) return zero();
 
-  if (full.betAmount === 0) return full;
+  // 1. Probabilité effective après spread (on perd de l'edge à l'entrée)
+  const effectiveProbability = Math.max(0, probability - spreadEstimate);
+  const q = 1 - effectiveProbability;
 
-  const b = (1 / marketPrice) - 1;
-  const effectiveFraction = full.effectiveFraction / 2;
+  // 2. Cote ajustée pour les frais de plateforme
+  const grossOdds = (1 / marketPrice) - 1;
+  const netOdds   = grossOdds * (1 - PLATFORM_FEE);
+
+  if (netOdds <= 0) return zero();
+
+  // 3. Fraction Kelly sur probabilité et cote nettes
+  const kellyFraction = (effectiveProbability * netOdds - q) / netOdds;
+
+  if (kellyFraction <= 0) return zero();
+
+  // 4. Half-Kelly + cap à 10 % du bankroll
+  const halfKelly        = kellyFraction / 2;
+  const effectiveFraction = Math.min(halfKelly, 0.10);
+
+  // 5. Montant brut − gas fee
   const rawAmount = effectiveFraction * bankroll;
-  const betAmount = Math.round(rawAmount * 100) / 100;
+  let betAmount   = rawAmount - GAS_FEE;
 
-  if (betAmount < MIN_BET_AMOUNT) return zero();
+  // 6. Minimum 0.10€, sinon pas rentable
+  // Warning : Kelly suggère un montant positif mais trop faible pour couvrir les frais
+  if (betAmount < MIN_BET_AMOUNT) {
+    if (kellyFraction > 0) {
+      console.warn(
+        `[kelly] ⚠️ OVERBETTING: Kelly suggests ${rawAmount.toFixed(3)}€ ` +
+        `(after gas: ${betAmount.toFixed(3)}€) but min_bet is ${MIN_BET_AMOUNT}€ — skipping`
+      );
+    }
+    return zero();
+  }
 
-  const potentialProfit = Math.round(betAmount * b * 100) / 100;
+  betAmount = Math.round(betAmount * 100) / 100;
 
-  return {
-    kellyFraction: full.kellyFraction,
-    effectiveFraction,
-    betAmount,
-    potentialProfit,
-  };
+  const potentialProfit = Math.round(betAmount * netOdds * 100) / 100;
+
+  console.log(
+    `[kelly] p=${(effectiveProbability * 100).toFixed(1)}% (spread−${(spreadEstimate * 100).toFixed(1)}%), ` +
+    `odds=${netOdds.toFixed(2)} (net), kelly=${(kellyFraction * 100).toFixed(1)}%, ` +
+    `half-kelly=${(effectiveFraction * 100).toFixed(1)}%, bet=${betAmount}€`
+  );
+
+  return { kellyFraction, effectiveFraction, betAmount, potentialProfit };
 }
 
 // ---------------------------------------------------------------------------

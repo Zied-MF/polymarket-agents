@@ -118,13 +118,17 @@ export interface PaperTradeRow {
   market_context: Record<string, unknown> | null;
   /** Date+heure exacte de résolution prévue (UTC) — pour détecter les délais UMA. */
   expected_resolution: string | null;
+  /** Outcome officiel retourné par Polymarket après résolution (ex: "Yes", "Above 68"). */
+  polymarket_outcome: string | null;
+  /** true si notre prédiction correspond à l'outcome officiel Polymarket. */
+  outcome_match: boolean | null;
 }
 
 export type SavePaperTradeInput = Omit<
   PaperTradeRow,
-  "id" | "created_at" | "actual_result" | "won" | "resolved_at"
+  // Champs auto-générés ou remplis à la résolution
+  "id" | "created_at" | "actual_result" | "won" | "resolved_at" | "polymarket_outcome" | "outcome_match"
 >;
-// market_context et expected_resolution sont inclus dans SavePaperTradeInput (nullable)
 
 export type SaveBetInput = {
   opportunity_id: string;
@@ -481,22 +485,29 @@ export async function getPendingPaperTrades(): Promise<PaperTradeRow[]> {
 
 /**
  * Résout un paper trade après vérification du résultat réel.
- * Met à jour actual_result, won, potential_pnl et resolved_at.
+ * Met à jour actual_result, won, potential_pnl, resolved_at,
+ * et optionnellement polymarket_outcome + outcome_match pour audit.
  */
 export async function resolvePaperTrade(
   id: string,
-  actualResult: string,
-  won: boolean,
-  pnl: number
+  data: {
+    actual_result:       string;
+    won:                 boolean;
+    potential_pnl:       number;
+    polymarket_outcome?: string | null;
+    outcome_match?:      boolean | null;
+  }
 ): Promise<void> {
   const db = getClient();
   const { error } = await db
     .from("paper_trades")
     .update({
-      actual_result: actualResult,
-      won,
-      potential_pnl: pnl,
-      resolved_at:   new Date().toISOString(),
+      actual_result:      data.actual_result,
+      won:                data.won,
+      potential_pnl:      data.potential_pnl,
+      resolved_at:        new Date().toISOString(),
+      polymarket_outcome: data.polymarket_outcome ?? null,
+      outcome_match:      data.outcome_match      ?? null,
     })
     .eq("id", id);
 

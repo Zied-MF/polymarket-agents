@@ -14,7 +14,7 @@
 
 import { NextResponse }                          from "next/server";
 import { evaluatePosition, type MarketSnapshot } from "@/lib/positions/position-manager";
-import { getOpenPositions, updatePosition, recordSellSignal } from "@/lib/db/positions";
+import { getOpenPositions, updatePosition, executeSell, markPaperTradeSold } from "@/lib/db/positions";
 import { sendSellSignals, type SellSignalNotification } from "@/lib/utils/discord";
 
 // ---------------------------------------------------------------------------
@@ -180,15 +180,30 @@ export async function GET(): Promise<NextResponse<MonitorResult>> {
       );
 
       try {
-        await recordSellSignal(
+        const sellPnl = await executeSell(
           position.id,
-          signal.reason,
           signal.currentPrice,
-          signal.currentProb
+          position.entryPrice,
+          position.suggestedBet,
+          signal.reason
         );
+
+        const label = position.city ?? position.ticker ?? position.question;
+        console.log(
+          `[monitor-positions] SELL executed: ${label}, ` +
+          `entry=${position.entryPrice.toFixed(3)}, sell=${signal.currentPrice.toFixed(3)}, ` +
+          `pnl=${sellPnl >= 0 ? "+" : ""}${sellPnl.toFixed(3)}€`
+        );
+
+        // Marquer le paper trade associé comme vendu pour éviter une double résolution
+        if (position.paperTradeId) {
+          await markPaperTradeSold(position.paperTradeId, sellPnl).catch((err) =>
+            console.error(`${tag} ✗ markPaperTradeSold : ${err instanceof Error ? err.message : err}`)
+          );
+        }
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
-        console.error(`${tag} ✗ recordSellSignal : ${msg}`);
+        console.error(`${tag} ✗ executeSell : ${msg}`);
         errors.push({ positionId: position.id, error: msg });
       }
 
@@ -212,7 +227,7 @@ export async function GET(): Promise<NextResponse<MonitorResult>> {
         agent:        position.agent,
         entryPrice:   position.entryPrice,
         currentPrice: signal.currentPrice,
-        status:       "sell_signal",
+        status:       "sold",
         action:       signal.suggestedAction,
         reason:       signal.reason,
         potentialPnl: signal.potentialPnl,

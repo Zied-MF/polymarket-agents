@@ -1,32 +1,28 @@
 /**
- * Check-results endpoint — résolution des opportunités passées
+ * Check-results endpoint — résolution des paper trades passés
  *
  * GET /api/check-results
  *
  * Pipeline :
- *   1. Récupère les opportunités "detected" dont detected_at < aujourd'hui
+ *   1. Récupère les paper trades weather non résolus dont resolution_date < aujourd'hui
+ *      (exclut les trades déjà vendus via monitor-positions)
  *   2. Pour chaque, fetch la température réelle via Open-Meteo Archive API
  *   3. Compare avec l'outcome prédit → WIN ou LOSS
- *   4. Calcule le P&L (half-Kelly simulé)
- *   5. Met à jour Supabase (status, actual_result, pnl)
- *   6. Met à jour daily_stats (wins, losses, total_pnl)
- *   7. Envoie un résumé Discord
- *   8. Retourne le rapport complet
+ *   4. Met à jour Supabase (actual_result, won, potential_pnl, resolved_at)
+ *   5. Envoie un résumé Discord
+ *   6. Retourne le rapport complet
+ *
+ * P&L calculé avec le bet HISTORIQUE (trade.suggested_bet), pas recalculé avec Kelly
  */
 
 import { NextResponse }                  from "next/server";
 import { STATION_MAPPING }               from "@/lib/data/station-mapping";
 import { getCoordinates }               from "@/lib/data-sources/geocoding";
 import {
-  getPendingOpportunities,
-  updateOpportunityResult,
-  updateDailyResultStats,
   getPendingPaperTrades,
   resolvePaperTrade,
-  type OpportunityRow,
   type PaperTradeRow,
 }                                        from "@/lib/db/supabase";
-import { calculateHalfKelly, BANKROLL }  from "@/lib/utils/kelly";
 import { sendResultsSummary, type ResultDetail } from "@/lib/utils/discord";
 
 // ---------------------------------------------------------------------------
@@ -39,20 +35,6 @@ const ARCHIVE_BASE = "https://archive-api.open-meteo.com/v1/archive";
 // Types de réponse
 // ---------------------------------------------------------------------------
 
-interface CheckDetail {
-  id: string;
-  city: string;
-  date: string;
-  outcome: string;
-  actual: number;
-  unit: "F" | "C";
-  result: "WIN" | "LOSS";
-  marketPrice: number;
-  estimatedProbability: number;
-  suggestedBet: number;
-  pnl: number;
-}
-
 interface PaperTradeResolved {
   id: string;
   agent: string;
@@ -64,16 +46,11 @@ interface PaperTradeResolved {
 
 interface CheckSummary {
   checkedAt: string;
-  checked: number;
-  wins: number;
-  losses: number;
-  skipped: number;
-  winRate: number;
-  totalPnL: number;
-  details: CheckDetail[];
   paper_trades_resolved: number;
   paper_trades_wins: number;
+  paper_trades_losses: number;
   paper_trades_pnl: number;
+  details: PaperTradeResolved[];
   errors: { id: string; question: string | null; error: string }[];
 }
 
@@ -91,21 +68,20 @@ const MONTHS: Record<string, number> = {
  * Exemples :
  *   "Highest temperature in NYC on April 14?" → "2026-04-14"
  *   "Will the low temp in Chicago on April 15 be below 50°F?" → "2026-04-15"
- * Fallback : lendemain de detected_at.
+ * Fallback : lendemain de created_at.
  */
-function parseDateFromQuestion(question: string, detectedAt: string): string {
+function parseDateFromQuestion(question: string, createdAt: string): string {
   const m = question.match(
     /\b(january|february|march|april|may|june|july|august|september|october|november|december)\s+(\d{1,2})\b/i
   );
   if (m) {
     const month   = MONTHS[m[1].toLowerCase()];
     const day     = parseInt(m[2], 10);
-    const detYear = new Date(detectedAt).getUTCFullYear();
+    const detYear = new Date(createdAt).getUTCFullYear();
     const date    = new Date(Date.UTC(detYear, month, day));
     return date.toISOString().split("T")[0];
   }
-  // Fallback : lendemain de la détection (marché J+1 le plus fréquent)
-  const det = new Date(detectedAt);
+  const det = new Date(createdAt);
   det.setUTCDate(det.getUTCDate() + 1);
   return det.toISOString().split("T")[0];
 }
@@ -145,7 +121,6 @@ async function fetchActualTemperature(
   stationCode: string,
   dateStr: string
 ): Promise<{ highC: number; lowC: number }> {
-  // Chemin rapide : mapping statique (ICAO ou alias nom de ville)
   let lat: number;
   let lon: number;
 
@@ -154,7 +129,6 @@ async function fetchActualTemperature(
     lat = station.lat;
     lon = station.lon;
   } else {
-    // Fallback : géocodage dynamique
     const geo = await getCoordinates(stationCode);
     if (!geo) throw new Error(`Station/ville inconnue : "${stationCode}"`);
     lat = geo.lat;
@@ -244,9 +218,9 @@ function resolveOutcome(
   }
 
   if (o === "yes" || o === "no") {
-    const q       = question.toLowerCase();
-    const numM    = q.match(/([\d.]+)/);
-    const thresh  = numM ? parseFloat(numM[1]) : null;
+    const q      = question.toLowerCase();
+    const numM   = q.match(/([\d.]+)/);
+    const thresh = numM ? parseFloat(numM[1]) : null;
     let base: "WIN" | "LOSS";
     if (thresh !== null && /above|high(est)?/i.test(q)) {
       base = actual > thresh ? "WIN" : "LOSS";
@@ -267,13 +241,13 @@ function resolveOutcome(
 // Helpers — P&L
 // ---------------------------------------------------------------------------
 
+// P&L calculé avec le bet HISTORIQUE (trade.suggested_bet), pas recalculé avec Kelly
 function computePnl(
   result: "WIN" | "LOSS",
   marketPrice: number,
-  suggestedBet: number  // bet historique stocké au moment du scan — ne jamais recalculer
+  suggestedBet: number
 ): number {
   if (suggestedBet === 0) return 0;
-
   return result === "WIN"
     ? Math.round(((1 / marketPrice - 1) * suggestedBet) * 100) / 100
     : -suggestedBet;
@@ -287,130 +261,27 @@ export async function GET(): Promise<NextResponse<CheckSummary>> {
   const checkedAt = new Date();
   console.log(`[check-results] ▶ Démarrage — ${checkedAt.toISOString()}`);
 
-  // 1. Récupérer les opportunités en attente
-  let pending: OpportunityRow[];
-  try {
-    pending = await getPendingOpportunities();
-    console.log(`[check-results] ${pending.length} opportunité(s) à vérifier`);
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    console.error(`[check-results] ✗ getPendingOpportunities : ${msg}`);
-    return NextResponse.json(
-      {
-        checkedAt: checkedAt.toISOString(),
-        checked: 0, wins: 0, losses: 0, skipped: 0,
-        winRate: 0, totalPnL: 0, details: [],
-        paper_trades_resolved: 0, paper_trades_wins: 0, paper_trades_pnl: 0,
-        errors: [{ id: "N/A", question: null, error: msg }],
-      },
-      { status: 502 }
-    );
-  }
-
-  const details: CheckDetail[]         = [];
-  const errors: CheckSummary["errors"] = [];
-  let skipped = 0;
-
-  // 2. Traiter chaque opportunité
-  for (const opp of pending) {
-    const tag = `[check-results][${opp.station_code ?? "?"}][${opp.id.slice(0, 8)}]`;
-
-    if (!opp.station_code) {
-      console.warn(`${tag} Pas de station_code — ignoré`);
-      skipped++;
-      continue;
-    }
-
-    const question   = opp.question ?? "";
-    const targetDate = parseDateFromQuestion(question, opp.detected_at);
-    const unit       = detectUnit(opp.outcome);
-
-    // 3. Température réelle
-    let highC: number, lowC: number;
-    try {
-      ({ highC, lowC } = await fetchActualTemperature(opp.station_code, targetDate));
-      console.log(
-        `${tag} Temp réelle ${targetDate} : high=${highC.toFixed(1)}°C  low=${lowC.toFixed(1)}°C`
-      );
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      console.error(`${tag} ✗ fetchActualTemperature : ${msg}`);
-      errors.push({ id: opp.id, question, error: msg });
-      continue;
-    }
-
-    // 4. Résolution WIN / LOSS
-    const actual       = selectTemp(opp.outcome, highC, lowC, unit);
-    const result       = resolveOutcome(opp.outcome, actual, question);
-    const kelly        = calculateHalfKelly(opp.estimated_probability, opp.market_price, BANKROLL);
-    const suggestedBet = kelly.betAmount;
-    const pnl          = computePnl(result, opp.market_price, suggestedBet);
-
-    console.log(
-      `${tag} ${result} — outcome="${opp.outcome}"  ` +
-      `actual=${actual.toFixed(1)}°${unit}  ` +
-      `pnl=${pnl >= 0 ? "+" : ""}${pnl.toFixed(2)}€`
-    );
-
-    // 5. Mise à jour Supabase
-    try {
-      await updateOpportunityResult(opp.id, {
-        status:        result === "WIN" ? "won" : "lost",
-        actual_result: highC,   // toujours stocké en °C
-        pnl,
-      });
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      console.error(`${tag} ✗ updateOpportunityResult : ${msg}`);
-      errors.push({ id: opp.id, question, error: msg });
-    }
-
-    details.push({
-      id:                   opp.id,
-      city:                 opp.city ?? opp.station_code,
-      date:                 targetDate,
-      outcome:              opp.outcome,
-      actual:               Math.round(actual * 10) / 10,
-      unit,
-      result,
-      marketPrice:          opp.market_price,
-      estimatedProbability: opp.estimated_probability,
-      suggestedBet,
-      pnl,
-    });
-  }
-
-  // 6. Agrégation
-  const wins    = details.filter((d) => d.result === "WIN").length;
-  const losses  = details.filter((d) => d.result === "LOSS").length;
-  const checked = details.length;
-  const winRate = checked > 0 ? wins / checked : 0;
-  const totalPnL = Math.round(
-    details.reduce((sum, d) => sum + d.pnl, 0) * 100
-  ) / 100;
-
-  // 7. Mise à jour daily_stats
-  if (checked > 0) {
-    const todayStr = checkedAt.toISOString().split("T")[0];
-    updateDailyResultStats(todayStr, wins, losses, totalPnL).catch((err) =>
-      console.error(
-        "[check-results] ✗ updateDailyResultStats :",
-        err instanceof Error ? err.message : err
-      )
-    );
-  }
-
-  // 7b. Résoudre les paper trades en attente
   const paperResolved: PaperTradeResolved[] = [];
-  let pendingPaperTrades: PaperTradeRow[] = [];
+  const errors: CheckSummary["errors"]      = [];
+  let pendingPaperTrades: PaperTradeRow[]   = [];
 
   try {
     pendingPaperTrades = await getPendingPaperTrades();
     console.log(`[check-results] ${pendingPaperTrades.length} paper trade(s) à résoudre`);
   } catch (err) {
-    console.error(
-      "[check-results] ✗ getPendingPaperTrades :",
-      err instanceof Error ? err.message : err
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(`[check-results] ✗ getPendingPaperTrades : ${msg}`);
+    return NextResponse.json(
+      {
+        checkedAt: checkedAt.toISOString(),
+        paper_trades_resolved: 0,
+        paper_trades_wins:     0,
+        paper_trades_losses:   0,
+        paper_trades_pnl:      0,
+        details: [],
+        errors: [{ id: "N/A", question: null, error: msg }],
+      },
+      { status: 502 }
     );
   }
 
@@ -443,8 +314,10 @@ export async function GET(): Promise<NextResponse<CheckSummary>> {
       const pnl       = computePnl(result, trade.market_price, trade.suggested_bet);
       const actualStr = `high=${highC.toFixed(1)}°C low=${lowC.toFixed(1)}°C actual=${actual.toFixed(1)}°${unit}`;
 
-      console.log(`${tag} ${result} — outcome="${trade.outcome}"  ${actualStr}  pnl=${pnl >= 0 ? "+" : ""}${pnl.toFixed(2)}`);
-      console.log(`${tag} Trade resolved: bet=${trade.suggested_bet}, result=${result}, pnl=${pnl}`);
+      console.log(
+        `${tag} ${result} — outcome="${trade.outcome}"  ${actualStr}  ` +
+        `bet=${trade.suggested_bet}, pnl=${pnl >= 0 ? "+" : ""}${pnl.toFixed(2)}`
+      );
 
       try {
         await resolvePaperTrade(trade.id, actualStr, won, pnl);
@@ -456,61 +329,56 @@ export async function GET(): Promise<NextResponse<CheckSummary>> {
       }
 
     } else if (trade.agent === "finance") {
-      // Finance paper trades: skip resolution (requires live stock data not available in archive)
       console.log(`${tag} Finance paper trade — résolution manuelle requise, ignoré`);
     }
   }
 
+  // Résumé
+  const wins   = paperResolved.filter((p) => p.won).length;
+  const losses = paperResolved.filter((p) => !p.won).length;
+  const pnl    = Math.round(paperResolved.reduce((s, p) => s + p.pnl, 0) * 100) / 100;
+
   if (paperResolved.length > 0) {
-    const paperWins = paperResolved.filter((p) => p.won).length;
-    const paperPnl  = Math.round(paperResolved.reduce((s, p) => s + p.pnl, 0) * 100) / 100;
     console.log(
-      `[check-results] 🃏 ${paperResolved.length} paper trade(s) résolus — ` +
-      `${paperWins}W / ${paperResolved.length - paperWins}L  P&L ${paperPnl >= 0 ? "+" : ""}${paperPnl.toFixed(2)}`
+      `[check-results] ■ Terminé — ${paperResolved.length} paper trade(s) résolus — ` +
+      `${wins}W / ${losses}L  P&L ${pnl >= 0 ? "+" : ""}${pnl.toFixed(2)}€, ${errors.length} erreurs`
     );
-  }
 
-  // 8. Notification Discord (fire-and-forget)
-  if (checked > 0) {
-    const discordDetails: ResultDetail[] = details.map((d) => ({
-      city:    d.city,
-      date:    d.date,
-      outcome: d.outcome,
-      actual:  d.actual,
-      unit:    d.unit,
-      result:  d.result,
-      pnl:     d.pnl,
-    }));
-    sendResultsSummary(
-      { checked, wins, losses, winRate, totalPnL, details: discordDetails },
-      checkedAt
-    ).catch((err) =>
-      console.error(
-        "[check-results] ✗ sendResultsSummary :",
-        err instanceof Error ? err.message : err
-      )
-    );
-  }
+    // Notification Discord (fire-and-forget)
+    const discordDetails: ResultDetail[] = paperResolved
+      .filter((p) => p.agent === "weather")
+      .map((p) => ({
+        city:    p.actualResult.split(" ")[0],
+        date:    checkedAt.toISOString().split("T")[0],
+        outcome: p.outcome,
+        actual:  0,
+        unit:    "F" as const,
+        result:  p.won ? "WIN" : "LOSS",
+        pnl:     p.pnl,
+      }));
 
-  // 9. Résumé console
-  const pnlSign = totalPnL >= 0 ? "+" : "";
-  console.log(
-    `[check-results] ■ Terminé — ${checked} vérifiés, ${wins}W / ${losses}L, ` +
-    `P&L ${pnlSign}${totalPnL.toFixed(2)}€, ${skipped} ignorés, ${errors.length} erreurs`
-  );
+    if (discordDetails.length > 0) {
+      sendResultsSummary(
+        { checked: paperResolved.length, wins, losses, winRate: wins / paperResolved.length, totalPnL: pnl, details: discordDetails },
+        checkedAt
+      ).catch((err) =>
+        console.error(
+          "[check-results] ✗ sendResultsSummary :",
+          err instanceof Error ? err.message : err
+        )
+      );
+    }
+  } else {
+    console.log(`[check-results] ■ Terminé — aucun paper trade à résoudre, ${errors.length} erreurs`);
+  }
 
   return NextResponse.json({
-    checkedAt: checkedAt.toISOString(),
-    checked,
-    wins,
-    losses,
-    skipped,
-    winRate:  Math.round(winRate * 1000) / 1000,
-    totalPnL,
-    details,
+    checkedAt:             checkedAt.toISOString(),
     paper_trades_resolved: paperResolved.length,
-    paper_trades_wins:     paperResolved.filter((p) => p.won).length,
-    paper_trades_pnl:      Math.round(paperResolved.reduce((s, p) => s + p.pnl, 0) * 100) / 100,
+    paper_trades_wins:     wins,
+    paper_trades_losses:   losses,
+    paper_trades_pnl:      pnl,
+    details:               paperResolved,
     errors,
   });
 }

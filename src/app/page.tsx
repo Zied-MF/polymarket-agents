@@ -102,9 +102,15 @@ export default function Dashboard() {
             </div>
             <a
               href="/results"
-              className="px-4 py-2 bg-gray-800 hover:bg-gray-700 border border-gray-700 rounded-lg font-medium transition text-sm"
+              className="px-3 py-2 text-sm text-gray-400 hover:text-white border border-gray-700 hover:border-gray-600 rounded-lg transition"
             >
               📊 Results
+            </a>
+            <a
+              href="/positions"
+              className="px-3 py-2 text-sm text-gray-400 hover:text-white border border-gray-700 hover:border-gray-600 rounded-lg transition"
+            >
+              📍 Positions
             </a>
             <button
               onClick={fetchData}

@@ -459,11 +459,13 @@ export async function getPendingPaperTrades(): Promise<PaperTradeRow[]> {
   const db = getClient();
   const today = new Date().toISOString().split("T")[0];
 
+  // Exclut les paper trades déjà vendus via monitor-positions (actual_result = 'sold')
   const { data, error } = await db
     .from("paper_trades")
     .select("*")
     .is("won", null)
     .lt("resolution_date", today)
+    .neq("actual_result", "sold")
     .order("resolution_date", { ascending: true });
 
   if (error) throw new Error(`[supabase][getPendingPaperTrades] ${error.message}`);

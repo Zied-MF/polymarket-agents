@@ -372,12 +372,17 @@ export default function ResultsPage() {
           </div>
 
           <div className="flex items-center gap-3">
-            {/* Lien vers le dashboard principal */}
             <a
               href="/"
               className="px-3 py-2 text-sm text-gray-400 hover:text-white border border-gray-700 hover:border-gray-600 rounded-lg transition"
             >
               ← Dashboard
+            </a>
+            <a
+              href="/positions"
+              className="px-3 py-2 text-sm text-gray-400 hover:text-white border border-gray-700 hover:border-gray-600 rounded-lg transition"
+            >
+              📍 Positions
             </a>
 
             {/* Sélecteur de période */}

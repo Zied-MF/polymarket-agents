@@ -21,9 +21,17 @@
  *                           CHECK (status IN ('open', 'hold', 'sell_signal', 'sold', 'resolved')),
  *     sell_reason         text,
  *     sell_signal_at      timestamptz,
+ *     sold_at             timestamptz,
+ *     sell_price          numeric,
+ *     sell_pnl            numeric,
  *     opened_at           timestamptz DEFAULT now(),
  *     resolution_date     date
  *   );
+ *
+ *   -- Colonnes ajoutées après coup (si la table existe déjà) :
+ *   ALTER TABLE positions ADD COLUMN IF NOT EXISTS sold_at TIMESTAMPTZ;
+ *   ALTER TABLE positions ADD COLUMN IF NOT EXISTS sell_price DECIMAL;
+ *   ALTER TABLE positions ADD COLUMN IF NOT EXISTS sell_pnl DECIMAL;
  *
  *   CREATE INDEX positions_status_idx ON positions(status);
  *   CREATE INDEX positions_market_id_idx ON positions(market_id);
@@ -79,6 +87,9 @@ export interface PositionRow {
   status: "open" | "hold" | "sell_signal" | "sold" | "resolved";
   sell_reason: string | null;
   sell_signal_at: string | null;
+  sold_at: string | null;
+  sell_price: number | null;
+  sell_pnl: number | null;
   opened_at: string;
   resolution_date: string | null;
 }
@@ -218,4 +229,58 @@ export async function recordSellSignal(
     .eq("id", id);
 
   if (error) throw new Error(`[positions][recordSellSignal] ${error.message}`);
+}
+
+/**
+ * Exécute la vente simulée d'une position (status → 'sold').
+ * Calcule et persiste le P&L de vente.
+ * Retourne le sellPnl calculé.
+ */
+export async function executeSell(
+  id: string,
+  sellPrice: number,
+  entryPrice: number,
+  suggestedBet: number,
+  reason: string
+): Promise<number> {
+  const sellPnl = Math.round((sellPrice - entryPrice) * suggestedBet * 100) / 100;
+  const now     = new Date().toISOString();
+
+  const db = getClient();
+  const { error } = await db
+    .from("positions")
+    .update({
+      status:              "sold",
+      sell_reason:         reason,
+      sell_signal_at:      now,
+      sold_at:             now,
+      sell_price:          sellPrice,
+      sell_pnl:            sellPnl,
+      current_price:       sellPrice,
+      current_probability: sellPrice,
+    })
+    .eq("id", id);
+
+  if (error) throw new Error(`[positions][executeSell] ${error.message}`);
+  return sellPnl;
+}
+
+/**
+ * Marque le paper_trade associé à une position vendue comme résolu (résolution manuelle).
+ * Cela empêche check-results de tenter de le résoudre via l'archive météo.
+ */
+export async function markPaperTradeSold(paperTradeId: string, sellPnl: number): Promise<void> {
+  if (!paperTradeId) return;
+  const db = getClient();
+  const { error } = await db
+    .from("paper_trades")
+    .update({
+      actual_result: "sold",
+      won:           sellPnl >= 0,
+      potential_pnl: sellPnl,
+      resolved_at:   new Date().toISOString(),
+    })
+    .eq("id", paperTradeId);
+
+  if (error) throw new Error(`[positions][markPaperTradeSold] ${error.message}`);
 }

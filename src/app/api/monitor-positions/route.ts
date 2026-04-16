@@ -101,6 +101,18 @@ interface MonitorResult {
 }
 
 // ---------------------------------------------------------------------------
+// Constantes
+// ---------------------------------------------------------------------------
+
+/** Âge minimum d'une position avant qu'elle soit éligible à la vente.
+ *  Évite de vendre immédiatement après l'ouverture quand entry_price ≈ current_price. */
+const MIN_POSITION_AGE_MS = 30 * 60 * 1000; // 30 minutes
+
+/** Variation minimale du prix pour déclencher une évaluation.
+ *  En dessous, le marché n'a pas bougé significativement. */
+const MIN_PRICE_CHANGE_RATIO = 0.01; // 1%
+
+// ---------------------------------------------------------------------------
 // Handler
 // ---------------------------------------------------------------------------
 
@@ -131,8 +143,23 @@ export async function GET(): Promise<NextResponse<MonitorResult>> {
     );
   }
 
-  // 2. Évaluer chaque position
-  for (const position of positions) {
+  // Filtrer les positions trop récentes (< 30 min) — évite les ventes immédiates
+  const now = Date.now();
+  const eligiblePositions = positions.filter((p) => {
+    const ageMs = now - new Date(p.openedAt).getTime();
+    if (ageMs < MIN_POSITION_AGE_MS) {
+      console.log(
+        `[monitor-positions] ⏭ ${p.id.slice(0, 8)} (${p.agent}) trop récente ` +
+        `(${Math.round(ageMs / 1000 / 60)}min < 30min) — ignorée`
+      );
+      return false;
+    }
+    return true;
+  });
+  console.log(`[monitor-positions] ${eligiblePositions.length}/${positions.length} position(s) éligible(s)`);
+
+  // 2. Évaluer chaque position éligible
+  for (const position of eligiblePositions) {
     const tag = `[monitor-positions][${position.agent}][${position.id.slice(0, 8)}]`;
 
     // 2a. Fetch snapshot de marché
@@ -160,6 +187,48 @@ export async function GET(): Promise<NextResponse<MonitorResult>> {
       (o) => o.toLowerCase() === position.outcome.toLowerCase()
     );
     const currentPrice = outcomeIdx >= 0 ? snapshot.outcomePrices[outcomeIdx] : null;
+
+    // Log de debug : âge, variation prix, variation proba
+    const ageMin      = Math.round((Date.now() - new Date(position.openedAt).getTime()) / 1000 / 60);
+    const priceChange = currentPrice !== null
+      ? Math.abs(currentPrice - position.entryPrice) / position.entryPrice
+      : 0;
+    const probChange  = currentPrice !== null
+      ? position.entryProbability - currentPrice
+      : 0;
+
+    console.log(
+      `${tag} age=${ageMin}min, priceChange=${(priceChange * 100).toFixed(2)}%, ` +
+      `probChange=${(probChange * 100).toFixed(1)}pts ` +
+      `(entry=${position.entryPrice.toFixed(3)}, current=${currentPrice?.toFixed(3) ?? "N/A"})`
+    );
+
+    // Guard : ne pas évaluer si le prix n'a pas bougé significativement (< 1%)
+    if (currentPrice !== null && priceChange < MIN_PRICE_CHANGE_RATIO) {
+      console.log(`${tag} ⏭ Prix quasi-inchangé (${(priceChange * 100).toFixed(2)}% < 1%) — HOLD sans évaluation`);
+      try {
+        await updatePosition(position.id, {
+          currentPrice,
+          currentProbability: currentPrice,
+          status: "hold",
+        });
+      } catch (err) {
+        console.error(`${tag} ✗ updatePosition (no-change) :`, err instanceof Error ? err.message : err);
+      }
+      positionSummaries.push({
+        id:           position.id,
+        question:     position.question,
+        outcome:      position.outcome,
+        agent:        position.agent,
+        entryPrice:   position.entryPrice,
+        currentPrice,
+        status:       "hold",
+        action:       "HOLD",
+        reason:       `Prix inchangé (${(priceChange * 100).toFixed(2)}% < 1%)`,
+        potentialPnl: Math.round((currentPrice - position.entryPrice) * position.suggestedBet * 100) / 100,
+      });
+      continue;
+    }
 
     // Mettre à jour currentPrice/currentProbability dans la position pour l'évaluation
     const positionWithCurrent = {

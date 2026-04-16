@@ -104,6 +104,10 @@ export const financeAdapter: AgentConfig = {
 
     const kelly = calculateHalfKelly(best.estimatedProbability, best.marketPrice, BANKROLL, spreadEstimate);
 
+    if (kelly.betAmount === 0) {
+      return { skipReason: `Kelly bet insuffisant (spread≈${(spreadEstimate * 100).toFixed(1)}%, mise < MIN)` };
+    }
+
     return {
       dominated: {
         marketId:             m.id,

@@ -361,13 +361,15 @@ export async function GET(): Promise<NextResponse<CheckSummary>> {
         ? polymarketOutcome.toLowerCase() === trade.outcome.toLowerCase()
         : null;
 
-      const won = outcomeMatch !== null ? outcomeMatch : ourResult === "WIN";
-      const pnl = computePnl(won, trade.market_price, trade.suggested_bet);
+      const won         = outcomeMatch !== null ? outcomeMatch : ourResult === "WIN";
+      const marketPrice  = Number(trade.market_price);
+      const suggestedBet = Number(trade.suggested_bet);
+      const pnl          = computePnl(won, marketPrice, suggestedBet);
 
       console.log(
         `${tag} our=${ourResult}, polymarket=${polymarketOutcome ?? "N/A"}, ` +
         `match=${outcomeMatch ?? "unknown"} — outcome="${trade.outcome}"  ${actualStr}  ` +
-        `bet=${trade.suggested_bet}, pnl=${pnl >= 0 ? "+" : ""}${pnl.toFixed(2)}`
+        `price=${marketPrice}, bet=${suggestedBet}, pnl=${pnl >= 0 ? "+" : ""}${pnl.toFixed(2)}`
       );
 
       try {

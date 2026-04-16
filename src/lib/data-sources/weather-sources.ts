@@ -22,6 +22,55 @@ import type { WeatherForecast, ModelTemps }   from "@/types";
 const OPEN_METEO_BASE = "https://api.open-meteo.com/v1/forecast";
 
 // ---------------------------------------------------------------------------
+// Cache mémoire — évite de refetch les mêmes coordonnées/date en 10 min
+// (plusieurs marchés NYC 80°F / 81°F / 82°F partagent le même appel)
+// ---------------------------------------------------------------------------
+
+interface CacheEntry {
+  data:      WeatherForecast;
+  timestamp: number;
+}
+
+const forecastCache = new Map<string, CacheEntry>();
+const CACHE_TTL     = 10 * 60 * 1000; // 10 minutes
+
+function getCachedForecast(key: string): WeatherForecast | null {
+  const cached = forecastCache.get(key);
+  if (cached && Date.now() - cached.timestamp < CACHE_TTL) {
+    console.log(`[weather-sources] 📦 Cache hit: ${key}`);
+    return cached.data;
+  }
+  return null;
+}
+
+function setCachedForecast(key: string, data: WeatherForecast): void {
+  forecastCache.set(key, { data, timestamp: Date.now() });
+}
+
+// ---------------------------------------------------------------------------
+// fetchInBatches — fetch séquentiel par batch avec délai entre chaque
+// ---------------------------------------------------------------------------
+
+export async function fetchInBatches<T, R>(
+  items:     T[],
+  fetchFn:   (item: T) => Promise<R>,
+  batchSize = 5,
+  delayMs   = 200
+): Promise<R[]> {
+  const results: R[] = [];
+  for (let i = 0; i < items.length; i += batchSize) {
+    const batch        = items.slice(i, i + batchSize);
+    const batchResults = await Promise.all(batch.map(fetchFn));
+    results.push(...batchResults);
+    // Délai entre les batches (sauf le dernier)
+    if (i + batchSize < items.length) {
+      await new Promise<void>((r) => setTimeout(r, delayMs));
+    }
+  }
+  return results;
+}
+
+// ---------------------------------------------------------------------------
 // Types internes
 // ---------------------------------------------------------------------------
 
@@ -107,7 +156,12 @@ export async function fetchForecast(
   date: Date,
   timezone = "auto"
 ): Promise<WeatherForecast> {
-  const dateStr    = toDateString(date);
+  const dateStr = toDateString(date);
+  const cacheKey = `${lat.toFixed(4)},${lon.toFixed(4)},${dateStr}`;
+
+  // Retourner depuis le cache si disponible (même station, même jour)
+  const cached = getCachedForecast(cacheKey);
+  if (cached) return cached;
 
   // Demander 16 jours pour couvrir tous les marchés Polymarket actifs
   const url = new URL(OPEN_METEO_BASE);
@@ -117,7 +171,9 @@ export async function fetchForecast(
   url.searchParams.set("timezone",      timezone);
   url.searchParams.set("forecast_days", "16");
 
-  const res = await fetch(url.toString());
+  const res = await fetch(url.toString(), {
+    signal: AbortSignal.timeout(15_000),
+  });
   if (!res.ok) {
     throw new Error(`Open-Meteo error ${res.status}: ${await res.text()}`);
   }
@@ -157,7 +213,7 @@ export async function fetchForecast(
   // modelHighTemps vide (pas de multi-modèles dans cet endpoint)
   const modelHighTemps: ModelTemps = {};
 
-  return {
+  const result: WeatherForecast = {
     city:           "", // rempli par fetchForecastForStation
     country:        "",
     highTemp,
@@ -170,6 +226,9 @@ export async function fetchForecast(
     source:         "open-meteo",
     fetchedAt:      new Date(),
   };
+
+  setCachedForecast(cacheKey, result);
+  return result;
 }
 
 /**
@@ -186,16 +245,19 @@ export async function fetchForecastForStation(
   cityOrCode: string,
   date: Date
 ): Promise<WeatherForecast | null> {
+  const t0 = Date.now();
+
   // --- Chemin rapide : mapping statique ---
   const station = getStationCoordinates(cityOrCode);
   if (station) {
     const forecast = await fetchForecast(station.lat, station.lon, date, station.timezone);
     const result   = { ...forecast, city: station.city, country: station.country };
+    const elapsed  = Date.now() - t0;
 
     console.log(
       `[weather-sources] ${station.city} ${date.toISOString().slice(0, 10)}: ` +
-      `high=${result.highTemp}°C, low=${result.lowTemp}°C, ` +
-      `sigma=${result.dynamicSigma}, confidence=${result.confidenceLevel}`
+      `high=${result.highTemp}°C low=${result.lowTemp}°C ` +
+      `sigma=${result.dynamicSigma} (${elapsed}ms)`
     );
 
     return result;
@@ -210,11 +272,12 @@ export async function fetchForecastForStation(
 
   const forecast = await fetchForecast(geo.lat, geo.lon, date, "auto");
   const result   = { ...forecast, city: cityOrCode, country: geo.country };
+  const elapsed  = Date.now() - t0;
 
   console.log(
     `[weather-sources] ${cityOrCode} ${date.toISOString().slice(0, 10)}: ` +
-    `high=${result.highTemp}°C, low=${result.lowTemp}°C, ` +
-    `sigma=${result.dynamicSigma}, confidence=${result.confidenceLevel}`
+    `high=${result.highTemp}°C low=${result.lowTemp}°C ` +
+    `sigma=${result.dynamicSigma} (${elapsed}ms)`
   );
 
   return result;

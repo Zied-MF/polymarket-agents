@@ -49,6 +49,16 @@ export const cryptoAdapter: AgentConfig = {
   async fetchMarkets(): Promise<CryptoMarket[]> {
     const markets = await fetchCryptoMarkets();
 
+    console.log(`[crypto-adapter] ${markets.length} marchés récupérés depuis Gamma`);
+    if (markets.length > 0) {
+      const s = markets[0];
+      console.log(
+        `[crypto-adapter] Premier marché: id=${s.id} token=${s.token}` +
+        ` liq=${s.liquidity} outcomes=${JSON.stringify(s.outcomes)}` +
+        ` prices=${JSON.stringify(s.outcomePrices)} q="${s.question.slice(0, 80)}"`
+      );
+    }
+
     return markets.filter((m) => {
       if (m.liquidity < MIN_LIQUIDITY) {
         console.log(`[crypto-adapter] ⏭ Liquidité insuffisante ($${round(m.liquidity, 2)}) — ${m.token}`);

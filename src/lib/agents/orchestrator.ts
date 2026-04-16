@@ -88,7 +88,8 @@ class Orchestrator {
   private readonly maxPositionsPerAgent  = 15;
   private readonly maxPositionsPerSector = 5;   // anti-corrélation
   private readonly minEdge               = 0.0798; // 7.98 %
-  private readonly batchSize             = 10;
+  private readonly batchSize             = 5;
+  private readonly batchDelayMs          = 200; // pause entre batches pour éviter 429
 
   /**
    * Enregistre un agent. Idempotent : un même `agent.name` n'est ajouté qu'une fois.
@@ -123,7 +124,7 @@ class Orchestrator {
           const opportunities: Opportunity[] = [];
           const skipped:       SkippedMarket[] = [];
 
-          // Analyser par batch de batchSize en parallèle
+          // Analyser par batch de batchSize en parallèle, avec délai entre chaque
           for (let i = 0; i < markets.length; i += this.batchSize) {
             const batch = markets.slice(i, i + this.batchSize);
             const batchResults = await Promise.all(
@@ -132,6 +133,10 @@ class Orchestrator {
             for (const r of batchResults) {
               if (r.opportunity) opportunities.push(r.opportunity);
               if (r.skipped)     skipped.push(r.skipped);
+            }
+            // Pause entre batches pour éviter les 429 sur les APIs externes
+            if (i + this.batchSize < markets.length) {
+              await new Promise<void>((r) => setTimeout(r, this.batchDelayMs));
             }
           }
 

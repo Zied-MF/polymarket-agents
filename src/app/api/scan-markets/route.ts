@@ -40,6 +40,7 @@ function ensureAgentsRegistered(): void {
   orchestrator.registerAgent(financeAdapter);
   orchestrator.registerAgent(cryptoAdapter);
   agentsRegistered = true;
+  console.log(`[scan-markets] Agents enregistrés: weather, finance, crypto`);
 }
 
 // ---------------------------------------------------------------------------

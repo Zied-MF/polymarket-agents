@@ -7,7 +7,14 @@
       "Bash(node -e \"const p = require\\('./package.json'\\); console.log\\(p.dependencies?.tailwindcss || p.devDependencies?.tailwindcss\\)\")",
       "Bash(npx --yes tsc --version)",
       "Bash(echo \"EXIT: $?\")",
-      "Read(//Users/ziedfeikh/Documents/polymarket-agents/src/app/api/scan-markets/**)"
+      "Read(//Users/ziedfeikh/Documents/polymarket-agents/src/app/api/scan-markets/**)",
+      "Bash(curl -s http://localhost:3000/api/scan-markets)",
+      "Bash(curl -s http://localhost:3000/api/debug-crypto)",
+      "Bash(python3 -m json.tool)",
+      "Bash(curl -s \"https://gamma-api.polymarket.com/events?tag_slug=crypto&active=true&closed=false&order=endDate&ascending=true&limit=5\")",
+      "Bash(python3 -c ':*)",
+      "Bash(curl -s \"https://gamma-api.polymarket.com/events?tag_slug=crypto&active=true&closed=false&order=endDate&ascending=false&limit=10\")",
+      "Bash(curl -s \"https://gamma-api.polymarket.com/events?tag_slug=crypto&active=true&closed=false&order=endDate&ascending=false&limit=100\")"
     ]
   }
 }

@@ -45,6 +45,8 @@ const TOKEN_MAP: Record<string, string> = {
   BONK:  "bonk",
   JUP:   "jupiter-exchange-solana",
   TRUMP: "official-trump",
+  BNB:   "binancecoin",
+  HYPE:  "hyperliquid",
 };
 
 // ---------------------------------------------------------------------------

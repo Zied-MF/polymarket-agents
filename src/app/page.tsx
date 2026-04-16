@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import { useState } from "react";
 
 interface Opportunity {
   marketId:             string;
@@ -26,38 +26,34 @@ interface ScanResult {
   scannedAt:      string;
   duration:       string;
   byAgent:        Record<string, AgentStats>;
-  opportunities:  number;   // count
+  opportunities:  number;
   saved:          number;
-  skipped:        number;   // count
+  skipped:        number;
   details:        Opportunity[];
   skippedDetails: { marketId: string; question: string; reason: string; agent: string }[];
   errors:         { marketId: string; question: string; error: string }[];
 }
 
 export default function Dashboard() {
-  const [data, setData] = useState<ScanResult | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
+  const [data, setData]             = useState<ScanResult | null>(null);
+  const [scanning, setScanning]     = useState(false);
+  const [error, setError]           = useState<string | null>(null);
   const [showSkipped, setShowSkipped] = useState(false);
 
-  const fetchData = async () => {
-    setLoading(true);
+  const runScan = async () => {
+    setScanning(true);
     setError(null);
     try {
       const res = await fetch("/api/scan-markets");
-      if (!res.ok) throw new Error("Failed to fetch");
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const json = await res.json();
       setData(json);
     } catch (e) {
-      setError("Erreur lors du chargement des données");
+      setError(e instanceof Error ? e.message : "Erreur lors du scan");
     } finally {
-      setLoading(false);
+      setScanning(false);
     }
   };
-
-  useEffect(() => {
-    fetchData();
-  }, []);
 
   const getEdgeColor = (edge: number) => {
     if (edge >= 0.15) return "text-green-400";
@@ -90,7 +86,7 @@ export default function Dashboard() {
 
   const avgEdge = data?.details?.length
     ? (data.details.reduce((acc, o) => acc + o.edge, 0) / data.details.length * 100).toFixed(1)
-    : "0";
+    : null;
 
   const totalScanned = data?.byAgent
     ? Object.values(data.byAgent).reduce((acc, s) => acc + s.scanned, 0)
@@ -98,29 +94,24 @@ export default function Dashboard() {
 
   return (
     <div className="min-h-screen bg-gray-950 text-white p-6">
-      {/* Header */}
       <div className="max-w-6xl mx-auto">
+
+        {/* Header */}
         <div className="flex items-center justify-between mb-8">
           <div>
-            <h1 className="text-3xl font-bold flex items-center gap-3">
-              📊 Polymarket Trading Agent
-            </h1>
+            <h1 className="text-3xl font-bold">📊 Polymarket Trading Agent</h1>
             <p className="text-gray-400 mt-1">
               {data?.scannedAt
-                ? `Dernière mise à jour : ${new Date(data.scannedAt).toLocaleString("fr-FR")}`
-                : "Chargement..."}
+                ? `Scan du ${new Date(data.scannedAt).toLocaleString("fr-FR")} — ${data.duration}`
+                : "Aucun scan effectué — cliquez sur Lancer le scan"}
             </p>
           </div>
-          <div className="flex items-center gap-4">
-            <div className="flex items-center gap-2">
-              <span className="w-3 h-3 bg-green-500 rounded-full animate-pulse"></span>
-              <span className="text-green-400">Running</span>
-            </div>
+          <div className="flex items-center gap-3">
             <a
               href="/results"
               className="px-3 py-2 text-sm text-gray-400 hover:text-white border border-gray-700 hover:border-gray-600 rounded-lg transition"
             >
-              📊 Results
+              📊 Résultats
             </a>
             <a
               href="/positions"
@@ -129,117 +120,159 @@ export default function Dashboard() {
               📍 Positions
             </a>
             <button
-              onClick={fetchData}
-              disabled={loading}
-              className="px-4 py-2 bg-blue-600 hover:bg-blue-700 rounded-lg font-medium disabled:opacity-50 transition"
+              onClick={runScan}
+              disabled={scanning}
+              className="px-5 py-2 bg-blue-600 hover:bg-blue-700 rounded-lg font-medium disabled:opacity-50 transition flex items-center gap-2"
             >
-              {loading ? "⏳ Chargement..." : "🔄 Rafraîchir"}
+              {scanning
+                ? <><span className="animate-spin">⏳</span> Scan en cours…</>
+                : "🔍 Lancer le scan"}
             </button>
           </div>
         </div>
 
-        {/* Stats */}
-        <div className="grid grid-cols-1 md:grid-cols-4 gap-4 mb-8">
-          <div className="bg-gray-900 rounded-xl p-4 border border-gray-800">
-            <p className="text-gray-400 text-sm">Marchés scannés</p>
-            <p className="text-2xl font-bold">{totalScanned ?? "-"}</p>
+        {/* Scan en cours — bannière */}
+        {scanning && (
+          <div className="bg-blue-500/10 border border-blue-500/30 rounded-xl p-4 mb-6 flex items-center gap-3">
+            <span className="animate-spin text-xl">⏳</span>
+            <div>
+              <p className="font-medium text-blue-300">Scan en cours…</p>
+              <p className="text-blue-400/70 text-sm">Weather + Finance + Crypto agents actifs. Peut prendre 30–90 secondes.</p>
+            </div>
           </div>
-          <div className="bg-gray-900 rounded-xl p-4 border border-gray-800">
-            <p className="text-gray-400 text-sm">Opportunités</p>
-            <p className="text-2xl font-bold text-green-400">{data?.opportunities ?? "-"}</p>
-          </div>
-          <div className="bg-gray-900 rounded-xl p-4 border border-gray-800">
-            <p className="text-gray-400 text-sm">Edge moyen</p>
-            <p className="text-2xl font-bold text-yellow-400">{avgEdge}%</p>
-          </div>
-          <div className="bg-gray-900 rounded-xl p-4 border border-gray-800">
-            <p className="text-gray-400 text-sm">Sauvegardés DB</p>
-            <p className="text-2xl font-bold text-blue-400">{data?.saved ?? "-"}</p>
-          </div>
-        </div>
+        )}
 
-        {/* Error */}
+        {/* Erreur */}
         {error && (
-          <div className="bg-red-500/10 border border-red-500/50 rounded-xl p-4 mb-8 text-red-400">
+          <div className="bg-red-500/10 border border-red-500/50 rounded-xl p-4 mb-6 text-red-400">
             {error}
           </div>
         )}
 
-        {/* Opportunities */}
-        <div className="mb-8">
-          <h2 className="text-xl font-semibold mb-4 flex items-center gap-2">
-            🎯 Opportunités détectées
-            <span className="text-sm font-normal text-gray-400">
-              ({data?.opportunities ?? 0})
-            </span>
-          </h2>
-
-          {data?.opportunities === 0 && !loading && (
-            <div className="bg-gray-900 rounded-xl p-8 text-center text-gray-400 border border-gray-800">
-              Aucune opportunité détectée pour le moment
-            </div>
-          )}
-
-          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-            {data?.details.map((opp, i) => (
-              <div key={i} className="bg-gray-900 rounded-xl p-5 border border-gray-800 hover:border-gray-700 transition">
-                <div className="flex items-start justify-between mb-3">
-                  <div>
-                    <h3 className="font-semibold text-lg">{opp.city ?? opp.ticker ?? opp.token ?? "Unknown"}</h3>
-                    <p className="text-gray-400 text-sm truncate max-w-[200px]">{opp.question}</p>
-                  </div>
-                  <div className="flex flex-col items-end gap-1">
-                    {getAgentBadge(opp.agent)}
-                    {getConfidenceBadge(opp.confidence)}
-                  </div>
-                </div>
-
-                <div className="mb-3">
-                  <p className="text-sm text-gray-400 mb-1">Outcome prédit</p>
-                  <p className="font-mono text-lg">{opp.outcome}</p>
-                </div>
-
-                <div className="mb-3">
-                  <div className="flex justify-between text-sm mb-1">
-                    <span className="text-gray-400">Marché: {(opp.marketPrice * 100).toFixed(0)}%</span>
-                    <span className="text-blue-400">Notre: {(opp.estimatedProbability * 100).toFixed(0)}%</span>
-                  </div>
-                  <div className="h-2 bg-gray-800 rounded-full overflow-hidden">
-                    <div
-                      className="h-full bg-gradient-to-r from-red-500 via-yellow-500 to-green-500"
-                      style={{ width: `${opp.estimatedProbability * 100}%` }}
-                    ></div>
-                  </div>
-                </div>
-
-                <div className="flex items-center justify-between pt-3 border-t border-gray-800">
-                  <div>
-                    <span className="text-gray-400 text-sm">Edge: </span>
-                    <span className={`font-bold ${getEdgeColor(opp.edge)}`}>
-                      +{(opp.edge * 100).toFixed(1)}%
-                    </span>
-                  </div>
-                  <div>
-                    <span className="text-gray-400 text-sm">Mise: </span>
-                    <span className="font-bold text-green-400">
-                      {opp.suggestedBet?.toFixed(2) ?? "0.00"}€
-                    </span>
-                  </div>
-                  <div>
-                    <span className="text-gray-400 text-sm">x</span>
-                    <span className="font-bold text-purple-400">
-                      {opp.marketPrice > 0 ? (1 / opp.marketPrice).toFixed(1) : "-"}
-                    </span>
-                  </div>
-                </div>
-              </div>
-            ))}
+        {/* Stats — toujours visibles */}
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-8">
+          <div className="bg-gray-900 rounded-xl p-4 border border-gray-800">
+            <p className="text-gray-400 text-sm">Marchés scannés</p>
+            <p className="text-2xl font-bold">{totalScanned ?? "—"}</p>
+          </div>
+          <div className="bg-gray-900 rounded-xl p-4 border border-gray-800">
+            <p className="text-gray-400 text-sm">Opportunités</p>
+            <p className="text-2xl font-bold text-green-400">{data?.opportunities ?? "—"}</p>
+          </div>
+          <div className="bg-gray-900 rounded-xl p-4 border border-gray-800">
+            <p className="text-gray-400 text-sm">Edge moyen</p>
+            <p className="text-2xl font-bold text-yellow-400">{avgEdge != null ? `${avgEdge}%` : "—"}</p>
+          </div>
+          <div className="bg-gray-900 rounded-xl p-4 border border-gray-800">
+            <p className="text-gray-400 text-sm">Sauvegardés</p>
+            <p className="text-2xl font-bold text-blue-400">{data?.saved ?? "—"}</p>
           </div>
         </div>
 
-        {/* Skipped Markets */}
+        {/* Par agent */}
+        {data?.byAgent && (
+          <div className="grid grid-cols-3 gap-4 mb-8">
+            {Object.entries(data.byAgent).map(([agent, stats]) => (
+              <div key={agent} className="bg-gray-900 rounded-xl p-4 border border-gray-800">
+                <p className="text-gray-400 text-sm capitalize">{agent}</p>
+                <p className="text-lg font-bold">
+                  {stats.opportunities} <span className="text-sm text-gray-500">/ {stats.scanned} marchés</span>
+                </p>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {/* État initial — avant le premier scan */}
+        {!data && !scanning && (
+          <div className="bg-gray-900 rounded-xl p-12 text-center border border-gray-800 border-dashed">
+            <p className="text-4xl mb-4">🔍</p>
+            <p className="text-xl text-gray-300 mb-2">Aucun scan effectué</p>
+            <p className="text-gray-500 mb-6">Cliquez sur "Lancer le scan" pour analyser les marchés.</p>
+            <button
+              onClick={runScan}
+              className="px-6 py-3 bg-blue-600 hover:bg-blue-700 rounded-lg font-medium transition"
+            >
+              🔍 Lancer le scan
+            </button>
+          </div>
+        )}
+
+        {/* Opportunités */}
+        {data && (
+          <div className="mb-8">
+            <h2 className="text-xl font-semibold mb-4 flex items-center gap-2">
+              🎯 Opportunités détectées
+              <span className="text-sm font-normal text-gray-400">({data.opportunities})</span>
+            </h2>
+
+            {data.opportunities === 0 && (
+              <div className="bg-gray-900 rounded-xl p-8 text-center text-gray-400 border border-gray-800">
+                Aucune opportunité détectée pour ce scan
+              </div>
+            )}
+
+            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+              {data.details.map((opp, i) => (
+                <div key={i} className="bg-gray-900 rounded-xl p-5 border border-gray-800 hover:border-gray-700 transition">
+                  <div className="flex items-start justify-between mb-3">
+                    <div>
+                      <h3 className="font-semibold text-lg">{opp.city ?? opp.ticker ?? opp.token ?? "Unknown"}</h3>
+                      <p className="text-gray-400 text-sm truncate max-w-[200px]">{opp.question}</p>
+                    </div>
+                    <div className="flex flex-col items-end gap-1">
+                      {getAgentBadge(opp.agent)}
+                      {getConfidenceBadge(opp.confidence)}
+                    </div>
+                  </div>
+
+                  <div className="mb-3">
+                    <p className="text-sm text-gray-400 mb-1">Outcome prédit</p>
+                    <p className="font-mono text-lg">{opp.outcome}</p>
+                  </div>
+
+                  <div className="mb-3">
+                    <div className="flex justify-between text-sm mb-1">
+                      <span className="text-gray-400">Marché: {(opp.marketPrice * 100).toFixed(0)}%</span>
+                      <span className="text-blue-400">Notre: {(opp.estimatedProbability * 100).toFixed(0)}%</span>
+                    </div>
+                    <div className="h-2 bg-gray-800 rounded-full overflow-hidden">
+                      <div
+                        className="h-full bg-gradient-to-r from-red-500 via-yellow-500 to-green-500"
+                        style={{ width: `${opp.estimatedProbability * 100}%` }}
+                      />
+                    </div>
+                  </div>
+
+                  <div className="flex items-center justify-between pt-3 border-t border-gray-800">
+                    <div>
+                      <span className="text-gray-400 text-sm">Edge: </span>
+                      <span className={`font-bold ${getEdgeColor(opp.edge)}`}>
+                        +{(opp.edge * 100).toFixed(1)}%
+                      </span>
+                    </div>
+                    <div>
+                      <span className="text-gray-400 text-sm">Mise: </span>
+                      <span className="font-bold text-green-400">
+                        {opp.suggestedBet?.toFixed(2) ?? "0.00"}€
+                      </span>
+                    </div>
+                    <div>
+                      <span className="text-gray-400 text-sm">x</span>
+                      <span className="font-bold text-purple-400">
+                        {opp.marketPrice > 0 ? (1 / opp.marketPrice).toFixed(1) : "—"}
+                      </span>
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* Marchés ignorés */}
         {data?.skippedDetails && data.skippedDetails.length > 0 && (
-          <div>
+          <div className="mb-8">
             <button
               onClick={() => setShowSkipped(!showSkipped)}
               className="flex items-center gap-2 text-gray-400 hover:text-white transition mb-4"
@@ -254,13 +287,15 @@ export default function Dashboard() {
                   <thead className="bg-gray-800">
                     <tr>
                       <th className="text-left p-3 text-gray-400">Marché</th>
+                      <th className="text-left p-3 text-gray-400">Agent</th>
                       <th className="text-left p-3 text-gray-400">Raison</th>
                     </tr>
                   </thead>
                   <tbody>
                     {data.skippedDetails.map((s, i) => (
                       <tr key={i} className="border-t border-gray-800">
-                        <td className="p-3 truncate max-w-[300px]">{s.question}</td>
+                        <td className="p-3 truncate max-w-[280px]">{s.question}</td>
+                        <td className="p-3 text-gray-500 capitalize">{s.agent}</td>
                         <td className="p-3 text-gray-400">{s.reason}</td>
                       </tr>
                     ))}
@@ -272,9 +307,9 @@ export default function Dashboard() {
         )}
 
         {/* Footer */}
-        <div className="mt-12 text-center text-gray-500 text-sm">
-          <p>Polymarket Trading Agent v1.0 — Cron toutes les 15 minutes</p>
-          <p>Weather + Finance Agents | Budget: 10€ | Kelly Criterion: Half-Kelly</p>
+        <div className="mt-12 text-center text-gray-600 text-sm">
+          <p>Polymarket Trading Agent — Weather · Finance · Crypto</p>
+          <p>Budget: 10 USDC · Half-Kelly · Déduplication 24h</p>
         </div>
       </div>
     </div>

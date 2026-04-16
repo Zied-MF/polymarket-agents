@@ -698,44 +698,74 @@ export interface CryptoMarket extends Market {
 
 /** Tokens crypto courants à extraire depuis les questions Polymarket. */
 const CRYPTO_TOKENS = [
-  "BTC", "ETH", "SOL", "DOGE", "XRP", "ADA", "MATIC", "POL", "AVAX",
+  "BTC", "ETH", "SOL", "DOGE", "XRP", "BNB", "ADA", "MATIC", "POL", "AVAX",
   "DOT", "LINK", "UNI", "LTC", "BCH", "ATOM", "FIL", "NEAR", "APT",
   "ARB", "OP", "SUI", "INJ", "TIA", "PEPE", "SHIB", "WIF", "BONK",
-  "JUP", "TRUMP",
+  "JUP", "TRUMP", "HYPE",
 ];
 
 /**
- * Extrait le symbole du token depuis la question d'un event crypto Polymarket.
- * Priorité :
- *   1. Token connu entre parenthèses — ex: "Bitcoin (BTC) above…" → "BTC"
- *   2. Token connu en majuscules dans le titre (cherche les tokens de CRYPTO_TOKENS)
- *   3. Alias courants : "Bitcoin" → "BTC", "Ethereum" → "ETH", etc.
+ * Map nom complet → symbole pour les questions de type
+ * "Bitcoin Up or Down - April 17, 1:10PM-1:15PM ET".
+ * Ordre : noms plus longs en premier pour éviter les faux-positifs
+ * ("Shiba Inu" avant "Shiba").
  */
-function extractCryptoToken(question: string): string | null {
-  // 1. Entre parenthèses
+const CRYPTO_NAME_TO_SYMBOL: [string, string][] = [
+  ["Bitcoin Cash",      "BCH"],
+  ["Bitcoin",           "BTC"],
+  ["Ethereum",          "ETH"],
+  ["Solana",            "SOL"],
+  ["Dogecoin",          "DOGE"],
+  ["Shiba Inu",         "SHIB"],
+  ["Shiba",             "SHIB"],
+  ["Hyperliquid",       "HYPE"],
+  ["Avalanche",         "AVAX"],
+  ["Polkadot",          "DOT"],
+  ["Chainlink",         "LINK"],
+  ["Polygon",           "MATIC"],
+  ["Cardano",           "ADA"],
+  ["Litecoin",          "LTC"],
+  ["Ripple",            "XRP"],
+  ["Uniswap",           "UNI"],
+  ["Cosmos",            "ATOM"],
+  ["Filecoin",          "FIL"],
+  ["Arbitrum",          "ARB"],
+  ["Optimism",          "OP"],
+  ["Injective",         "INJ"],
+  ["Celestia",          "TIA"],
+  ["Jupiter",           "JUP"],
+  ["Trump",             "TRUMP"],
+  ["WIF",               "WIF"],
+  ["BONK",              "BONK"],
+  ["PEPE",              "PEPE"],
+];
+
+/**
+ * Extrait le symbole du token depuis la question ou le titre d'un event crypto Polymarket.
+ *
+ * Formats supportés :
+ *   "Bitcoin Up or Down - April 17, 1:10PM-1:15PM ET"  → "BTC"  (via nom complet)
+ *   "Bitcoin (BTC) above $70k?"                         → "BTC"  (via parenthèses)
+ *   "Will BTC exceed $70k?"                             → "BTC"  (via symbole)
+ *
+ * Priorité :
+ *   1. Token connu entre parenthèses — ex: "(BTC)"
+ *   2. Nom complet (CRYPTO_NAME_TO_SYMBOL) — ex: "Bitcoin"
+ *   3. Symbole en majuscules (\bBTC\b, \bETH\b…)
+ */
+export function extractCryptoToken(question: string): string | null {
+  // 1. Entre parenthèses : "(BTC)", "(ETH)"
   const parenM = question.match(/\(([A-Z]{2,6})\)/);
   if (parenM && CRYPTO_TOKENS.includes(parenM[1])) return parenM[1];
 
-  // 2. Token connu directement dans le titre
-  for (const token of CRYPTO_TOKENS) {
-    if (new RegExp(`\\b${token}\\b`).test(question)) return token;
+  // 2. Noms complets (priorité sur les symboles courts pour éviter "SOL" dans "Solana")
+  for (const [name, symbol] of CRYPTO_NAME_TO_SYMBOL) {
+    if (new RegExp(`\\b${name}\\b`, "i").test(question)) return symbol;
   }
 
-  // 3. Alias textuels courants
-  const ALIASES: Record<string, string> = {
-    "Bitcoin":  "BTC",
-    "Ethereum": "ETH",
-    "Solana":   "SOL",
-    "Dogecoin": "DOGE",
-    "Ripple":   "XRP",
-    "Cardano":  "ADA",
-    "Avalanche":"AVAX",
-    "Polkadot": "DOT",
-    "Litecoin": "LTC",
-    "Shiba":    "SHIB",
-  };
-  for (const [alias, token] of Object.entries(ALIASES)) {
-    if (new RegExp(`\\b${alias}\\b`, "i").test(question)) return token;
+  // 3. Symbole exact en majuscules dans le texte
+  for (const token of CRYPTO_TOKENS) {
+    if (new RegExp(`\\b${token}\\b`).test(question)) return token;
   }
 
   return null;
@@ -745,27 +775,39 @@ function extractCryptoToken(question: string): string | null {
  * Récupère les marchés crypto actifs via :
  *   GET /events?tag_slug=crypto&active=true&closed=false&order=endDate&ascending=true&limit=100
  *
- * Filtre : endDate aujourd'hui ou demain (identique à fetchStockMarkets).
+ * Gère deux structures possibles de la Gamma API :
+ *   A) Event avec markets[] imbriqués  — structure classique
+ *   B) Event plat (event = market)     — pas de markets[], données au niveau event
+ *
+ * Filtre date : fenêtre de 3 jours (aujourd'hui + J+1 + J+2) pour couvrir
+ * les marchés intraday 5-minutes qui s'étendent sur plusieurs jours.
  */
 export async function fetchCryptoMarkets(): Promise<CryptoMarket[]> {
   const startTime = Date.now();
   const nowUtc    = new Date();
-  const today     = nowUtc.toISOString().split("T")[0];
-  const tomorrow  = new Date(nowUtc.getTime() + 86_400_000).toISOString().split("T")[0];
+  // Fenêtre de 3 jours pour couvrir les marchés à court terme
+  const dateWindow = new Set(
+    Array.from({ length: 3 }, (_, i) =>
+      new Date(nowUtc.getTime() + i * 86_400_000).toISOString().split("T")[0]
+    )
+  );
+  const windowStr = [...dateWindow].join(" / ");
 
-  console.log(`[gamma-api] fetchCryptoMarkets — today=${today} tomorrow=${tomorrow}`);
+  console.log(`[gamma-api] fetchCryptoMarkets — fenêtre date: ${windowStr}`);
 
   const url =
     `${GAMMA_BASE}/events?tag_slug=crypto&active=true&closed=false` +
-    `&order=endDate&ascending=true&limit=100`;
+    `&order=startDate&ascending=false&limit=100`;
+
+  console.log(`[gamma-api] fetchCryptoMarkets — GET ${url}`);
 
   let allEvents: GammaEvent[] = [];
   try {
     const res = await fetchWithRetry(url);
     const raw: unknown = await res.json();
     allEvents = Array.isArray(raw)
-      ? raw
-      : ((raw as Record<string, unknown>).data as GammaEvent[] | undefined) ?? [];
+      ? (raw as GammaEvent[])
+      : (((raw as Record<string, unknown>).data as GammaEvent[] | undefined) ?? []);
   } catch (err) {
     console.warn(
       `[gamma-api] ⚠ fetchCryptoMarkets indisponible :`,
@@ -776,69 +818,152 @@ export async function fetchCryptoMarkets(): Promise<CryptoMarket[]> {
 
   console.log(`[gamma-api] fetchCryptoMarkets — ${allEvents.length} events bruts`);
 
+  // Log le premier event pour diagnostiquer la structure
+  if (allEvents.length > 0) {
+    const s = allEvents[0] as unknown as Record<string, unknown>;
+    console.log(
+      `[gamma-api] fetchCryptoMarkets — structure premier event:` +
+      ` title="${String(s.title ?? "").slice(0, 60)}"` +
+      ` endDate="${String(s.endDate ?? "null")}"` +
+      ` markets=${Array.isArray(s.markets) ? (s.markets as unknown[]).length : "none"}` +
+      ` outcomes=${s.outcomes ? "present" : "absent"}` +
+      ` liquidity=${String(s.liquidity ?? "absent")}`
+    );
+  }
+
+  // Filtre date (aujourd'hui + J+1 + J+2)
+  // Si l'event n'a pas d'endDate, on l'accepte et on se fie aux endDates des markets
   const events = allEvents.filter((ev) => {
-    if (!ev.endDate) return false;
-    return ev.endDate.includes(today) || ev.endDate.includes(tomorrow);
+    if (!ev.endDate) return true; // pas de date event → accept, on filtrera au market-level
+    return [...dateWindow].some((d) => ev.endDate!.startsWith(d));
   });
 
-  console.log(`[gamma-api] fetchCryptoMarkets — ${events.length} events pour ${today}-${tomorrow}`);
+  console.log(
+    `[gamma-api] fetchCryptoMarkets — ${events.length}/${allEvents.length} events dans la fenêtre` +
+    ` (${allEvents.length - events.length} hors-fenêtre ignorés)`
+  );
 
   const results: CryptoMarket[] = [];
-  const seenMarkets = new Set<string>();
+  const seenIds = new Set<string>();
+
+  let skippedNoToken   = 0;
+  let skippedResolved  = 0;
+  let skippedNoOutcomes = 0;
 
   for (const event of events) {
-    const title      = event.title ?? "";
-    const endDateStr = event.endDate ?? "";
-    const token      = extractCryptoToken(title);
-    const direction  = extractDirection(title);
+    const raw       = event as unknown as Record<string, unknown>; // accès aux champs non typés (event plat)
+    const title     = event.title ?? "";
+    const evEndDate = event.endDate ?? "";
+
+    // Extraction du token depuis le titre de l'event
+    const token     = extractCryptoToken(title);
+    const direction = extractDirection(title);
 
     if (!token) {
-      console.log(`[gamma-api] ⏭ Token crypto introuvable : "${title.slice(0, 60)}" — ignoré`);
+      skippedNoToken++;
+      console.log(`[gamma-api] ⏭ Token introuvable : "${title.slice(0, 70)}"`);
       continue;
     }
 
-    const markets = event.markets ?? [];
-    if (markets.length === 0) continue;
+    const nestedMarkets = event.markets ?? [];
 
-    for (const m of markets) {
-      if (seenMarkets.has(m.id)) continue;
-      seenMarkets.add(m.id);
+    // ── Cas A : markets[] imbriqués ─────────────────────────────────────────
+    if (nestedMarkets.length > 0) {
+      for (const m of nestedMarkets) {
+        if (seenIds.has(m.id)) continue;
 
-      const outcomes      = parseJsonField<string>(m.outcomes);
-      const rawPrices     = parseJsonField<string>(m.outcomePrices);
-      const outcomePrices = rawPrices.map(Number);
+        // Filtre date au niveau market si l'event n'en avait pas
+        if (!evEndDate && m.endDate) {
+          const mDate = m.endDate.split("T")[0];
+          if (![...dateWindow].some((d) => mDate === d)) continue;
+        }
 
-      if (outcomes.length === 0 || outcomes.length !== outcomePrices.length) continue;
+        seenIds.add(m.id);
 
-      if (outcomePrices.every((p) => p <= 0.01 || p >= 0.99)) {
+        const outcomes      = parseJsonField<string>(m.outcomes);
+        const rawPrices     = parseJsonField<string>(m.outcomePrices);
+        const outcomePrices = rawPrices.map(Number);
+
+        if (outcomes.length === 0 || outcomes.length !== outcomePrices.length) {
+          skippedNoOutcomes++;
+          continue;
+        }
+        if (outcomePrices.every((p) => p <= 0.01 || p >= 0.99)) {
+          skippedResolved++;
+          continue;
+        }
+
+        const question = m.question ?? title;
+        // Essayer d'affiner le token depuis la question du market
+        const mToken   = extractCryptoToken(question) ?? token;
+
+        results.push({
+          id:           m.id,
+          question,
+          slug:         m.slug ?? event.slug ?? m.id,
+          category:     "crypto",
+          outcomes,
+          outcomePrices,
+          volume:       parseFloat(toNumberStr(m.volume)),
+          liquidity:    parseFloat(toNumberStr(m.liquidity)),
+          endDate:      new Date(m.endDate ?? evEndDate),
+          token:        mToken,
+          direction,
+        });
+
         console.log(
-          `[gamma-api] ⏭ Marché crypto probablement résolu (tous les prix à 0 ou 1) : ${m.id} — ignoré`
+          `[gamma-api] ✓ ${mToken} (${direction}) liq=${parseFloat(toNumberStr(m.liquidity)).toFixed(0)}` +
+          ` — "${question.slice(0, 70)}"`
         );
-        continue;
       }
-
-      results.push({
-        id:           m.id,
-        question:     m.question ?? title,
-        slug:         m.slug ?? event.slug ?? m.id,
-        category:     "crypto",
-        outcomes,
-        outcomePrices,
-        volume:       parseFloat(toNumberStr(m.volume)),
-        liquidity:    parseFloat(toNumberStr(m.liquidity)),
-        endDate:      new Date(m.endDate ?? endDateStr),
-        token,
-        direction,
-      });
-
-      console.log(
-        `[gamma-api] ✓ ${token} (${direction}) — "${(m.question ?? title).slice(0, 70)}"`
-      );
+      continue;
     }
+
+    // ── Cas B : event plat (l'event lui-même est un market) ─────────────────
+    if (!event.id) continue;
+    if (seenIds.has(event.id)) continue;
+    seenIds.add(event.id);
+
+    // Les champs outcomes/prices/liquidity sont au niveau raw de l'event
+    const flatOutcomes      = parseJsonField<string>(raw.outcomes as string | string[] | undefined);
+    const flatRawPrices     = parseJsonField<string>(raw.outcomePrices as string | string[] | undefined);
+    const flatOutcomePrices = flatRawPrices.map(Number);
+
+    if (flatOutcomes.length === 0 || flatOutcomes.length !== flatOutcomePrices.length) {
+      skippedNoOutcomes++;
+      console.log(`[gamma-api] ⏭ Event plat sans outcomes : "${title.slice(0, 70)}"`);
+      continue;
+    }
+    if (flatOutcomePrices.every((p) => p <= 0.01 || p >= 0.99)) {
+      skippedResolved++;
+      continue;
+    }
+
+    results.push({
+      id:           event.id,
+      question:     title,
+      slug:         event.slug ?? event.id,
+      category:     "crypto",
+      outcomes:     flatOutcomes,
+      outcomePrices: flatOutcomePrices,
+      volume:       parseFloat(toNumberStr(raw.volume as string | number | undefined)),
+      liquidity:    parseFloat(toNumberStr(raw.liquidity as string | number | undefined)),
+      endDate:      evEndDate ? new Date(evEndDate) : new Date(),
+      token,
+      direction,
+    });
+
+    console.log(
+      `[gamma-api] ✓ ${token} (flat/${direction}) liq=${parseFloat(toNumberStr(raw.liquidity as string | number | undefined)).toFixed(0)}` +
+      ` — "${title.slice(0, 70)}"`
+    );
   }
 
   const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
-  console.log(`[gamma-api] fetchCryptoMarkets — ${results.length} marchés crypto (${elapsed}s)`);
+  console.log(
+    `[gamma-api] fetchCryptoMarkets — ${results.length} marchés retenus en ${elapsed}s` +
+    ` (token_introuvable=${skippedNoToken} résolu=${skippedResolved} no_outcomes=${skippedNoOutcomes})`
+  );
   return results;
 }
 

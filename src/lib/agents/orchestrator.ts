@@ -86,7 +86,7 @@ class Orchestrator {
   private agents: AgentConfig[] = [];
 
   private readonly maxPositionsPerAgent  = 15;
-  private readonly maxPositionsPerSector = 5;   // anti-corrélation
+  private readonly maxPositionsPerSector = 8;   // anti-corrélation (secteurs granulaires)
   private readonly minEdge               = 0.0798; // 7.98 %
   private readonly batchSize             = 5;
   private readonly batchDelayMs          = 200; // pause entre batches pour éviter 429
@@ -222,19 +222,27 @@ class Orchestrator {
   }
 
   /**
-   * Tri par edge décroissant + limites par agent et par secteur.
+   * Tri par edge décroissant + limites par agent, secteur et market_id.
    *
-   * Secteurs :
-   *   crypto  → tous les tokens forment un seul secteur (corrélés entre eux)
-   *   stocks  → toutes les actions forment un seul secteur
-   *   weather → une ville = un secteur (pas de corrélation entre villes)
+   * Secteurs granulaires :
+   *   crypto_l1 / crypto_meme / crypto_defi / crypto_other
+   *   finance_tech / finance_banks / finance_energy / finance_other
+   *   weather_us / weather_eu / weather_asia / weather_other
    */
   private applyRiskLimits(opps: Opportunity[]): Opportunity[] {
     const sorted = [...opps].sort((a, b) => b.edge - a.edge);
     const countByAgent:  Record<string, number> = {};
     const countBySector: Record<string, number> = {};
+    const seenMarketIds = new Set<string>();
 
-    return sorted.filter((opp) => {
+    const kept = sorted.filter((opp) => {
+      // Dédupliquer le même market_id (deux agents sur le même marché)
+      if (seenMarketIds.has(opp.marketId)) {
+        console.log(`[orchestrator] Duplicate market ${opp.marketId} — skipping`);
+        return false;
+      }
+      seenMarketIds.add(opp.marketId);
+
       // Limite par agent
       const agentCount = countByAgent[opp.agent] ?? 0;
       if (agentCount >= this.maxPositionsPerAgent) {
@@ -245,7 +253,7 @@ class Orchestrator {
         return false;
       }
 
-      // Limite par secteur (anti-corrélation)
+      // Limite par secteur (anti-corrélation granulaire)
       const sector      = this.getSector(opp);
       const sectorCount = countBySector[sector] ?? 0;
       if (sectorCount >= this.maxPositionsPerSector) {
@@ -260,12 +268,45 @@ class Orchestrator {
       countBySector[sector]     = sectorCount + 1;
       return true;
     });
+
+    console.log(`[orchestrator] Sector distribution:`, countBySector);
+    return kept;
   }
 
   private getSector(opp: Opportunity): string {
-    if (opp.agent === "crypto")   return "crypto";          // tous corrélés
-    if (opp.agent === "finance")  return "stocks";          // toutes actions corrélées
-    if (opp.agent === "weather")  return `weather_${opp.city ?? "unknown"}`; // par ville
+    if (opp.agent === "crypto") {
+      const token = opp.token?.toUpperCase() ?? "";
+      const L1    = ["BTC", "ETH", "SOL", "AVAX", "ADA", "DOT"];
+      const MEME  = ["DOGE", "SHIB", "PEPE", "BONK", "WIF", "TRUMP"];
+      const DEFI  = ["UNI", "AAVE", "LINK", "MKR", "CRV", "ARB", "OP"];
+      if (L1.includes(token))   return "crypto_l1";
+      if (MEME.includes(token)) return "crypto_meme";
+      if (DEFI.includes(token)) return "crypto_defi";
+      return "crypto_other";
+    }
+
+    if (opp.agent === "finance") {
+      const ticker = opp.ticker?.toUpperCase() ?? "";
+      const TECH   = ["AAPL", "MSFT", "GOOGL", "META", "NVDA", "AMZN", "TSLA"];
+      const BANKS  = ["JPM", "BAC", "GS", "MS", "V", "MA", "ALLY"];
+      const ENERGY = ["XOM", "CVX", "COP", "SLB"];
+      if (TECH.includes(ticker))   return "finance_tech";
+      if (BANKS.includes(ticker))  return "finance_banks";
+      if (ENERGY.includes(ticker)) return "finance_energy";
+      return "finance_other";
+    }
+
+    if (opp.agent === "weather") {
+      const city   = (opp.city ?? "").toLowerCase();
+      const US     = ["new york", "nyc", "los angeles", "chicago", "houston", "miami", "atlanta", "boston", "san francisco", "seattle", "denver"];
+      const EU     = ["london", "paris", "berlin", "madrid", "rome", "amsterdam", "vienna", "zurich", "stockholm", "warsaw", "munich"];
+      const ASIA   = ["tokyo", "seoul", "hong kong", "singapore", "shanghai", "beijing", "mumbai", "bangkok", "ankara"];
+      if (US.some((c)   => city.includes(c))) return "weather_us";
+      if (EU.some((c)   => city.includes(c))) return "weather_eu";
+      if (ASIA.some((c) => city.includes(c))) return "weather_asia";
+      return "weather_other";
+    }
+
     return "other";
   }
 }

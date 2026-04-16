@@ -24,6 +24,8 @@ import {
   getRecentOpportunities,
   incrementDailyOpportunities,
   savePaperTrade,
+  acquireScanLock,
+  releaseScanLock,
 }                                          from "@/lib/db/supabase";
 import { openPosition }                    from "@/lib/db/positions";
 import type { Opportunity, SkippedMarket, AgentStats } from "@/lib/agents/orchestrator";
@@ -63,12 +65,20 @@ interface ScanResult {
 // Handler
 // ---------------------------------------------------------------------------
 
-export async function GET(): Promise<NextResponse<ScanResult>> {
+export async function GET(): Promise<NextResponse<ScanResult | { status: string; reason: string }>> {
   ensureAgentsRegistered();
+
+  // Verrou anti-double exécution
+  const hasLock = await acquireScanLock();
+  if (!hasLock) {
+    console.log("[scan-markets] ⏭ Scan already in progress, skipping...");
+    return NextResponse.json({ status: "skipped", reason: "Another scan is in progress" }, { status: 409 });
+  }
 
   const startTime = Date.now();
   console.log(`[scan-markets] ▶ Démarrage scan — ${new Date().toISOString()}`);
 
+  try {
   const errors: ScanResult["errors"] = [];
 
   // 1. Scan via l'Orchestrator
@@ -244,4 +254,8 @@ export async function GET(): Promise<NextResponse<ScanResult>> {
     skippedDetails: skipped.slice(0, 20),
     errors,
   });
+
+  } finally {
+    await releaseScanLock();
+  }
 }

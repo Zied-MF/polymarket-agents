@@ -523,6 +523,70 @@ export async function resolvePaperTrade(
  * Crée la ligne si elle n'existe pas encore (upsert idempotent).
  * Utilisé en interne par le cron scan-markets.
  */
+// ---------------------------------------------------------------------------
+// Verrou de scan (table scan_locks) — anti race-condition
+//
+// SQL à exécuter une fois dans Supabase :
+//   CREATE TABLE IF NOT EXISTS scan_locks (
+//     id        TEXT PRIMARY KEY DEFAULT 'scan',
+//     locked_at TIMESTAMPTZ,
+//     locked_by TEXT
+//   );
+//   INSERT INTO scan_locks (id) VALUES ('scan') ON CONFLICT DO NOTHING;
+// ---------------------------------------------------------------------------
+
+const LOCK_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes max par scan
+
+/**
+ * Essaie d'acquérir le verrou de scan.
+ * Retourne true si le verrou est obtenu, false si un scan est déjà en cours.
+ * Ignore l'erreur si la table scan_locks n'existe pas encore.
+ */
+export async function acquireScanLock(): Promise<boolean> {
+  const db  = getClient();
+  const now = new Date();
+  const expiry = new Date(now.getTime() - LOCK_TIMEOUT_MS).toISOString();
+
+  try {
+    const { data, error } = await db
+      .from("scan_locks")
+      .update({
+        locked_at: now.toISOString(),
+        locked_by: `scan-${now.getTime()}`,
+      })
+      .eq("id", "scan")
+      .or(`locked_at.is.null,locked_at.lt.${expiry}`)
+      .select()
+      .single();
+
+    if (error) {
+      // Table absente ou autre erreur → on laisse passer (best-effort)
+      console.warn(`[supabase] acquireScanLock: ${error.message} — proceeding without lock`);
+      return true;
+    }
+
+    return !!data;
+  } catch (err) {
+    console.warn(`[supabase] acquireScanLock exception:`, err instanceof Error ? err.message : err);
+    return true; // best-effort
+  }
+}
+
+/**
+ * Libère le verrou de scan.
+ */
+export async function releaseScanLock(): Promise<void> {
+  const db = getClient();
+  try {
+    await db
+      .from("scan_locks")
+      .update({ locked_at: null, locked_by: null })
+      .eq("id", "scan");
+  } catch (err) {
+    console.warn(`[supabase] releaseScanLock:`, err instanceof Error ? err.message : err);
+  }
+}
+
 export async function incrementDailyOpportunities(
   count: number,
   date?: string

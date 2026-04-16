@@ -101,7 +101,7 @@ export interface PaperTradeRow {
   question: string | null;
   city: string | null;
   ticker: string | null;
-  agent: "weather" | "finance";
+  agent: "weather" | "finance" | "crypto";
   outcome: string;
   market_price: number;
   estimated_probability: number;
@@ -114,12 +114,17 @@ export interface PaperTradeRow {
   won: boolean | null;
   potential_pnl: number | null;
   resolved_at: string | null;
+  /** Contexte du marché au moment du bet (liquidité, spread, outcomes…) — pour post-mortem. */
+  market_context: Record<string, unknown> | null;
+  /** Date+heure exacte de résolution prévue (UTC) — pour détecter les délais UMA. */
+  expected_resolution: string | null;
 }
 
 export type SavePaperTradeInput = Omit<
   PaperTradeRow,
   "id" | "created_at" | "actual_result" | "won" | "resolved_at"
 >;
+// market_context et expected_resolution sont inclus dans SavePaperTradeInput (nullable)
 
 export type SaveBetInput = {
   opportunity_id: string;
@@ -422,6 +427,8 @@ export async function savePaperTrade(
         confidence:            input.confidence,
         resolution_date:       input.resolution_date,
         potential_pnl:         input.potential_pnl,
+        market_context:        input.market_context ?? null,
+        expected_resolution:   input.expected_resolution ?? null,
       })
       .select()
       .single()

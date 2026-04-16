@@ -60,10 +60,10 @@ function StatusBadge({ status }: { status: PositionStats["status"] }) {
   }
 }
 
-function AgentBadge({ agent }: { agent: "weather" | "finance" }) {
-  return agent === "finance"
-    ? <span className="px-2 py-0.5 text-xs rounded-full bg-blue-500/20 text-blue-400">📈 Finance</span>
-    : <span className="px-2 py-0.5 text-xs rounded-full bg-cyan-500/20 text-cyan-400">🌡 Météo</span>;
+function AgentBadge({ agent }: { agent: "weather" | "finance" | "crypto" }) {
+  if (agent === "finance") return <span className="px-2 py-0.5 text-xs rounded-full bg-blue-500/20 text-blue-400">📈 Finance</span>;
+  if (agent === "crypto")  return <span className="px-2 py-0.5 text-xs rounded-full bg-purple-500/20 text-purple-400">₿ Crypto</span>;
+  return <span className="px-2 py-0.5 text-xs rounded-full bg-cyan-500/20 text-cyan-400">🌡 Météo</span>;
 }
 
 // ---------------------------------------------------------------------------

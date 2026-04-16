@@ -92,7 +92,7 @@ CREATE TABLE IF NOT EXISTS paper_trades (
   question              TEXT,
   city                  TEXT,
   ticker                TEXT,
-  agent                 TEXT         NOT NULL CHECK (agent IN ('weather', 'finance')),
+  agent                 TEXT         NOT NULL CHECK (agent IN ('weather', 'finance', 'crypto')),
   outcome               TEXT         NOT NULL,
   market_price          DECIMAL      NOT NULL,
   estimated_probability DECIMAL      NOT NULL,

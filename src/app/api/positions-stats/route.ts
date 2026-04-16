@@ -31,7 +31,7 @@ export interface PositionStats {
   question: string;
   city: string | null;
   ticker: string | null;
-  agent: "weather" | "finance";
+  agent: "weather" | "finance" | "crypto";
   outcome: string;
   entryPrice: number;
   currentPrice: number | null;

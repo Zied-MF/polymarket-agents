@@ -3,13 +3,11 @@
  *
  * Ce module est purement fonctionnel (pas d'I/O).
  * Il expose les types partagés et la fonction evaluatePosition() qui détermine
- * si une position doit être vendue, conservée ou switchée.
+ * si une position doit être vendue ou conservée.
  *
  * Règles de sell signal :
- *   SELL  si currentProbability < entryProbability - 0.20 (chute de 20+ pts)
+ *   SELL  si currentProbability < entryProbability - 0.25 (chute de 25+ pts)
  *   SELL  si currentPrice < entryPrice × 0.5 (prix divisé par 2+)
- *   SWITCH si un autre outcome du même marché a une probabilité plus élevée
- *          que l'outcome actuel de plus de 15 pts
  *   HOLD  sinon
  */
 
@@ -24,7 +22,7 @@ export interface Position {
   question: string;
   city: string | null;
   ticker: string | null;
-  agent: "weather" | "finance";
+  agent: "weather" | "finance" | "crypto";
   outcome: string;
   entryPrice: number;
   entryProbability: number;
@@ -49,7 +47,7 @@ export interface MarketSnapshot {
 export interface SellSignal {
   positionId: string;
   reason: string;
-  suggestedAction: "SELL" | "HOLD" | "SWITCH";
+  suggestedAction: "SELL";
   entryPrice: number;
   currentPrice: number;
   entryProb: number;
@@ -58,9 +56,6 @@ export interface SellSignal {
   potentialPnl: number;
   /** P&L estimé si on garde jusqu'à résolution (probabilité actuelle). */
   projectedPnl: number;
-  /** Outcome alternatif si action = SWITCH. */
-  switchToOutcome?: string;
-  switchToPrice?: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -102,8 +97,8 @@ export function evaluatePosition(
       : -position.suggestedBet
   * 100) / 100;
 
-  // ── Règle 1 : chute de probabilité ≥ 20 pts ─────────────────────────────
-  if (probDrop >= 0.20) {
+  // ── Règle 1 : chute de probabilité ≥ 25 pts ─────────────────────────────
+  if (probDrop >= 0.25) {
     return {
       positionId:      position.id,
       reason:          `Probabilité en baisse : ${(position.entryProbability * 100).toFixed(0)}% → ${(currentProb * 100).toFixed(0)}% (−${(probDrop * 100).toFixed(0)} pts)`,
@@ -130,28 +125,6 @@ export function evaluatePosition(
       potentialPnl,
       projectedPnl,
     };
-  }
-
-  // ── Règle 3 : un autre outcome a une probabilité supérieure de 15+ pts ──
-  const SWITCH_THRESHOLD = 0.15;
-  for (let i = 0; i < snapshot.outcomes.length; i++) {
-    if (i === outcomeIdx) continue;
-    const altPrice = snapshot.outcomePrices[i];
-    if (altPrice - currentProb >= SWITCH_THRESHOLD) {
-      return {
-        positionId:      position.id,
-        reason:          `Meilleur outcome détecté : "${snapshot.outcomes[i]}" à ${(altPrice * 100).toFixed(0)}% vs "${position.outcome}" à ${(currentProb * 100).toFixed(0)}%`,
-        suggestedAction: "SWITCH",
-        entryPrice:      position.entryPrice,
-        currentPrice,
-        entryProb:       position.entryProbability,
-        currentProb,
-        potentialPnl,
-        projectedPnl,
-        switchToOutcome: snapshot.outcomes[i],
-        switchToPrice:   altPrice,
-      };
-    }
   }
 
   return null; // HOLD

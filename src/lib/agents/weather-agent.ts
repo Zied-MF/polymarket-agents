@@ -31,6 +31,37 @@ import type { Outcome } from "@/types";
 const MIN_EDGE     = 0.0798;
 const BASE_SIGMA_C = 2.0;
 
+/**
+ * Température moyenne historique globale utilisée pour calibrer les fat tails.
+ * Valeur indicative — l'important est la déviation relative, pas la valeur absolue.
+ */
+const HISTORICAL_AVG_C = 15.0;
+
+// ---------------------------------------------------------------------------
+// Fat tails — correction du sigma pour les événements extrêmes
+// ---------------------------------------------------------------------------
+
+/**
+ * Les modèles météo sous-estiment l'incertitude quand la température prévue
+ * s'éloigne de la normale historique. Augmente sigma proportionnellement à
+ * l'écart : +20 % de sigma par 10°C d'écart par rapport à HISTORICAL_AVG_C.
+ *
+ * Exemples :
+ *   forecast=15°C (= avg) → fatTailFactor = 1.0  → sigma inchangé
+ *   forecast=25°C (+10°C) → fatTailFactor = 1.2  → sigma × 1.2
+ *   forecast=35°C (+20°C) → fatTailFactor = 1.4  → sigma × 1.4
+ *   forecast=−5°C (−20°C) → fatTailFactor = 1.4  → sigma × 1.4
+ */
+function applyFatTailSigma(
+  baseSigma:    number,
+  forecastC:    number,
+  historicalAvg = HISTORICAL_AVG_C
+): number {
+  const deviation      = Math.abs(forecastC - historicalAvg);
+  const fatTailFactor  = 1 + (deviation / 10) * 0.2;
+  return baseSigma * fatTailFactor;
+}
+
 // ---------------------------------------------------------------------------
 // Maths : distribution gaussienne
 // ---------------------------------------------------------------------------
@@ -322,9 +353,10 @@ export function analyzeMarket(
   const forecastTemp =
     effectiveUnit === "F" ? celsiusToFahrenheit(forecastTempC) : forecastTempC;
 
-  // 3. Sigma dans l'unité effective (1°C ≈ 1.8°F)
-  const sigmaC = forecast.dynamicSigma ?? (BASE_SIGMA_C / forecast.confidence);
-  const sigma  = effectiveUnit === "F" ? sigmaC * (9 / 5) : sigmaC;
+  // 3. Sigma dans l'unité effective (1°C ≈ 1.8°F) — avec correction fat tails
+  const baseSigmaC  = forecast.dynamicSigma ?? (BASE_SIGMA_C / forecast.confidence);
+  const sigmaC      = applyFatTailSigma(baseSigmaC, forecastTempC);
+  const sigma       = effectiveUnit === "F" ? sigmaC * (9 / 5) : sigmaC;
 
   if (effectiveUnit === "F") {
     console.log(
@@ -336,7 +368,7 @@ export function analyzeMarket(
     );
   }
   console.log(
-    `[weather-agent] ${market.city}: sigma=${sigmaC.toFixed(2)}°C → ${sigma.toFixed(2)}°${effectiveUnit}, ` +
+    `[weather-agent] ${market.city}: baseSigma=${baseSigmaC.toFixed(2)}°C, adjustedSigma=${sigmaC.toFixed(2)}°C → ${sigma.toFixed(2)}°${effectiveUnit}, ` +
     `confidence=${forecast.confidenceLevel ?? forecast.confidence}` +
     (effectiveUnit !== market.unit ? ` [unit override: ${market.unit}→${effectiveUnit}]` : "")
   );

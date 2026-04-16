@@ -6,7 +6,8 @@
       "Bash(npm run:*)",
       "Bash(node -e \"const p = require\\('./package.json'\\); console.log\\(p.dependencies?.tailwindcss || p.devDependencies?.tailwindcss\\)\")",
       "Bash(npx --yes tsc --version)",
-      "Bash(echo \"EXIT: $?\")"
+      "Bash(echo \"EXIT: $?\")",
+      "Read(//Users/ziedfeikh/Documents/polymarket-agents/src/app/api/scan-markets/**)"
     ]
   }
 }

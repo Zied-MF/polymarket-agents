@@ -3,26 +3,35 @@
 import { useState, useEffect } from "react";
 
 interface Opportunity {
-  marketId: string;
-  question: string;
-  city: string;
-  outcome: string;
-  marketPrice: number;
+  marketId:             string;
+  question:             string;
+  city?:                string;
+  ticker?:              string;
+  token?:               string;
+  outcome:              string;
+  marketPrice:          number;
   estimatedProbability: number;
-  edge: number;
-  multiplier: number;
-  suggestedBet: number;
-  confidence?: string;
-  agent?: "weather" | "finance";
+  edge:                 number;
+  suggestedBet:         number;
+  confidence?:          string;
+  agent?:               "weather" | "finance" | "crypto";
+}
+
+interface AgentStats {
+  scanned:       number;
+  opportunities: number;
 }
 
 interface ScanResult {
-  scannedAt: string;
-  total_markets: number;
-  opportunities: Opportunity[];
-  skipped: { marketId: string; question: string; reason: string }[];
-  saved_to_db: number;
-  errors: any[];
+  scannedAt:      string;
+  duration:       string;
+  byAgent:        Record<string, AgentStats>;
+  opportunities:  number;   // count
+  saved:          number;
+  skipped:        number;   // count
+  details:        Opportunity[];
+  skippedDetails: { marketId: string; question: string; reason: string; agent: string }[];
+  errors:         { marketId: string; question: string; error: string }[];
 }
 
 export default function Dashboard() {
@@ -56,9 +65,12 @@ export default function Dashboard() {
     return "text-red-400";
   };
 
-  const getAgentBadge = (agent?: "weather" | "finance") => {
+  const getAgentBadge = (agent?: "weather" | "finance" | "crypto") => {
     if (agent === "finance") {
       return <span className="px-2 py-1 text-xs rounded-full bg-blue-500/20 text-blue-400">📈 Finance</span>;
+    }
+    if (agent === "crypto") {
+      return <span className="px-2 py-1 text-xs rounded-full bg-purple-500/20 text-purple-400">₿ Crypto</span>;
     }
     return <span className="px-2 py-1 text-xs rounded-full bg-cyan-500/20 text-cyan-400">🌡️ Météo</span>;
   };
@@ -76,9 +88,13 @@ export default function Dashboard() {
     }
   };
 
-  const avgEdge = data?.opportunities.length
-    ? (data.opportunities.reduce((acc, o) => acc + o.edge, 0) / data.opportunities.length * 100).toFixed(1)
+  const avgEdge = data?.details?.length
+    ? (data.details.reduce((acc, o) => acc + o.edge, 0) / data.details.length * 100).toFixed(1)
     : "0";
+
+  const totalScanned = data?.byAgent
+    ? Object.values(data.byAgent).reduce((acc, s) => acc + s.scanned, 0)
+    : null;
 
   return (
     <div className="min-h-screen bg-gray-950 text-white p-6">
@@ -126,11 +142,11 @@ export default function Dashboard() {
         <div className="grid grid-cols-1 md:grid-cols-4 gap-4 mb-8">
           <div className="bg-gray-900 rounded-xl p-4 border border-gray-800">
             <p className="text-gray-400 text-sm">Marchés scannés</p>
-            <p className="text-2xl font-bold">{data?.total_markets ?? "-"}</p>
+            <p className="text-2xl font-bold">{totalScanned ?? "-"}</p>
           </div>
           <div className="bg-gray-900 rounded-xl p-4 border border-gray-800">
             <p className="text-gray-400 text-sm">Opportunités</p>
-            <p className="text-2xl font-bold text-green-400">{data?.opportunities.length ?? "-"}</p>
+            <p className="text-2xl font-bold text-green-400">{data?.opportunities ?? "-"}</p>
           </div>
           <div className="bg-gray-900 rounded-xl p-4 border border-gray-800">
             <p className="text-gray-400 text-sm">Edge moyen</p>
@@ -138,7 +154,7 @@ export default function Dashboard() {
           </div>
           <div className="bg-gray-900 rounded-xl p-4 border border-gray-800">
             <p className="text-gray-400 text-sm">Sauvegardés DB</p>
-            <p className="text-2xl font-bold text-blue-400">{data?.saved_to_db ?? "-"}</p>
+            <p className="text-2xl font-bold text-blue-400">{data?.saved ?? "-"}</p>
           </div>
         </div>
 
@@ -154,22 +170,22 @@ export default function Dashboard() {
           <h2 className="text-xl font-semibold mb-4 flex items-center gap-2">
             🎯 Opportunités détectées
             <span className="text-sm font-normal text-gray-400">
-              ({data?.opportunities.length ?? 0})
+              ({data?.opportunities ?? 0})
             </span>
           </h2>
 
-          {data?.opportunities.length === 0 && !loading && (
+          {data?.opportunities === 0 && !loading && (
             <div className="bg-gray-900 rounded-xl p-8 text-center text-gray-400 border border-gray-800">
               Aucune opportunité détectée pour le moment
             </div>
           )}
 
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-            {data?.opportunities.map((opp, i) => (
+            {data?.details.map((opp, i) => (
               <div key={i} className="bg-gray-900 rounded-xl p-5 border border-gray-800 hover:border-gray-700 transition">
                 <div className="flex items-start justify-between mb-3">
                   <div>
-                    <h3 className="font-semibold text-lg">{opp.city || "Unknown"}</h3>
+                    <h3 className="font-semibold text-lg">{opp.city ?? opp.ticker ?? opp.token ?? "Unknown"}</h3>
                     <p className="text-gray-400 text-sm truncate max-w-[200px]">{opp.question}</p>
                   </div>
                   <div className="flex flex-col items-end gap-1">
@@ -212,7 +228,7 @@ export default function Dashboard() {
                   <div>
                     <span className="text-gray-400 text-sm">x</span>
                     <span className="font-bold text-purple-400">
-                      {opp.multiplier?.toFixed(1)}
+                      {opp.marketPrice > 0 ? (1 / opp.marketPrice).toFixed(1) : "-"}
                     </span>
                   </div>
                 </div>
@@ -222,14 +238,14 @@ export default function Dashboard() {
         </div>
 
         {/* Skipped Markets */}
-        {data?.skipped && data.skipped.length > 0 && (
+        {data?.skippedDetails && data.skippedDetails.length > 0 && (
           <div>
             <button
               onClick={() => setShowSkipped(!showSkipped)}
               className="flex items-center gap-2 text-gray-400 hover:text-white transition mb-4"
             >
               <span>{showSkipped ? "▼" : "▶"}</span>
-              <span>Marchés ignorés ({data.skipped.length})</span>
+              <span>Marchés ignorés ({data.skipped})</span>
             </button>
 
             {showSkipped && (
@@ -242,7 +258,7 @@ export default function Dashboard() {
                     </tr>
                   </thead>
                   <tbody>
-                    {data.skipped.map((s, i) => (
+                    {data.skippedDetails.map((s, i) => (
                       <tr key={i} className="border-t border-gray-800">
                         <td className="p-3 truncate max-w-[300px]">{s.question}</td>
                         <td className="p-3 text-gray-400">{s.reason}</td>

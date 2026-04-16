@@ -10,7 +10,7 @@
  *     question            text,
  *     city                text,
  *     ticker              text,
- *     agent               text NOT NULL CHECK (agent IN ('weather', 'finance')),
+ *     agent               text NOT NULL CHECK (agent IN ('weather', 'finance', 'crypto')),
  *     outcome             text NOT NULL,
  *     entry_price         numeric NOT NULL,
  *     entry_probability   numeric NOT NULL,
@@ -77,7 +77,7 @@ export interface PositionRow {
   question: string | null;
   city: string | null;
   ticker: string | null;
-  agent: "weather" | "finance";
+  agent: "weather" | "finance" | "crypto";
   outcome: string;
   entry_price: number;
   entry_probability: number;
@@ -100,7 +100,7 @@ export type OpenPositionInput = {
   question: string | null;
   city: string | null;
   ticker: string | null;
-  agent: "weather" | "finance";
+  agent: "weather" | "finance" | "crypto";
   outcome: string;
   entryPrice: number;
   entryProbability: number;

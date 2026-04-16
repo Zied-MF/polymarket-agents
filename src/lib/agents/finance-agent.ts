@@ -95,6 +95,39 @@ function estimateProbability(upScore: number, downScore: number): number {
 }
 
 // ---------------------------------------------------------------------------
+// Mean-reversion — pénalité si Polymarket a déjà pricé le momentum
+// ---------------------------------------------------------------------------
+
+/**
+ * Polymarket tend vers le mean-reversion : si un titre a bougé de +3%
+ * et que le marché price déjà > 75 % dans cette direction, le signal a
+ * probablement déjà été intégré. Divise le score par 2 dans ce cas.
+ *
+ * @param rawScore     Score brut (upScore ou downScore selon la direction dominante)
+ * @param changePercent Variation % de la journée (positive = hausse)
+ * @param marketPrice   Prix Polymarket de l'outcome dans la direction dominante [0,1]
+ */
+function adjustForMeanReversion(
+  rawScore:      number,
+  changePercent: number,
+  marketPrice:   number
+): number {
+  if (changePercent > 2 && marketPrice > 0.75) {
+    console.log(
+      `[finance-agent] Mean-reversion penalty: market already prices ${(marketPrice * 100).toFixed(0)}% UP`
+    );
+    return rawScore * 0.5;
+  }
+  if (changePercent < -2 && marketPrice < 0.25) {
+    console.log(
+      `[finance-agent] Mean-reversion penalty: market already prices ${((1 - marketPrice) * 100).toFixed(0)}% DOWN`
+    );
+    return rawScore * 0.5;
+  }
+  return rawScore;
+}
+
+// ---------------------------------------------------------------------------
 // Résolution de la direction d'un outcome
 // ---------------------------------------------------------------------------
 
@@ -166,17 +199,25 @@ export function analyzeStockMarket(
 
   console.log(`[finance-agent] ${market.ticker}: change=${change}%, upScore=${upScore}, downScore=${downScore}`);
 
-  const dominantScore     = Math.max(upScore, downScore);
   const dominantDirection = upScore >= downScore ? "up" : "down";
 
+  // Trouver le prix du marché pour l'outcome dominant (pour mean-reversion)
+  const dominantMarketPrice = market.outcomePrices.find((_, i) =>
+    resolveOutcomeDirection(market.outcomes[i], market.direction) === dominantDirection
+  ) ?? 0.5;
+
+  // Appliquer la pénalité mean-reversion avant de calculer la probabilité
+  const rawDominantScore = Math.max(upScore, downScore);
+  const dominantScore    = adjustForMeanReversion(rawDominantScore, change, dominantMarketPrice);
+
   if (dominantScore < MIN_SCORE) {
-    console.log(`[finance-agent] ${market.ticker}: score=${dominantScore} < ${MIN_SCORE} — skip`);
+    console.log(`[finance-agent] ${market.ticker}: score=${dominantScore.toFixed(1)} < ${MIN_SCORE} — skip`);
     return [];
   }
 
   const estimatedProbability = estimateProbability(
-    dominantDirection === "up" ? upScore : 0,
-    dominantDirection === "up" ? 0 : downScore
+    dominantDirection === "up" ? dominantScore : 0,
+    dominantDirection === "up" ? 0 : dominantScore
   );
 
   console.log(

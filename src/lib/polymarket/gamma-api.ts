@@ -678,6 +678,171 @@ export async function fetchStockMarkets(): Promise<StockMarket[]> {
 }
 
 // ---------------------------------------------------------------------------
+// CryptoMarket — type public pour les marchés crypto
+// ---------------------------------------------------------------------------
+
+/**
+ * Marché Polymarket de type crypto (ex: "Will BTC be above $70k on April 15?").
+ * Étend Market avec le token crypto extrait de la question.
+ */
+export interface CryptoMarket extends Market {
+  /** Symbole du token extrait de la question, ex: "BTC". */
+  token: string;
+  /** Direction implicite du marché : "up", "down" ou "unknown". */
+  direction: "up" | "down" | "unknown";
+}
+
+// ---------------------------------------------------------------------------
+// fetchCryptoMarkets — /events?tag_slug=crypto
+// ---------------------------------------------------------------------------
+
+/** Tokens crypto courants à extraire depuis les questions Polymarket. */
+const CRYPTO_TOKENS = [
+  "BTC", "ETH", "SOL", "DOGE", "XRP", "ADA", "MATIC", "POL", "AVAX",
+  "DOT", "LINK", "UNI", "LTC", "BCH", "ATOM", "FIL", "NEAR", "APT",
+  "ARB", "OP", "SUI", "INJ", "TIA", "PEPE", "SHIB", "WIF", "BONK",
+  "JUP", "TRUMP",
+];
+
+/**
+ * Extrait le symbole du token depuis la question d'un event crypto Polymarket.
+ * Priorité :
+ *   1. Token connu entre parenthèses — ex: "Bitcoin (BTC) above…" → "BTC"
+ *   2. Token connu en majuscules dans le titre (cherche les tokens de CRYPTO_TOKENS)
+ *   3. Alias courants : "Bitcoin" → "BTC", "Ethereum" → "ETH", etc.
+ */
+function extractCryptoToken(question: string): string | null {
+  // 1. Entre parenthèses
+  const parenM = question.match(/\(([A-Z]{2,6})\)/);
+  if (parenM && CRYPTO_TOKENS.includes(parenM[1])) return parenM[1];
+
+  // 2. Token connu directement dans le titre
+  for (const token of CRYPTO_TOKENS) {
+    if (new RegExp(`\\b${token}\\b`).test(question)) return token;
+  }
+
+  // 3. Alias textuels courants
+  const ALIASES: Record<string, string> = {
+    "Bitcoin":  "BTC",
+    "Ethereum": "ETH",
+    "Solana":   "SOL",
+    "Dogecoin": "DOGE",
+    "Ripple":   "XRP",
+    "Cardano":  "ADA",
+    "Avalanche":"AVAX",
+    "Polkadot": "DOT",
+    "Litecoin": "LTC",
+    "Shiba":    "SHIB",
+  };
+  for (const [alias, token] of Object.entries(ALIASES)) {
+    if (new RegExp(`\\b${alias}\\b`, "i").test(question)) return token;
+  }
+
+  return null;
+}
+
+/**
+ * Récupère les marchés crypto actifs via :
+ *   GET /events?tag_slug=crypto&active=true&closed=false&order=endDate&ascending=true&limit=100
+ *
+ * Filtre : endDate aujourd'hui ou demain (identique à fetchStockMarkets).
+ */
+export async function fetchCryptoMarkets(): Promise<CryptoMarket[]> {
+  const startTime = Date.now();
+  const nowUtc    = new Date();
+  const today     = nowUtc.toISOString().split("T")[0];
+  const tomorrow  = new Date(nowUtc.getTime() + 86_400_000).toISOString().split("T")[0];
+
+  console.log(`[gamma-api] fetchCryptoMarkets — today=${today} tomorrow=${tomorrow}`);
+
+  const url =
+    `${GAMMA_BASE}/events?tag_slug=crypto&active=true&closed=false` +
+    `&order=endDate&ascending=true&limit=100`;
+
+  let allEvents: GammaEvent[] = [];
+  try {
+    const res = await fetchWithRetry(url);
+    const raw: unknown = await res.json();
+    allEvents = Array.isArray(raw)
+      ? raw
+      : ((raw as Record<string, unknown>).data as GammaEvent[] | undefined) ?? [];
+  } catch (err) {
+    console.warn(
+      `[gamma-api] ⚠ fetchCryptoMarkets indisponible :`,
+      err instanceof Error ? err.message : err
+    );
+    return [];
+  }
+
+  console.log(`[gamma-api] fetchCryptoMarkets — ${allEvents.length} events bruts`);
+
+  const events = allEvents.filter((ev) => {
+    if (!ev.endDate) return false;
+    return ev.endDate.includes(today) || ev.endDate.includes(tomorrow);
+  });
+
+  console.log(`[gamma-api] fetchCryptoMarkets — ${events.length} events pour ${today}-${tomorrow}`);
+
+  const results: CryptoMarket[] = [];
+  const seenMarkets = new Set<string>();
+
+  for (const event of events) {
+    const title      = event.title ?? "";
+    const endDateStr = event.endDate ?? "";
+    const token      = extractCryptoToken(title);
+    const direction  = extractDirection(title);
+
+    if (!token) {
+      console.log(`[gamma-api] ⏭ Token crypto introuvable : "${title.slice(0, 60)}" — ignoré`);
+      continue;
+    }
+
+    const markets = event.markets ?? [];
+    if (markets.length === 0) continue;
+
+    for (const m of markets) {
+      if (seenMarkets.has(m.id)) continue;
+      seenMarkets.add(m.id);
+
+      const outcomes      = parseJsonField<string>(m.outcomes);
+      const rawPrices     = parseJsonField<string>(m.outcomePrices);
+      const outcomePrices = rawPrices.map(Number);
+
+      if (outcomes.length === 0 || outcomes.length !== outcomePrices.length) continue;
+
+      if (outcomePrices.every((p) => p <= 0.01 || p >= 0.99)) {
+        console.log(
+          `[gamma-api] ⏭ Marché crypto probablement résolu (tous les prix à 0 ou 1) : ${m.id} — ignoré`
+        );
+        continue;
+      }
+
+      results.push({
+        id:           m.id,
+        question:     m.question ?? title,
+        slug:         m.slug ?? event.slug ?? m.id,
+        category:     "crypto",
+        outcomes,
+        outcomePrices,
+        volume:       parseFloat(toNumberStr(m.volume)),
+        liquidity:    parseFloat(toNumberStr(m.liquidity)),
+        endDate:      new Date(m.endDate ?? endDateStr),
+        token,
+        direction,
+      });
+
+      console.log(
+        `[gamma-api] ✓ ${token} (${direction}) — "${(m.question ?? title).slice(0, 70)}"`
+      );
+    }
+  }
+
+  const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+  console.log(`[gamma-api] fetchCryptoMarkets — ${results.length} marchés crypto (${elapsed}s)`);
+  return results;
+}
+
+// ---------------------------------------------------------------------------
 // parseMarketRules — export public (utilisé par les tests et le mock)
 // ---------------------------------------------------------------------------
 

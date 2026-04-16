@@ -208,16 +208,15 @@ export async function GET(): Promise<NextResponse<MonitorResult>> {
       }
 
       discordSignals.push({
-        question:        position.question,
-        outcome:         position.outcome,
-        agent:           position.agent,
-        action:          signal.suggestedAction === "SWITCH" ? "SWITCH" : "SELL",
-        reason:          signal.reason,
-        entryPrice:      signal.entryPrice,
-        currentPrice:    signal.currentPrice,
-        potentialPnl:    signal.potentialPnl,
-        suggestedBet:    position.suggestedBet,
-        switchToOutcome: signal.switchToOutcome,
+        question:     position.question,
+        outcome:      position.outcome,
+        agent:        position.agent,
+        action:       "SELL",
+        reason:       signal.reason,
+        entryPrice:   signal.entryPrice,
+        currentPrice: signal.currentPrice,
+        potentialPnl: signal.potentialPnl,
+        suggestedBet: position.suggestedBet,
       });
 
       positionSummaries.push({

@@ -240,7 +240,7 @@ export async function sendResultsSummary(
 export interface SellSignalNotification {
   question: string;
   outcome: string;
-  agent: "weather" | "finance";
+  agent: "weather" | "finance" | "crypto";
   action: "SELL" | "SWITCH";
   reason: string;
   entryPrice: number;

@@ -30,6 +30,7 @@ import {
   incrementDailyOpportunities,
   savePaperTrade,
 } from "@/lib/db/supabase";
+import { openPosition } from "@/lib/db/positions";
 import type { WeatherMarket, StockMarket } from "@/lib/polymarket/gamma-api";
 import type { Outcome } from "@/types";
 
@@ -384,7 +385,7 @@ export async function GET(): Promise<NextResponse<ScanResult>> {
           ? Math.round(opp.suggestedBet * (1 / opp.marketPrice - 1) * 100) / 100
           : 0;
         try {
-          await savePaperTrade({
+          const paperTrade = await savePaperTrade({
             market_id:             opp.marketId,
             question:              opp.question,
             city:                  opp.city,
@@ -401,6 +402,29 @@ export async function GET(): Promise<NextResponse<ScanResult>> {
           });
           paperTradesLogged++;
           console.log(`[scan-markets] 🃏 Paper trade sauvegardé : ${opp.marketId}/${opp.outcome}`);
+
+          // Ouvrir une position pour le suivi en temps réel
+          try {
+            await openPosition({
+              paperTradeId:     paperTrade.id,
+              marketId:         opp.marketId,
+              question:         opp.question,
+              city:             opp.city,
+              ticker:           opp.agent === "finance" ? opp.stationCode : null,
+              agent:            opp.agent,
+              outcome:          opp.outcome,
+              entryPrice:       opp.marketPrice,
+              entryProbability: opp.estimatedProbability,
+              suggestedBet:     opp.suggestedBet,
+              resolutionDate:   opp.targetDate,
+            });
+            console.log(`[scan-markets] 📍 Position ouverte : ${opp.marketId}/${opp.outcome}`);
+          } catch (err) {
+            console.error(
+              `[scan-markets] ✗ openPosition failed (${opp.marketId}/${opp.outcome}) :`,
+              err instanceof Error ? err.message : err
+            );
+          }
         } catch (err) {
           console.error(
             `[scan-markets] ✗ savePaperTrade failed (${opp.marketId}/${opp.outcome}) :`,

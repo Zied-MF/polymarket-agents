@@ -233,6 +233,83 @@ export async function sendResultsSummary(
   }
 }
 
+// ---------------------------------------------------------------------------
+// Sell signals (monitor-positions)
+// ---------------------------------------------------------------------------
+
+export interface SellSignalNotification {
+  question: string;
+  outcome: string;
+  agent: "weather" | "finance";
+  action: "SELL" | "SWITCH";
+  reason: string;
+  entryPrice: number;
+  currentPrice: number;
+  potentialPnl: number;
+  suggestedBet: number;
+  switchToOutcome?: string;
+}
+
+/**
+ * Envoie une notification Discord pour les sell signals détectés.
+ * Un embed par signal, groupés en messages de 10.
+ */
+export async function sendSellSignals(
+  signals: SellSignalNotification[],
+  checkedAt: Date
+): Promise<void> {
+  if (signals.length === 0) return;
+
+  const webhookUrl = process.env.DISCORD_WEBHOOK_URL;
+  if (!webhookUrl) {
+    console.warn("[discord] DISCORD_WEBHOOK_URL non défini — sell signals ignorés");
+    return;
+  }
+
+  const COLOR_SELL   = 0xe74c3c; // rouge
+  const COLOR_SWITCH = 0xf39c12; // orange
+
+  const embeds: DiscordEmbed[] = signals.map((s) => {
+    const pnlStr   = s.potentialPnl >= 0 ? `+${s.potentialPnl.toFixed(2)}€` : `${s.potentialPnl.toFixed(2)}€`;
+    const priceStr = `${(s.entryPrice * 100).toFixed(1)}% → ${(s.currentPrice * 100).toFixed(1)}%`;
+    const fields: DiscordField[] = [
+      { name: "🎯 Outcome", value: s.outcome, inline: true },
+      { name: "📉 Prix", value: priceStr, inline: true },
+      { name: "💰 P&L potentiel", value: pnlStr, inline: true },
+      { name: "💵 Mise", value: `${s.suggestedBet.toFixed(2)}€`, inline: true },
+      { name: "📋 Raison", value: s.reason, inline: false },
+    ];
+    if (s.action === "SWITCH" && s.switchToOutcome) {
+      fields.push({ name: "🔄 Switcher vers", value: s.switchToOutcome, inline: true });
+    }
+    return {
+      title: `${s.action === "SELL" ? "🔴 SELL" : "🔄 SWITCH"} — ${s.question.slice(0, 60)}`,
+      color: s.action === "SELL" ? COLOR_SELL : COLOR_SWITCH,
+      fields,
+      footer: {
+        text: `[${s.agent}] Vérifié à ${checkedAt.toLocaleString("fr-FR", { timeZone: "UTC", timeZoneName: "short" })}`,
+      },
+    };
+  });
+
+  const CHUNK_SIZE = 10;
+  for (let i = 0; i < embeds.length; i += CHUNK_SIZE) {
+    const payload: DiscordWebhookPayload = {
+      username: "Polymarket Position Manager",
+      embeds: embeds.slice(i, i + CHUNK_SIZE),
+    };
+    try {
+      await postWebhook(webhookUrl, payload);
+      console.log(`[discord] ✅ Sell signals envoyés (${Math.min(CHUNK_SIZE, embeds.length - i)} signal(s))`);
+    } catch (err) {
+      console.error("[discord] ✗ Échec envoi sell signals :", err instanceof Error ? err.message : err);
+    }
+    if (i + CHUNK_SIZE < embeds.length) {
+      await new Promise((r) => setTimeout(r, 1000));
+    }
+  }
+}
+
 export async function sendDiscordNotification(
   opportunities: OpportunityNotification[],
   scannedAt: Date

@@ -1,0 +1,290 @@
+/**
+ * Monitor Positions endpoint
+ *
+ * GET /api/monitor-positions
+ *
+ * Pipeline :
+ *   1. Récupère toutes les positions ouvertes (status = 'open' | 'hold')
+ *   2. Pour chaque position, fetch les prix actuels via l'API Gamma
+ *   3. Évalue avec evaluatePosition()
+ *   4. Sell signal → recordSellSignal() + notification Discord
+ *   5. Pas de signal → updatePosition() (mise à jour du prix courant)
+ *   6. Retourne le résumé complet
+ */
+
+import { NextResponse }                          from "next/server";
+import { evaluatePosition, type MarketSnapshot } from "@/lib/positions/position-manager";
+import { getOpenPositions, updatePosition, recordSellSignal } from "@/lib/db/positions";
+import { sendSellSignals, type SellSignalNotification } from "@/lib/utils/discord";
+
+// ---------------------------------------------------------------------------
+// Gamma API — fetch prix actuel d'un marché
+// ---------------------------------------------------------------------------
+
+const GAMMA_BASE = "https://gamma-api.polymarket.com";
+
+const GAMMA_HEADERS: HeadersInit = {
+  Accept: "application/json",
+  "User-Agent":
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 " +
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+};
+
+interface GammaMarket {
+  id: string;
+  question?: string;
+  outcomes?: string | string[];
+  outcomePrices?: string | string[];
+  active?: boolean;
+  closed?: boolean;
+}
+
+function parseJsonField<T>(raw: string | T[] | undefined): T[] {
+  if (raw == null) return [];
+  if (Array.isArray(raw)) return raw;
+  try { return JSON.parse(raw) as T[]; } catch { return []; }
+}
+
+async function fetchMarketSnapshot(marketId: string): Promise<MarketSnapshot | null> {
+  try {
+    const url = `${GAMMA_BASE}/markets/${encodeURIComponent(marketId)}`;
+    const res  = await fetch(url, { headers: GAMMA_HEADERS });
+
+    if (!res.ok) {
+      console.warn(`[monitor-positions] Gamma HTTP ${res.status} pour market ${marketId}`);
+      return null;
+    }
+
+    const raw: GammaMarket = await res.json();
+    const outcomes      = parseJsonField<string>(raw.outcomes);
+    const pricesStrings = parseJsonField<string>(raw.outcomePrices);
+    const outcomePrices = pricesStrings.map(Number);
+
+    if (outcomes.length === 0 || outcomes.length !== outcomePrices.length) return null;
+
+    return { marketId, outcomes, outcomePrices };
+  } catch (err) {
+    console.warn(
+      `[monitor-positions] Erreur fetch market ${marketId} :`,
+      err instanceof Error ? err.message : err
+    );
+    return null;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Types de réponse
+// ---------------------------------------------------------------------------
+
+interface PositionSummary {
+  id: string;
+  question: string;
+  outcome: string;
+  agent: string;
+  entryPrice: number;
+  currentPrice: number | null;
+  status: string;
+  action: "SELL" | "SWITCH" | "HOLD" | "NO_DATA";
+  reason: string | null;
+  potentialPnl: number | null;
+}
+
+interface MonitorResult {
+  checkedAt: string;
+  totalOpen: number;
+  sellSignals: number;
+  switchSignals: number;
+  holds: number;
+  noData: number;
+  positions: PositionSummary[];
+  errors: { positionId: string; error: string }[];
+}
+
+// ---------------------------------------------------------------------------
+// Handler
+// ---------------------------------------------------------------------------
+
+export async function GET(): Promise<NextResponse<MonitorResult>> {
+  const checkedAt = new Date();
+  console.log(`[monitor-positions] ▶ Démarrage — ${checkedAt.toISOString()}`);
+
+  const errors: MonitorResult["errors"] = [];
+  const positionSummaries: PositionSummary[] = [];
+  const discordSignals: SellSignalNotification[] = [];
+
+  // 1. Récupérer les positions ouvertes
+  let positions;
+  try {
+    positions = await getOpenPositions();
+    console.log(`[monitor-positions] ${positions.length} position(s) ouverte(s)`);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(`[monitor-positions] ✗ getOpenPositions : ${msg}`);
+    return NextResponse.json(
+      {
+        checkedAt: checkedAt.toISOString(),
+        totalOpen: 0, sellSignals: 0, switchSignals: 0, holds: 0, noData: 0,
+        positions: [],
+        errors: [{ positionId: "N/A", error: msg }],
+      },
+      { status: 502 }
+    );
+  }
+
+  // 2. Évaluer chaque position
+  for (const position of positions) {
+    const tag = `[monitor-positions][${position.agent}][${position.id.slice(0, 8)}]`;
+
+    // 2a. Fetch snapshot de marché
+    const snapshot = await fetchMarketSnapshot(position.marketId);
+
+    if (!snapshot) {
+      console.warn(`${tag} Impossible de récupérer les prix pour market ${position.marketId}`);
+      positionSummaries.push({
+        id:           position.id,
+        question:     position.question,
+        outcome:      position.outcome,
+        agent:        position.agent,
+        entryPrice:   position.entryPrice,
+        currentPrice: null,
+        status:       position.status,
+        action:       "NO_DATA",
+        reason:       "Marché introuvable dans l'API Gamma",
+        potentialPnl: null,
+      });
+      continue;
+    }
+
+    // 2b. Trouver le prix actuel de l'outcome de la position
+    const outcomeIdx   = snapshot.outcomes.findIndex(
+      (o) => o.toLowerCase() === position.outcome.toLowerCase()
+    );
+    const currentPrice = outcomeIdx >= 0 ? snapshot.outcomePrices[outcomeIdx] : null;
+
+    // Mettre à jour currentPrice/currentProbability dans la position pour l'évaluation
+    const positionWithCurrent = {
+      ...position,
+      currentPrice:       currentPrice,
+      currentProbability: currentPrice,
+    };
+
+    // 2c. Évaluer
+    const signal = evaluatePosition(positionWithCurrent, snapshot);
+
+    if (signal && (signal.suggestedAction === "SELL" || signal.suggestedAction === "SWITCH")) {
+      // Sell ou Switch signal
+      console.log(
+        `${tag} ${signal.suggestedAction} — "${signal.reason}" ` +
+        `(entry=${position.entryPrice.toFixed(3)}, current=${signal.currentPrice.toFixed(3)}, ` +
+        `potentialPnl=${signal.potentialPnl >= 0 ? "+" : ""}${signal.potentialPnl.toFixed(2)})`
+      );
+
+      try {
+        await recordSellSignal(
+          position.id,
+          signal.reason,
+          signal.currentPrice,
+          signal.currentProb
+        );
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error(`${tag} ✗ recordSellSignal : ${msg}`);
+        errors.push({ positionId: position.id, error: msg });
+      }
+
+      discordSignals.push({
+        question:        position.question,
+        outcome:         position.outcome,
+        agent:           position.agent,
+        action:          signal.suggestedAction === "SWITCH" ? "SWITCH" : "SELL",
+        reason:          signal.reason,
+        entryPrice:      signal.entryPrice,
+        currentPrice:    signal.currentPrice,
+        potentialPnl:    signal.potentialPnl,
+        suggestedBet:    position.suggestedBet,
+        switchToOutcome: signal.switchToOutcome,
+      });
+
+      positionSummaries.push({
+        id:           position.id,
+        question:     position.question,
+        outcome:      position.outcome,
+        agent:        position.agent,
+        entryPrice:   position.entryPrice,
+        currentPrice: signal.currentPrice,
+        status:       "sell_signal",
+        action:       signal.suggestedAction,
+        reason:       signal.reason,
+        potentialPnl: signal.potentialPnl,
+      });
+
+    } else {
+      // HOLD — mise à jour du prix courant seulement
+      if (currentPrice !== null) {
+        try {
+          await updatePosition(position.id, {
+            currentPrice,
+            currentProbability: currentPrice,
+            status: "hold",
+          });
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          console.error(`${tag} ✗ updatePosition : ${msg}`);
+          errors.push({ positionId: position.id, error: msg });
+        }
+      }
+
+      console.log(
+        `${tag} HOLD — entry=${position.entryPrice.toFixed(3)}, ` +
+        `current=${currentPrice?.toFixed(3) ?? "N/A"}`
+      );
+
+      positionSummaries.push({
+        id:           position.id,
+        question:     position.question,
+        outcome:      position.outcome,
+        agent:        position.agent,
+        entryPrice:   position.entryPrice,
+        currentPrice: currentPrice,
+        status:       "hold",
+        action:       "HOLD",
+        reason:       null,
+        potentialPnl: currentPrice !== null
+          ? Math.round((currentPrice - position.entryPrice) * position.suggestedBet * 100) / 100
+          : null,
+      });
+    }
+  }
+
+  // 3. Notification Discord (fire-and-forget)
+  if (discordSignals.length > 0) {
+    sendSellSignals(discordSignals, checkedAt).catch((err) =>
+      console.error(
+        "[monitor-positions] ✗ sendSellSignals :",
+        err instanceof Error ? err.message : err
+      )
+    );
+  }
+
+  // 4. Résumé
+  const sellSignals   = positionSummaries.filter((p) => p.action === "SELL").length;
+  const switchSignals = positionSummaries.filter((p) => p.action === "SWITCH").length;
+  const holds         = positionSummaries.filter((p) => p.action === "HOLD").length;
+  const noData        = positionSummaries.filter((p) => p.action === "NO_DATA").length;
+
+  console.log(
+    `[monitor-positions] ■ Terminé — ${positions.length} positions : ` +
+    `${sellSignals} SELL, ${switchSignals} SWITCH, ${holds} HOLD, ${noData} NO_DATA, ${errors.length} erreurs`
+  );
+
+  return NextResponse.json({
+    checkedAt:    checkedAt.toISOString(),
+    totalOpen:    positions.length,
+    sellSignals,
+    switchSignals,
+    holds,
+    noData,
+    positions:    positionSummaries,
+    errors,
+  });
+}

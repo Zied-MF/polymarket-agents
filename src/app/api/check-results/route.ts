@@ -270,18 +270,13 @@ function resolveOutcome(
 function computePnl(
   result: "WIN" | "LOSS",
   marketPrice: number,
-  estimatedProbability: number
-): { pnl: number; suggestedBet: number } {
-  const kelly        = calculateHalfKelly(estimatedProbability, marketPrice, BANKROLL);
-  const suggestedBet = kelly.betAmount;
+  suggestedBet: number  // bet historique stocké au moment du scan — ne jamais recalculer
+): number {
+  if (suggestedBet === 0) return 0;
 
-  if (suggestedBet === 0) return { pnl: 0, suggestedBet: 0 };
-
-  const pnl = result === "WIN"
+  return result === "WIN"
     ? Math.round(((1 / marketPrice - 1) * suggestedBet) * 100) / 100
     : -suggestedBet;
-
-  return { pnl, suggestedBet };
 }
 
 // ---------------------------------------------------------------------------
@@ -345,13 +340,11 @@ export async function GET(): Promise<NextResponse<CheckSummary>> {
     }
 
     // 4. Résolution WIN / LOSS
-    const actual = selectTemp(opp.outcome, highC, lowC, unit);
-    const result = resolveOutcome(opp.outcome, actual, question);
-    const { pnl, suggestedBet } = computePnl(
-      result,
-      opp.market_price,
-      opp.estimated_probability
-    );
+    const actual       = selectTemp(opp.outcome, highC, lowC, unit);
+    const result       = resolveOutcome(opp.outcome, actual, question);
+    const kelly        = calculateHalfKelly(opp.estimated_probability, opp.market_price, BANKROLL);
+    const suggestedBet = kelly.betAmount;
+    const pnl          = computePnl(result, opp.market_price, suggestedBet);
 
     console.log(
       `${tag} ${result} — outcome="${opp.outcome}"  ` +
@@ -444,13 +437,14 @@ export async function GET(): Promise<NextResponse<CheckSummary>> {
         continue;
       }
 
-      const actual     = selectTemp(trade.outcome, highC, lowC, unit);
-      const result     = resolveOutcome(trade.outcome, actual, question);
-      const won        = result === "WIN";
-      const { pnl }    = computePnl(result, trade.market_price, trade.estimated_probability);
-      const actualStr  = `high=${highC.toFixed(1)}°C low=${lowC.toFixed(1)}°C actual=${actual.toFixed(1)}°${unit}`;
+      const actual    = selectTemp(trade.outcome, highC, lowC, unit);
+      const result    = resolveOutcome(trade.outcome, actual, question);
+      const won       = result === "WIN";
+      const pnl       = computePnl(result, trade.market_price, trade.suggested_bet);
+      const actualStr = `high=${highC.toFixed(1)}°C low=${lowC.toFixed(1)}°C actual=${actual.toFixed(1)}°${unit}`;
 
       console.log(`${tag} ${result} — outcome="${trade.outcome}"  ${actualStr}  pnl=${pnl >= 0 ? "+" : ""}${pnl.toFixed(2)}`);
+      console.log(`${tag} Trade resolved: bet=${trade.suggested_bet}, result=${result}, pnl=${pnl}`);
 
       try {
         await resolvePaperTrade(trade.id, actualStr, won, pnl);

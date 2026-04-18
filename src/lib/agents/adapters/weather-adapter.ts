@@ -26,9 +26,10 @@ import type { AgentConfig, AnalyzeResult }             from "@/lib/agents/orches
 // Constantes
 // ---------------------------------------------------------------------------
 
-const MIN_LIQUIDITY  = 5_000;  // relevé : $1 000 → $5 000
-const MIN_EDGE       = 0.12;   // relevé : 7.98% → 12% (gross)
-const NET_EDGE_MIN   = 0.08;   // relevé : 5% → 8% après spread
+const MIN_LIQUIDITY        = 5_000;  // relevé : $1 000 → $5 000
+const MIN_EDGE             = 0.12;   // relevé : 7.98% → 12% (gross)
+const NET_EDGE_MIN         = 0.08;   // relevé : 5% → 8% après spread
+const MAX_RESOLUTION_HOURS = 48;     // Ne prendre que les marchés qui expirent dans 48h max
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -77,6 +78,21 @@ export const weatherAdapter: AgentConfig = {
   async analyze(market: unknown, data: unknown): Promise<AnalyzeResult | null> {
     const m        = market as WeatherMarket;
     const forecast = data as Awaited<ReturnType<typeof fetchForecastForStation>>;
+
+    // Filtre horizon : ne pas bloquer les slots avec des trades longs
+    if (isNaN(m.endDate.getTime())) {
+      console.log(`[weather-adapter] ⚠️ Date invalide pour ${m.id}, skip`);
+      return { skipReason: "Date de résolution invalide" };
+    }
+    const hoursToResolution = (m.endDate.getTime() - Date.now()) / (1000 * 60 * 60);
+    if (hoursToResolution > MAX_RESOLUTION_HOURS) {
+      console.log(`[weather-adapter] ⏭ Résolution trop lointaine: ${Math.round(hoursToResolution)}h > ${MAX_RESOLUTION_HOURS}h — ${m.city}`);
+      return { skipReason: `Résolution dans ${Math.round(hoursToResolution)}h > ${MAX_RESOLUTION_HOURS}h` };
+    }
+    if (hoursToResolution < 1) {
+      console.log(`[weather-adapter] ⏭ Résolution trop proche: ${Math.round(hoursToResolution * 60)}min — ${m.city}`);
+      return { skipReason: "Résolution < 1h (trop tard pour entrer)" };
+    }
 
     if (!forecast) {
       return { skipReason: `Station inconnue : ${m.stationCode}` };

@@ -413,6 +413,13 @@ export async function savePaperTrade(
   input: SavePaperTradeInput
 ): Promise<PaperTradeRow> {
   const db = getClient();
+
+  // Normalise resolution_date en YYYY-MM-DD (tronque toute heure ou timezone éventuelle)
+  const resolutionDate =
+    typeof input.resolution_date === "string"
+      ? input.resolution_date.slice(0, 10)
+      : null;
+
   return execute<PaperTradeRow>(
     "savePaperTrade",
     db
@@ -429,7 +436,7 @@ export async function savePaperTrade(
         edge:                  input.edge,
         suggested_bet:         input.suggested_bet,
         confidence:            input.confidence,
-        resolution_date:       input.resolution_date,
+        resolution_date:       resolutionDate,
         potential_pnl:         input.potential_pnl,
         market_context:        input.market_context ?? null,
         expected_resolution:   input.expected_resolution ?? null,
@@ -596,6 +603,105 @@ export interface AgentPerformance {
   wins:    number;
   winRate: number; // 0-100
   pnl:     number;
+}
+
+// ---------------------------------------------------------------------------
+// Shadow Trades — tracking des opportunités détectées en shadow mode
+//
+// Les shadow trades sont de vrais paper_trades avec is_shadow=true.
+// Ils sont résolus par check-results comme les autres, mais ne sont jamais
+// considérés comme des positions réelles.
+//
+// Colonnes requises (à ajouter via Supabase SQL Editor si absentes) :
+//   ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS is_shadow BOOLEAN DEFAULT false;
+//   ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS hours_to_resolution DECIMAL;
+// ---------------------------------------------------------------------------
+
+export interface SaveShadowTradeInput {
+  marketId:             string;
+  question:             string;
+  agent:                "weather" | "finance" | "crypto";
+  outcome:              string;
+  marketPrice:          number;
+  estimatedProbability: number;
+  edge:                 number;
+  suggestedBet:         number;
+  confidence:           string | undefined;
+  targetDate?:          string;
+  targetDateTime?:      string;
+  ticker?:              string;
+  city?:                string;
+  hoursToResolution:    number;
+  marketContext?:       Record<string, unknown>;
+}
+
+/**
+ * Enregistre un trade shadow dans paper_trades (is_shadow=true).
+ * Utilisé par l'orchestrator pour tracer les opportunités détectées
+ * par les agents en shadow mode — résolues plus tard par check-results.
+ */
+export async function saveShadowTrade(input: SaveShadowTradeInput): Promise<void> {
+  const db = getClient();
+
+  const { error } = await db.from("paper_trades").insert({
+    market_id:             input.marketId,
+    question:              input.question,
+    agent:                 input.agent,
+    outcome:               input.outcome,
+    market_price:          input.marketPrice,
+    estimated_probability: input.estimatedProbability,
+    edge:                  input.edge,
+    suggested_bet:         input.suggestedBet,
+    confidence:            input.confidence ?? null,
+    resolution_date:       input.targetDate ?? null,
+    expected_resolution:   input.targetDateTime ?? null,
+    ticker:                input.ticker ?? null,
+    city:                  input.city ?? null,
+    market_context:        input.marketContext ?? null,
+    potential_pnl:         null,
+    is_shadow:             true,
+    hours_to_resolution:   Math.round(input.hoursToResolution * 10) / 10,
+  });
+
+  if (error) {
+    console.error(`[supabase] saveShadowTrade: ${error.message}`);
+  }
+}
+
+/**
+ * Performances théoriques d'un agent en shadow mode.
+ * Lit les N derniers trades shadow (is_shadow=true) résolus depuis paper_trades.
+ * Retourne des zéros si aucune donnée — shadow monitoring pas encore actif.
+ */
+export async function getShadowPerformance(
+  agentType: string,
+  lastN: number = 20
+): Promise<{ trades: number; winRate: number; theoreticalPnl: number }> {
+  const db = getClient();
+
+  const { data, error } = await db
+    .from("paper_trades")
+    .select("won, potential_pnl")
+    .eq("agent", agentType)
+    .eq("is_shadow", true)
+    .not("won", "is", null)
+    .order("created_at", { ascending: false })
+    .limit(lastN);
+
+  if (error || !data || data.length === 0) {
+    return { trades: 0, winRate: 0, theoreticalPnl: 0 };
+  }
+
+  const wins = data.filter((r) => r.won === true).length;
+  const pnl  = data.reduce((sum, r) => sum + Number(r.potential_pnl ?? 0), 0);
+
+  console.log(`[supabase] getShadowPerformance ${agentType}: ${data.length} trades, WR ${Math.round((wins / data.length) * 100)}%, P&L ${Math.round(pnl * 100) / 100}€`);
+
+  return {
+    trades:         data.length,
+    winRate:        Math.round((wins / data.length) * 100),
+    theoreticalPnl: Math.round(pnl * 100) / 100,
+  };
 }
 
 export async function getAgentPerformance24h(agentType: string): Promise<AgentPerformance> {

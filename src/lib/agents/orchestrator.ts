@@ -15,7 +15,7 @@
  * Risk limits : max 15 positions par agent, triées par edge décroissant.
  */
 
-import { getAgentPerformance24h } from "@/lib/db/supabase";
+import { getAgentPerformance24h, getShadowPerformance, saveShadowTrade } from "@/lib/db/supabase";
 
 // ---------------------------------------------------------------------------
 // Types publics
@@ -152,6 +152,30 @@ class Orchestrator {
       }
     }
 
+    // ── Promotion shadow → actif ─────────────────────────────────────────────
+    for (const agentType of [...this.shadowModeAgents]) {
+      try {
+        const shadowPerf = await getShadowPerformance(agentType, 20);
+        if (shadowPerf.trades >= 20 && shadowPerf.winRate > 55 && shadowPerf.theoreticalPnl > 0) {
+          console.log(
+            `[orchestrator] 🎉 PROMOTION: ${agentType} réactivé ` +
+            `(WR ${shadowPerf.winRate}%, P&L théorique +${shadowPerf.theoreticalPnl}€ sur ${shadowPerf.trades} trades)`
+          );
+          this.shadowModeAgents.delete(agentType);
+        } else if (shadowPerf.trades > 0) {
+          console.log(
+            `[orchestrator] 👻 ${agentType} reste en shadow ` +
+            `(WR ${shadowPerf.winRate}%, P&L ${shadowPerf.theoreticalPnl}€ sur ${shadowPerf.trades}/${20} trades requis)`
+          );
+        }
+      } catch (err) {
+        console.warn(
+          `[orchestrator] promotion check échoué pour ${agentType}:`,
+          err instanceof Error ? err.message : err
+        );
+      }
+    }
+
     console.log(
       `[orchestrator] Starting PARALLEL scan with ${agentsToRun.length} agents ` +
       `(shadow: [${[...this.shadowModeAgents].join(", ")}])…`
@@ -182,25 +206,51 @@ class Orchestrator {
             }
           }
 
-          // ── Shadow mode : analyse complète, zéro trade créé ────────────────
+          // ── Shadow mode : analyse complète, sauvegarde shadow, zéro trade réel ──
           if (this.shadowModeAgents.has(agent.type)) {
             console.log(
               `[orchestrator] 👻 SHADOW MODE: ${agent.name} — ` +
-              `${opportunities.length} opportunités détectées (non enregistrées) ` +
-              `en ${Date.now() - startTime}ms`
+              `${opportunities.length} opportunités détectées en ${Date.now() - startTime}ms`
             );
-            for (const opp of opportunities.slice(0, 3)) {
-              console.log(
-                `[orchestrator][shadow]   "${opp.question.slice(0, 60)}…" ` +
-                `edge=${(opp.edge * 100).toFixed(1)}%`
-              );
-            }
+
+            // Sauvegarder les meilleures opportunités shadow pour tracking (max 5)
+            const toSave = opportunities.slice(0, 5);
+            await Promise.allSettled(
+              toSave.map(async (opp) => {
+                const ref   = opp.targetDateTime ?? opp.targetDate;
+                const hours = ref
+                  ? (new Date(ref).getTime() - Date.now()) / (1000 * 60 * 60)
+                  : 0;
+                console.log(
+                  `[orchestrator][shadow]   "${opp.question.slice(0, 50)}…" ` +
+                  `edge=${(opp.edge * 100).toFixed(1)}% horizon=${Math.round(hours)}h`
+                );
+                await saveShadowTrade({
+                  marketId:             opp.marketId,
+                  question:             opp.question,
+                  agent:                opp.agent,
+                  outcome:              opp.outcome,
+                  marketPrice:          opp.marketPrice,
+                  estimatedProbability: opp.estimatedProbability,
+                  edge:                 opp.edge,
+                  suggestedBet:         opp.suggestedBet,
+                  confidence:           opp.confidence,
+                  targetDate:           opp.targetDate,
+                  targetDateTime:       opp.targetDateTime,
+                  ticker:               opp.ticker,
+                  city:                 opp.city,
+                  hoursToResolution:    hours,
+                  marketContext:        opp.marketContext,
+                });
+              })
+            );
+
             return {
-              agent:        agent.type,
-              opportunities: [],
+              agent:          agent.type,
+              opportunities:  [],
               skipped,
-              scanned:      markets.length,
-              shadowMode:   true,
+              scanned:        markets.length,
+              shadowMode:     true,
               shadowDetected: opportunities.length,
             };
           }
@@ -352,6 +402,19 @@ class Orchestrator {
     });
 
     console.log(`[orchestrator] Sector distribution:`, countBySector);
+
+    // Log horizon moyen des opportunités conservées
+    if (kept.length > 0) {
+      const avgHours = kept.reduce((sum, o) => {
+        const ref   = o.targetDateTime ?? o.targetDate;
+        const hours = ref
+          ? (new Date(ref).getTime() - Date.now()) / (1000 * 60 * 60)
+          : 0;
+        return sum + hours;
+      }, 0) / kept.length;
+      console.log(`[orchestrator] 📊 Horizon moyen des ${kept.length} opportunités: ${Math.round(avgHours)}h`);
+    }
+
     return kept;
   }
 

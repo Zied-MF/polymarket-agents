@@ -26,8 +26,9 @@ import type { AgentConfig, AnalyzeResult }                         from "@/lib/a
 // Constantes
 // ---------------------------------------------------------------------------
 
-const MIN_LIQUIDITY = 1_000;
-const NET_EDGE_MIN  = 0.05;
+const MIN_LIQUIDITY        = 1_000;
+const NET_EDGE_MIN         = 0.05;
+const MAX_RESOLUTION_HOURS = 48;     // Ne prendre que les marchés qui expirent dans 48h max
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -79,6 +80,19 @@ export const financeAdapter: AgentConfig = {
   async analyze(market: unknown, data: unknown): Promise<AnalyzeResult | null> {
     const m         = market as StockMarket;
     const stockData = data as StockData;
+
+    // Filtre horizon : ne pas bloquer les slots avec des trades longs
+    if (isNaN(m.endDate.getTime())) {
+      return { skipReason: "Date de résolution invalide" };
+    }
+    const hoursToResolution = (m.endDate.getTime() - Date.now()) / (1000 * 60 * 60);
+    if (hoursToResolution > MAX_RESOLUTION_HOURS) {
+      console.log(`[finance-adapter] ⏭ Résolution trop lointaine: ${Math.round(hoursToResolution)}h — ${m.ticker}`);
+      return { skipReason: `Résolution > ${MAX_RESOLUTION_HOURS}h` };
+    }
+    if (hoursToResolution < 1) {
+      return { skipReason: "Résolution < 1h" };
+    }
 
     // preMarket et technicals sont no-op sur le plan Finnhub gratuit
     const [preMarket] = await Promise.all([fetchPreMarketData(m.ticker)]);

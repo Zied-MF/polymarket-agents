@@ -26,7 +26,7 @@ import type { AgentConfig, AnalyzeResult }                         from "@/lib/a
 // Constantes
 // ---------------------------------------------------------------------------
 
-const MIN_LIQUIDITY        = 1_000;
+const MIN_LIQUIDITY        = 2_000;  // relevé : $1 000 → $2 000
 const NET_EDGE_MIN         = 0.05;
 const MAX_RESOLUTION_HOURS = 48;     // Ne prendre que les marchés qui expirent dans 48h max
 
@@ -55,9 +55,9 @@ export const financeAdapter: AgentConfig = {
   async fetchMarkets(): Promise<StockMarket[]> {
     const markets = await fetchStockMarkets();
 
-    return markets.filter((m) => {
+    const filtered = markets.filter((m) => {
       if (m.liquidity < MIN_LIQUIDITY) {
-        console.log(`[finance-adapter] ⏭ Liquidité insuffisante ($${round(m.liquidity, 2)}) — ${m.ticker}`);
+        console.log(`[finance-adapter] ⏭ Liquidité insuffisante ($${round(m.liquidity, 0)}) — ${m.ticker}`);
         return false;
       }
       if (m.outcomePrices.some((p) => p >= 0.95)) {
@@ -67,6 +67,9 @@ export const financeAdapter: AgentConfig = {
       }
       return true;
     });
+
+    console.log(`[finance-adapter] Filtre liquidité : ${filtered.length}/${markets.length} marchés conservés (min $${MIN_LIQUIDITY})`);
+    return filtered;
   },
 
   async fetchData(market: unknown): Promise<StockData> {

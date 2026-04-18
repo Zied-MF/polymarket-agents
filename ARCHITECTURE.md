@@ -224,7 +224,7 @@ export async function getAgentPerformance24h(agentType: string): Promise<AgentPe
 
 | Paramètre | Avant | Après |
 |---|---|---|
-| `MIN_LIQUIDITY` | $1 000 | $5 000 |
+| `MIN_LIQUIDITY` | $1 000 | $2 000 |
 | `MIN_EDGE` (gross) | 7.98% | **12%** |
 | `NET_EDGE_MIN` (après spread) | 5% | **8%** |
 | Filtre consensus | ≥ 90% | ≥ 90% (fetchMarkets) |
@@ -535,7 +535,7 @@ DISCORD_WEBHOOK_URL          # Webhook Discord (optionnel)
 | `GAS_FEE` | 0.01 USDC | `kelly.ts` |
 | `PLATFORM_FEE` | 2% | `kelly.ts` |
 | `MIN_BET_AMOUNT` | 0.10 USDC | `kelly.ts` |
-| `MIN_LIQUIDITY` | **$5 000** | `weather-adapter.ts` |
+| `MIN_LIQUIDITY` | **$2 000** | `weather-adapter.ts`, `finance-adapter.ts` |
 | `MIN_EDGE` (gross) | **12%** | `weather-adapter.ts` |
 | `NET_EDGE_MIN` | **8%** | `weather-adapter.ts` |
 | Anti-favori | **> 70%** | `weather-adapter.ts` |

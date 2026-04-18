@@ -26,7 +26,7 @@ import type { AgentConfig, AnalyzeResult }             from "@/lib/agents/orches
 // Constantes
 // ---------------------------------------------------------------------------
 
-const MIN_LIQUIDITY        = 5_000;  // relevé : $1 000 → $5 000
+const MIN_LIQUIDITY        = 2_000;  // relevé : $1 000 → $5 000 → $2 000
 const MIN_EDGE             = 0.12;   // relevé : 7.98% → 12% (gross)
 const NET_EDGE_MIN         = 0.08;   // relevé : 5% → 8% après spread
 const MAX_RESOLUTION_HOURS = 48;     // Ne prendre que les marchés qui expirent dans 48h max
@@ -56,9 +56,9 @@ export const weatherAdapter: AgentConfig = {
   async fetchMarkets(): Promise<WeatherMarket[]> {
     const markets = await fetchAllWeatherMarkets();
 
-    return markets.filter((m) => {
+    const filtered = markets.filter((m) => {
       if (m.liquidity < MIN_LIQUIDITY) {
-        console.log(`[weather-adapter] ⏭ Liquidité insuffisante ($${round(m.liquidity, 2)}) — "${m.question.slice(0, 60)}"`);
+        console.log(`[weather-adapter] ⏭ Liquidité insuffisante ($${round(m.liquidity, 0)}) — "${m.question.slice(0, 60)}"`);
         return false;
       }
       if (m.outcomePrices.some((p) => p >= 0.9)) {
@@ -68,6 +68,9 @@ export const weatherAdapter: AgentConfig = {
       }
       return true;
     });
+
+    console.log(`[weather-adapter] Filtre liquidité : ${filtered.length}/${markets.length} marchés conservés (min $${MIN_LIQUIDITY})`);
+    return filtered;
   },
 
   async fetchData(market: unknown) {

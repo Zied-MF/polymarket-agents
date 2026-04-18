@@ -2,13 +2,18 @@
  * Weather Adapter — adaptateur AgentConfig pour le Weather Agent
  *
  * Pipeline :
- *   fetchMarkets() → marchés météo filtrés (liquidité ≥ $1000, consensus < 90%)
+ *   fetchMarkets() → marchés météo filtrés (liquidité ≥ $5000, consensus < 90%)
  *   fetchData(market) → prévision Open-Meteo pour la station/date du marché
  *   analyze(market, forecast) → { dominated } ou { skipReason }
  *
+ * Seuils relevés après paper trading catastrophique (WR 39.8%, -85€) :
+ *   MIN_LIQUIDITY  : $1 000 → $5 000
+ *   MIN_EDGE       : 7.98% → 12% (gross)
+ *   NET_EDGE_MIN   : 5%    → 8%  (après spread)
+ *   Anti-favori    : skip si un outcome > 70%
+ *
  * Spread estimé en fonction de la liquidité :
  *   ≥ $10 000 → 2 %   |   ≥ $2 000 → 3 %   |   sinon → 4 %
- * Si edgeNet = edge − spread < 5 %, le marché est ignoré.
  */
 
 import { fetchAllWeatherMarkets, type WeatherMarket } from "@/lib/polymarket/gamma-api";
@@ -21,8 +26,9 @@ import type { AgentConfig, AnalyzeResult }             from "@/lib/agents/orches
 // Constantes
 // ---------------------------------------------------------------------------
 
-const MIN_LIQUIDITY  = 1_000;
-const NET_EDGE_MIN   = 0.05;   // 5 % après spread
+const MIN_LIQUIDITY  = 5_000;  // relevé : $1 000 → $5 000
+const MIN_EDGE       = 0.12;   // relevé : 7.98% → 12% (gross)
+const NET_EDGE_MIN   = 0.08;   // relevé : 5% → 8% après spread
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -76,14 +82,27 @@ export const weatherAdapter: AgentConfig = {
       return { skipReason: `Station inconnue : ${m.stationCode}` };
     }
 
+    // Filtre anti-favori : si un outcome dépasse 70%, le marché est trop consensuel
+    if (m.outcomePrices.some((p) => p > 0.70)) {
+      const dominant = Math.max(...m.outcomePrices);
+      console.log(`[weather-adapter] ⏭ Anti-favori (${(dominant * 100).toFixed(0)}% > 70%) — "${m.question.slice(0, 60)}"`);
+      return { skipReason: `Prix dominant ${(dominant * 100).toFixed(0)}% > 70% (favori évident)` };
+    }
+
     const outcomes = analyzeMarket(m, forecast);
     if (outcomes.length === 0) {
-      return { skipReason: `Aucun edge suffisant (edge < 7.98%)` };
+      return { skipReason: `Aucun edge suffisant (edge < ${(MIN_EDGE * 100).toFixed(0)}%)` };
     }
 
     const best = outcomes[0];
 
-    // Spread estimation + filtre net edge
+    // Filtre gross edge — seuil relevé à 12%
+    if (best.edge < MIN_EDGE) {
+      console.log(`[weather-adapter] ⏭ Edge brut insuffisant: ${(best.edge * 100).toFixed(1)}% < ${(MIN_EDGE * 100).toFixed(0)}% — "${m.question.slice(0, 60)}"`);
+      return { skipReason: `Edge brut ${(best.edge * 100).toFixed(1)}% < ${(MIN_EDGE * 100).toFixed(0)}%` };
+    }
+
+    // Spread estimation + filtre net edge — seuil relevé à 8%
     const spreadEstimate = estimateSpread(m.liquidity);
     const edgeNet        = best.edge - spreadEstimate;
     if (edgeNet < NET_EDGE_MIN) {
@@ -91,7 +110,7 @@ export const weatherAdapter: AgentConfig = {
         `[weather-adapter] ⏭ Edge net insuffisant: gross=${(best.edge * 100).toFixed(1)}%, ` +
         `spread≈${(spreadEstimate * 100).toFixed(1)}%, net=${(edgeNet * 100).toFixed(1)}% — "${m.question.slice(0, 60)}"`
       );
-      return { skipReason: `Edge net ${(edgeNet * 100).toFixed(1)}% < 5% (spread≈${(spreadEstimate * 100).toFixed(1)}%)` };
+      return { skipReason: `Edge net ${(edgeNet * 100).toFixed(1)}% < ${(NET_EDGE_MIN * 100).toFixed(0)}% (spread≈${(spreadEstimate * 100).toFixed(1)}%)` };
     }
 
     const kelly = calculateHalfKelly(best.estimatedProbability, best.marketPrice, BANKROLL, spreadEstimate);

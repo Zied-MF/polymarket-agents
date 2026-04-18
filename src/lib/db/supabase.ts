@@ -587,6 +587,44 @@ export async function releaseScanLock(): Promise<void> {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Circuit Breaker — performance des agents sur les dernières 24h
+// ---------------------------------------------------------------------------
+
+export interface AgentPerformance {
+  trades:  number;
+  wins:    number;
+  winRate: number; // 0-100
+  pnl:     number;
+}
+
+export async function getAgentPerformance24h(agentType: string): Promise<AgentPerformance> {
+  const db        = getClient();
+  const yesterday = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+
+  const { data } = await db
+    .from("paper_trades")
+    .select("won, potential_pnl")
+    .eq("agent", agentType)
+    .gte("created_at", yesterday)
+    .not("won", "is", null);
+
+  if (!data || data.length === 0) {
+    return { trades: 0, wins: 0, winRate: 100, pnl: 0 };
+  }
+
+  const trades  = data.length;
+  const wins    = data.filter((t) => t.won).length;
+  const pnl     = data.reduce((sum, t) => sum + Number(t.potential_pnl ?? 0), 0);
+
+  return {
+    trades,
+    wins,
+    winRate: Math.round((wins / trades) * 100),
+    pnl:     Math.round(pnl * 100) / 100,
+  };
+}
+
 export async function incrementDailyOpportunities(
   count: number,
   date?: string

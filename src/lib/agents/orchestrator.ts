@@ -15,6 +15,8 @@
  * Risk limits : max 15 positions par agent, triées par edge décroissant.
  */
 
+import { getAgentPerformance24h } from "@/lib/db/supabase";
+
 // ---------------------------------------------------------------------------
 // Types publics
 // ---------------------------------------------------------------------------
@@ -85,11 +87,19 @@ export interface ScanResult {
 class Orchestrator {
   private agents: AgentConfig[] = [];
 
-  private readonly maxPositionsPerAgent  = 15;
-  private readonly maxPositionsPerSector = 8;   // anti-corrélation (secteurs granulaires)
-  private readonly minEdge               = 0.0798; // 7.98 %
+  // Qualité > quantité après paper trading catastrophique (WR 39.8%, -85€)
+  private readonly maxPositionsPerAgent  = 3;
+  private readonly maxPositionsPerSector = 8;
+  private readonly minEdge               = 0.12; // 12% — seuil relevé
   private readonly batchSize             = 5;
-  private readonly batchDelayMs          = 200; // pause entre batches pour éviter 429
+  private readonly batchDelayMs          = 200;
+
+  /**
+   * Agents en shadow mode : ils scannent et analysent mais ne créent aucun trade.
+   * Permet de monitorer la qualité du signal sans risque capital.
+   * Pré-peuplé avec crypto et finance (WR < 40% historique).
+   */
+  private shadowModeAgents: Set<AgentType> = new Set(["crypto", "finance"]);
 
   /**
    * Enregistre un agent. Idempotent : un même `agent.name` n'est ajouté qu'une fois.
@@ -103,20 +113,54 @@ class Orchestrator {
 
   /**
    * Lance le scan PARALLÈLE avec tous les agents enregistrés.
-   * Chaque agent tourne simultanément ; les marchés d'un même agent
-   * sont analysés par batches de 10 en parallèle.
+   *
+   * Avant le scan :
+   *   1. Circuit breaker — désactive automatiquement les agents en difficulté (24h)
+   *   2. Shadow mode — les agents désactivés analysent mais ne créent aucun trade
+   *
+   * Pendant le scan :
+   *   - Les agents actifs tournent en parallèle (Promise.all)
+   *   - Les marchés d'un même agent sont traités par batches de 5
    */
   async scanAllMarkets(agentTypes?: AgentType[]): Promise<ScanResult> {
     const agentsToRun = agentTypes
       ? this.agents.filter((a) => agentTypes.includes(a.type))
       : this.agents;
 
-    console.log(`[orchestrator] Starting PARALLEL scan with ${agentsToRun.length} agents...`);
+    // ── Circuit breaker — séquentiel avant le scan ──────────────────────────
+    for (const agent of agentsToRun) {
+      try {
+        const perf = await getAgentPerformance24h(agent.type);
+        if (perf.trades >= 10 && perf.winRate < 40) {
+          console.log(
+            `[orchestrator] ⛔ AUTO-DISABLE: ${agent.name} ` +
+            `(WR ${perf.winRate}% < 40% sur ${perf.trades} trades)`
+          );
+          this.shadowModeAgents.add(agent.type);
+        } else if (perf.pnl < -15) {
+          console.log(
+            `[orchestrator] ⛔ AUTO-DISABLE: ${agent.name} ` +
+            `(P&L ${perf.pnl}€ < −15€ sur 24h)`
+          );
+          this.shadowModeAgents.add(agent.type);
+        }
+      } catch (err) {
+        console.warn(
+          `[orchestrator] circuit breaker check échoué pour ${agent.name} — scan maintenu :`,
+          err instanceof Error ? err.message : err
+        );
+      }
+    }
 
-    // Exécuter tous les agents EN PARALLÈLE
+    console.log(
+      `[orchestrator] Starting PARALLEL scan with ${agentsToRun.length} agents ` +
+      `(shadow: [${[...this.shadowModeAgents].join(", ")}])…`
+    );
+
+    // ── Scan parallèle ───────────────────────────────────────────────────────
     const results = await Promise.all(
       agentsToRun.map(async (agent) => {
-        console.log(`[orchestrator] Starting ${agent.name}...`);
+        console.log(`[orchestrator] Starting ${agent.name}…`);
         const startTime = Date.now();
 
         try {
@@ -124,7 +168,6 @@ class Orchestrator {
           const opportunities: Opportunity[] = [];
           const skipped:       SkippedMarket[] = [];
 
-          // Analyser par batch de batchSize en parallèle, avec délai entre chaque
           for (let i = 0; i < markets.length; i += this.batchSize) {
             const batch = markets.slice(i, i + this.batchSize);
             const batchResults = await Promise.all(
@@ -134,48 +177,87 @@ class Orchestrator {
               if (r.opportunity) opportunities.push(r.opportunity);
               if (r.skipped)     skipped.push(r.skipped);
             }
-            // Pause entre batches pour éviter les 429 sur les APIs externes
             if (i + this.batchSize < markets.length) {
               await new Promise<void>((r) => setTimeout(r, this.batchDelayMs));
             }
+          }
+
+          // ── Shadow mode : analyse complète, zéro trade créé ────────────────
+          if (this.shadowModeAgents.has(agent.type)) {
+            console.log(
+              `[orchestrator] 👻 SHADOW MODE: ${agent.name} — ` +
+              `${opportunities.length} opportunités détectées (non enregistrées) ` +
+              `en ${Date.now() - startTime}ms`
+            );
+            for (const opp of opportunities.slice(0, 3)) {
+              console.log(
+                `[orchestrator][shadow]   "${opp.question.slice(0, 60)}…" ` +
+                `edge=${(opp.edge * 100).toFixed(1)}%`
+              );
+            }
+            return {
+              agent:        agent.type,
+              opportunities: [],
+              skipped,
+              scanned:      markets.length,
+              shadowMode:   true,
+              shadowDetected: opportunities.length,
+            };
           }
 
           console.log(
             `[orchestrator] ${agent.name} done in ${Date.now() - startTime}ms: ` +
             `${opportunities.length} opportunities from ${markets.length} markets`
           );
-          return { agent: agent.type, opportunities, skipped, scanned: markets.length };
+          return {
+            agent:        agent.type,
+            opportunities,
+            skipped,
+            scanned:      markets.length,
+            shadowMode:   false,
+            shadowDetected: 0,
+          };
         } catch (err) {
           console.error(`[orchestrator] ${agent.name} failed:`, err instanceof Error ? err.message : err);
-          return { agent: agent.type, opportunities: [], skipped: [], scanned: 0 };
+          return {
+            agent:        agent.type,
+            opportunities: [],
+            skipped:      [],
+            scanned:      0,
+            shadowMode:   false,
+            shadowDetected: 0,
+          };
         }
       })
     );
 
-    // Combiner les résultats
+    // ── Combiner ─────────────────────────────────────────────────────────────
     const allOpportunities = results.flatMap((r) => r.opportunities);
     const allSkipped       = results.flatMap((r) => r.skipped);
     const byAgent: Record<string, AgentStats> = Object.fromEntries(
       results.map((r) => [r.agent, { scanned: r.scanned, opportunities: r.opportunities.length }])
     );
 
-    // Appliquer les limites de risque
     const beforeCount = allOpportunities.length;
     const filtered    = this.applyRiskLimits(allOpportunities);
-
     if (beforeCount > filtered.length) {
-      console.log(
-        `[orchestrator] Risk limits applied: ${beforeCount} → ${filtered.length} opportunities`
-      );
+      console.log(`[orchestrator] Risk limits applied: ${beforeCount} → ${filtered.length} opportunities`);
     }
 
     const avgEdge = filtered.length > 0
       ? Math.round(filtered.reduce((s, o) => s + o.edge, 0) / filtered.length * 1000) / 10
       : 0;
 
-    console.log(`[orchestrator] Scan complete:`);
-    console.log(`  - Total opportunities: ${filtered.length} (${avgEdge}% avg edge)`);
-    console.log(`  - By agent:`, byAgent);
+    // ── État final des agents ─────────────────────────────────────────────────
+    console.log(`[orchestrator] === ÉTAT DES AGENTS ===`);
+    for (const r of results) {
+      const mode    = r.shadowMode ? "👻 SHADOW" : "✅ ACTIF ";
+      const details = r.shadowMode
+        ? `${r.shadowDetected} détectées (non enregistrées)`
+        : `${r.opportunities.length} opportunités enregistrées`;
+      console.log(`[orchestrator]   ${mode} ${r.agent.padEnd(8)} — ${r.scanned} marchés, ${details}`);
+    }
+    console.log(`[orchestrator] Scan complet : ${filtered.length} trade(s) (edge moy. ${avgEdge}%)`);
 
     return { opportunities: filtered, skipped: allSkipped, byAgent };
   }

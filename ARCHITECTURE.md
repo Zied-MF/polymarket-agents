@@ -1,6 +1,6 @@
 # Architecture — Polymarket Trading Agents
 
-> Dernière mise à jour : 2026-04-16  
+> Dernière mise à jour : 2026-04-16 (v2)  
 > Stack : Next.js 16 · React 19 · TypeScript 5 · Supabase · Tailwind CSS 4
 
 ---
@@ -243,6 +243,8 @@ Pipeline :
 | < $10 000 | 3% |
 | ≥ $10 000 | 1.5% |
 
+**Guard Kelly = 0 (adapters) :** Après le calcul Kelly, si `betAmount === 0` (mise trop faible pour couvrir gas + frais), l'adapter retourne `{ skipReason: "Kelly bet insuffisant" }` au lieu d'un `dominated` avec `suggestedBet: 0`. Le trade n'est jamais sauvegardé.
+
 ---
 
 ## Filtres de risque — Orchestrateur
@@ -290,6 +292,13 @@ GET /api/check-results
         │
         └─ pour chaque trade :
                 │
+                ├─ [PRIORITÉ] getPositionByPaperTradeId(trade.id)
+                │       Si position.status === 'sold' ET sell_pnl !== null :
+                │         → resolvePaperTrade(won=sell_pnl>=0, potential_pnl=sell_pnl)
+                │         → continue  (skip résolution agent-spécifique)
+                │       Cas couvert : markPaperTradeSold() avait échoué silencieusement
+                │       mais la position est bien vendue dans positions
+                │
                 ├─ [weather] fetchActualTemperature(city, date)
                 │             → API Open-Meteo archive (historical)
                 │             selectTemp(outcome, highC, lowC, unit)
@@ -325,18 +334,34 @@ GET /api/monitor-positions
         │
         ├─ getOpenPositions()  (status IN ['open', 'hold'])
         │
-        └─ pour chaque position :
+        ├─ filtre par âge : positions < 30 min → ignorées (log + skip)
+        │       Évite de vendre immédiatement après ouverture (entry ≈ current)
+        │
+        └─ pour chaque position éligible :
                 ├─ fetchMarketSnapshot(market_id)  → prix actuel Gamma
+                │
+                ├─ calcul priceChange = |current − entry| / entry
+                ├─ log debug : age=Xmin, priceChange=X%, probChange=Xpts
+                │
+                ├─ si priceChange < 1% :
+                │       → updatePosition(HOLD) + continue
+                │       Prix quasi-inchangé, pas d'évaluation
+                │
                 ├─ evaluatePosition(position, snapshot)
-                │       SELL si currentProbability < entryProbability − 0.25
-                │       SELL si currentPrice < entryPrice × 0.5
+                │       SELL si probDrop ≥ 25 pts  (entryProb − currentProb)
+                │       SELL si priceRatio < 0.5   (currentPrice < entryPrice × 0.5)
                 │       HOLD sinon
-                ├─ si SELL signal :
-                │       recordSellSignal()    → positions.status = 'sell_signal'
-                │       executeSell()         → positions.status = 'sold', sell_pnl
+                │
+                ├─ si SELL :
+                │       executeSell()         → sell_pnl = (sell−entry)/entry × bet
                 │       markPaperTradeSold()  → paper_trades.actual_result = 'sold'
-                └─ sinon : updatePosition(currentPrice, currentProbability)
+                │
+                └─ si HOLD : updatePosition(currentPrice, currentProbability)
 ```
+
+**Formule `sell_pnl` :** `(sellPrice − entryPrice) / entryPrice × suggestedBet`  
+Exemple : entrée 0.40, sortie 0.60, bet 1 USDC → `(0.60−0.40)/0.40 × 1 = +0.50 USDC`  
+(Les prix Polymarket sont des probabilités [0,1] — on possède des *shares*, pas des USDC directs.)
 
 ---
 
@@ -495,6 +520,10 @@ DISCORD_WEBHOOK_URL          # Webhook Discord (optionnel)
 | `CACHE_TTL` (météo) | 10 min | `weather-sources.ts` |
 | `LOCK_TIMEOUT_MS` | 5 min | `supabase.ts` |
 | `AbortSignal.timeout` | 15 000ms | `weather-sources.ts` |
+| `MIN_POSITION_AGE_MS` | 30 min | `monitor-positions` |
+| `MIN_PRICE_CHANGE_RATIO` | 1% | `monitor-positions` |
+| `probDrop` SELL seuil | 25 pts | `position-manager.ts` |
+| `priceRatio` SELL seuil | < 0.5× | `position-manager.ts` |
 
 ---
 
@@ -505,8 +534,11 @@ DISCORD_WEBHOOK_URL          # Webhook Discord (optionnel)
 | Verrou `scan_locks` | `scan-markets` | Empêche 2 scans simultanés |
 | `getRecentOpportunities(24h)` | `scan-markets` | Ne resauvegarde pas la même opportunité en 24h |
 | `seenMarketIds` Set | orchestrateur | Un market_id unique même si 2 agents le voient |
-| `if (kelly.betAmount === 0) return skipReason` | adapters | Pas de trade sans mise valide |
-| `Number(trade.market_price)` | `check-results` | Coercition défensive contre null/undefined |
+| `kelly.betAmount === 0 → skipReason` | adapters | Pas de trade sauvegardé sans mise valide |
+| `Number(trade.market_price/suggested_bet)` | `check-results` | Coercition défensive contre null/undefined JS |
+| `getPositionByPaperTradeId` sold-check | `check-results` | Utilise `sell_pnl` réel si vendu par Position Manager |
+| `MIN_POSITION_AGE_MS` (30 min) | `monitor-positions` | Pas de vente immédiate après ouverture |
+| `MIN_PRICE_CHANGE_RATIO` (1%) | `monitor-positions` | Pas d'évaluation si le prix n'a pas bougé |
 | `edge > 50%` → skip | agents | Filtre les erreurs de données |
 | `marketPrice < 0.01 \|\| > 0.99` → skip | agents | Filtre les marchés déjà résolus |
 

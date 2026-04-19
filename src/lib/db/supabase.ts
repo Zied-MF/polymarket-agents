@@ -776,6 +776,45 @@ export async function markPostMortemDone(id: string): Promise<void> {
   if (error) throw new Error(`[supabase][markPostMortemDone] ${error.message}`);
 }
 
+// ---------------------------------------------------------------------------
+// Anti-Churn — éviter les positions dupliquées
+// ---------------------------------------------------------------------------
+
+/**
+ * Vérifie si un paper trade récent existe pour ce marketId.
+ * Évite de doubler une position sur le même marché dans la fenêtre donnée.
+ */
+export async function hasRecentTradeForMarket(
+  marketId:  string,
+  hoursBack: number = 24
+): Promise<boolean> {
+  const since = new Date(Date.now() - hoursBack * 60 * 60 * 1000).toISOString();
+  const { data } = await getClient()
+    .from("paper_trades")
+    .select("id")
+    .eq("market_id", marketId)
+    .gte("created_at", since)
+    .limit(1);
+  return (data?.length ?? 0) > 0;
+}
+
+/**
+ * Vérifie si un paper trade existe pour cette ville + date de résolution.
+ * Garantit qu'on n'ouvre qu'une seule position par ville/jour.
+ */
+export async function hasRecentTradeForCityDate(
+  city: string,
+  date: string
+): Promise<boolean> {
+  const { data } = await getClient()
+    .from("paper_trades")
+    .select("id")
+    .ilike("city", city)
+    .eq("resolution_date", date)
+    .limit(1);
+  return (data?.length ?? 0) > 0;
+}
+
 export async function incrementDailyOpportunities(
   count: number,
   date?: string

@@ -1,17 +1,17 @@
 /**
  * Weather Adapter — adaptateur AgentConfig pour le Weather Agent
  *
+ * Aligné sur WeatherBot.finance (3 modes via TRADING_MODE env var) :
+ *   balanced       — gopfan2, YES < 15¢ seulement, 10% edge min
+ *   aggressive     — YES jusqu'à 50¢, 8% edge min
+ *   high_conviction — YES < 15¢, 15% edge min, VERY_HIGH confiance
+ *
  * Pipeline :
- *   fetchMarkets() → marchés météo filtrés (liquidité ≥ $5000, consensus < 90%)
- *   fetchData(market) → prévision Open-Meteo pour la station/date du marché
- *   analyze(market, forecast) → { dominated } ou { skipReason }
+ *   fetchMarkets() → marchés météo filtrés (consensus < 90%, anti-doublon)
+ *   fetchData(market) → GFS + Ensemble + Multi-model (ECMWF/UKMO/GFS) en //
+ *   analyze(market, data) → filtres mode + accord modèles + edge + Claude → trade
  *
- * Seuils relevés après paper trading catastrophique (WR 39.8%, -85€) :
- *   MIN_LIQUIDITY  : $1 000 → $5 000
- *   MIN_EDGE       : 7.98% → 12% (gross)
- *   NET_EDGE_MIN   : 5%    → 8%  (après spread)
- *   Anti-favori    : skip si un outcome > 70%
- *
+ * Anti-churn : une seule position par ville/date (hasRecentTradeForCityDate).
  * Spread estimé en fonction de la liquidité :
  *   ≥ $10 000 → 2 %   |   ≥ $2 000 → 3 %   |   sinon → 4 %
  */
@@ -19,11 +19,13 @@
 import { fetchAllWeatherMarkets, type WeatherMarket }                           from "@/lib/polymarket/gamma-api";
 import { fetchForecastForStation, fetchEnsembleForecast }                        from "@/lib/data-sources/weather-sources";
 import { analyzeMarket, parseOutcomeForMarket }                                  from "@/lib/agents/weather-agent";
-import { calculateHalfKelly, BANKROLL }                                          from "@/lib/utils/kelly";
+import { BANKROLL }                                                              from "@/lib/utils/kelly";
 import { getAirportStation, isUSCity }                                           from "@/lib/data/airport-stations";
 import { analyzeWithClaude, type MarketContext }                                 from "@/lib/agents/claude-analyst";
 import { fetchMultiModelForecast, calculateMultiModelProbability,
          type MultiModelForecast }                                               from "@/lib/data-sources/multi-model-weather";
+import { TRADING_MODES, getCurrentMode, isConfidenceAtLeast }                   from "@/lib/config/trading-modes";
+import { hasRecentTradeForCityDate }                                             from "@/lib/db/supabase";
 import {
   getRecentLessons,
   getConfidenceCalibration,
@@ -37,10 +39,8 @@ import type { WeatherForecast, EnsembleForecast }                               
 // Constantes
 // ---------------------------------------------------------------------------
 
-const MIN_LIQUIDITY        = 2_000;  // relevé : $1 000 → $5 000 → $2 000
-const MIN_EDGE             = 0.12;   // relevé : 7.98% → 12% (gross)
-const NET_EDGE_MIN         = 0.08;   // relevé : 5% → 8% après spread
-const MAX_RESOLUTION_HOURS = 48;     // Ne prendre que les marchés qui expirent dans 48h max
+// Pas de filtre liquidité strict (aligné WeatherBot.finance)
+const MAX_RESOLUTION_HOURS = 48;  // Ne prendre que les marchés qui expirent dans 48h max
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -68,10 +68,7 @@ export const weatherAdapter: AgentConfig = {
     const markets = await fetchAllWeatherMarkets();
 
     const filtered = markets.filter((m) => {
-      if (m.liquidity < MIN_LIQUIDITY) {
-        console.log(`[weather-adapter] ⏭ Liquidité insuffisante ($${round(m.liquidity, 0)}) — "${m.question.slice(0, 60)}"`);
-        return false;
-      }
+      // Filtre consensus fort uniquement (pas de filtre liquidité — WeatherBot.finance)
       if (m.outcomePrices.some((p) => p >= 0.9)) {
         const dominant = Math.max(...m.outcomePrices);
         console.log(`[weather-adapter] ⏭ Consensus fort (${round(dominant * 100, 1)}%) — "${m.question.slice(0, 60)}"`);
@@ -80,7 +77,7 @@ export const weatherAdapter: AgentConfig = {
       return true;
     });
 
-    console.log(`[weather-adapter] Filtre liquidité : ${filtered.length}/${markets.length} marchés conservés (min $${MIN_LIQUIDITY})`);
+    console.log(`[weather-adapter] ${filtered.length}/${markets.length} marchés après filtre consensus`);
     return filtered;
   },
 
@@ -166,7 +163,7 @@ export const weatherAdapter: AgentConfig = {
 
     const outcomes = analyzeMarket(m, forecast, ensemble ?? undefined);
     if (outcomes.length === 0) {
-      return { skipReason: `Aucun edge suffisant (edge < ${(MIN_EDGE * 100).toFixed(0)}%)` };
+      return { skipReason: "Aucun edge suffisant (filtres gaussien/ensemble)" };
     }
 
     const best = outcomes[0];
@@ -215,22 +212,40 @@ export const weatherAdapter: AgentConfig = {
       }
     }
 
-    // === PRICE THRESHOLDS (WeatherBot rules) ===
+    // === TRADING MODE (WeatherBot.finance alignement) ===
+    const mode    = TRADING_MODES[getCurrentMode()];
     const yesPrice = m.outcomePrices[0];
 
-    // Règle 1 : ne jamais acheter YES au-dessus de 45¢
-    if (best.outcome === "Yes" && best.marketPrice > 0.45) {
-      console.log(`[weather-adapter] ⏭ YES trop cher: ${(best.marketPrice * 100).toFixed(0)}¢ > 45¢`);
-      return { skipReason: `YES price ${(best.marketPrice * 100).toFixed(0)}¢ > 45¢ (trop cher)` };
+    // Anti-churn : une seule position par ville/date
+    const targetDateStr = m.targetDate.toISOString().slice(0, 10);
+    try {
+      const alreadyOpen = await hasRecentTradeForCityDate(m.city, targetDateStr);
+      if (alreadyOpen) {
+        console.log(`[weather-adapter] ⏭ Anti-churn: position déjà ouverte pour ${m.city} le ${targetDateStr}`);
+        return { skipReason: `Already have position for ${m.city} on ${targetDateStr}` };
+      }
+    } catch (err) {
+      console.warn(`[weather-adapter] hasRecentTradeForCityDate échoué (non-bloquant):`, err instanceof Error ? err.message : err);
     }
 
-    // Règle 2 : ne jamais acheter NO si YES est en-dessous de 45¢ (NO > 55¢)
-    if (best.outcome === "No" && yesPrice < 0.45) {
-      console.log(`[weather-adapter] ⏭ NO pas rentable: YES seulement ${(yesPrice * 100).toFixed(0)}¢`);
-      return { skipReason: `NO not worth: YES only ${(yesPrice * 100).toFixed(0)}¢` };
+    // Filtre YES price (mode-based)
+    if (best.outcome === "Yes" && best.marketPrice > mode.yesMaxPrice) {
+      console.log(`[weather-adapter] ⏭ YES trop cher: ${(best.marketPrice * 100).toFixed(0)}¢ > ${(mode.yesMaxPrice * 100).toFixed(0)}¢ (mode: ${mode.name})`);
+      return { skipReason: `YES ${(best.marketPrice * 100).toFixed(0)}¢ > ${(mode.yesMaxPrice * 100).toFixed(0)}¢ (mode: ${mode.name})` };
     }
 
-    // Règle 3 : forte conviction sur YES cheap (< 20¢, forecast > 70%)
+    // Filtre NO price (mode-based)
+    if (best.outcome === "No" && yesPrice < mode.noMinYesPrice) {
+      console.log(`[weather-adapter] ⏭ NO pas rentable: YES ${(yesPrice * 100).toFixed(0)}¢ < ${(mode.noMinYesPrice * 100).toFixed(0)}¢ (mode: ${mode.name})`);
+      return { skipReason: `NO not worth: YES only ${(yesPrice * 100).toFixed(0)}¢ < ${(mode.noMinYesPrice * 100).toFixed(0)}¢` };
+    }
+
+    // Filet de sécurité : prix max 70¢ pour tout outcome
+    if (best.marketPrice > 0.70) {
+      return { skipReason: `Price ${(best.marketPrice * 100).toFixed(0)}¢ > 70¢ (favori évident)` };
+    }
+
+    // Forte conviction sur YES cheap (< 20¢, forecast > 70%) → STRONG BUY
     let confidenceOverride: "high" | "medium" | "low" | undefined = forecast.confidenceLevel;
     if (best.outcome === "Yes" && best.marketPrice < 0.20 && best.estimatedProbability > 0.70) {
       console.log(
@@ -240,32 +255,16 @@ export const weatherAdapter: AgentConfig = {
       confidenceOverride = "high";
     }
 
-    // Règle 4 : prix max 70¢ pour tout outcome (filet de sécurité)
-    if (best.marketPrice > 0.70) {
-      return { skipReason: `Price ${(best.marketPrice * 100).toFixed(0)}¢ > 70¢ (favori évident)` };
-    }
-
-    // Filtre gross edge — seuil relevé à 12%
-    if (best.edge < MIN_EDGE) {
-      console.log(`[weather-adapter] ⏭ Edge brut insuffisant: ${(best.edge * 100).toFixed(1)}% < ${(MIN_EDGE * 100).toFixed(0)}% — "${m.question.slice(0, 60)}"`);
-      return { skipReason: `Edge brut ${(best.edge * 100).toFixed(1)}% < ${(MIN_EDGE * 100).toFixed(0)}%` };
-    }
-
-    // Spread estimation + filtre net edge — seuil relevé à 8%
+    // Filtre edge (mode-based, après spread)
     const spreadEstimate = estimateSpread(m.liquidity);
     const edgeNet        = best.edge - spreadEstimate;
-    if (edgeNet < NET_EDGE_MIN) {
+    if (edgeNet < mode.minEdge) {
       console.log(
-        `[weather-adapter] ⏭ Edge net insuffisant: gross=${(best.edge * 100).toFixed(1)}%, ` +
-        `spread≈${(spreadEstimate * 100).toFixed(1)}%, net=${(edgeNet * 100).toFixed(1)}% — "${m.question.slice(0, 60)}"`
+        `[weather-adapter] ⏭ Edge insuffisant: gross=${(best.edge * 100).toFixed(1)}%, ` +
+        `spread≈${(spreadEstimate * 100).toFixed(1)}%, net=${(edgeNet * 100).toFixed(1)}% ` +
+        `< ${(mode.minEdge * 100).toFixed(0)}% (mode: ${mode.name})`
       );
-      return { skipReason: `Edge net ${(edgeNet * 100).toFixed(1)}% < ${(NET_EDGE_MIN * 100).toFixed(0)}% (spread≈${(spreadEstimate * 100).toFixed(1)}%)` };
-    }
-
-    const kelly = calculateHalfKelly(best.estimatedProbability, best.marketPrice, BANKROLL, spreadEstimate);
-
-    if (kelly.betAmount === 0) {
-      return { skipReason: `Kelly bet insuffisant (spread≈${(spreadEstimate * 100).toFixed(1)}%, mise < MIN)` };
+      return { skipReason: `Edge net ${(edgeNet * 100).toFixed(1)}% < ${(mode.minEdge * 100).toFixed(0)}% (mode: ${mode.name})` };
     }
 
     // === CLAUDE AI — validation finale ===
@@ -361,9 +360,20 @@ export const weatherAdapter: AgentConfig = {
       return { skipReason: `Claude: ${claudeAnalysis.reason}` };
     }
 
-    // Claude dit TRADE — ajuster la mise selon sa conviction (size 1-10)
-    const sizeMultiplier  = Math.max(0.1, Math.min(1.0, (claudeAnalysis.size ?? 5) / 10));
-    const adjustedBet     = Math.max(0.10, Math.min(kelly.betAmount * sizeMultiplier, BANKROLL * 0.9));
+    // Filtre confiance Claude (mode-based)
+    if (!isConfidenceAtLeast(claudeAnalysis.confidence, mode.minConfidence)) {
+      console.log(`[weather-adapter] ⏭ Confiance insuffisante: ${claudeAnalysis.confidence} < ${mode.minConfidence} (mode: ${mode.name})`);
+      return { skipReason: `Confidence ${claudeAnalysis.confidence} < ${mode.minConfidence} (mode: ${mode.name})` };
+    }
+
+    // Kelly sizing dynamique (mode-based) — Claude size 1-10 → % du bankroll
+    const claudeSize   = claudeAnalysis.size ?? 5;
+    const sizePercent  = (claudeSize / 10) * mode.maxBetPercent;
+    const adjustedBet  = Math.max(0.10, Math.min(BANKROLL * sizePercent, BANKROLL * mode.maxBetPercent));
+    console.log(
+      `[weather-adapter] 💰 Kelly sizing: Claude size=${claudeSize}/10 → ` +
+      `${(sizePercent * 100).toFixed(1)}% → ${adjustedBet.toFixed(2)}€ (mode: ${mode.name})`
+    );
 
     // Confiance : VERY_HIGH → high, HIGH → high, MEDIUM → medium, LOW → low
     const claudeConfidence = claudeAnalysis.confidence === "VERY_HIGH" || claudeAnalysis.confidence === "HIGH"

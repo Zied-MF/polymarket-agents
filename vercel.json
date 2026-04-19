@@ -1,16 +1,8 @@
 {
   "crons": [
-    {
-      "path": "/api/scan-markets",
-      "schedule": "*/15 * * * *"
-    },
-    {
-      "path": "/api/check-results",
-      "schedule": "0 8 * * *"
-    },
-    {
-      "path": "/api/post-mortem",
-      "schedule": "0 */6 * * *"
-    }
+    { "path": "/api/scan-markets",       "schedule": "*/15 * * * *" },
+    { "path": "/api/monitor-positions",  "schedule": "*/5 * * * *"  },
+    { "path": "/api/check-results",      "schedule": "0 8 * * *"    },
+    { "path": "/api/post-mortem",        "schedule": "0 */6 * * *"  }
   ]
 }

@@ -14,7 +14,8 @@
       "Bash(curl -s \"https://gamma-api.polymarket.com/events?tag_slug=crypto&active=true&closed=false&order=endDate&ascending=true&limit=5\")",
       "Bash(python3 -c ':*)",
       "Bash(curl -s \"https://gamma-api.polymarket.com/events?tag_slug=crypto&active=true&closed=false&order=endDate&ascending=false&limit=10\")",
-      "Bash(curl -s \"https://gamma-api.polymarket.com/events?tag_slug=crypto&active=true&closed=false&order=endDate&ascending=false&limit=100\")"
+      "Bash(curl -s \"https://gamma-api.polymarket.com/events?tag_slug=crypto&active=true&closed=false&order=endDate&ascending=false&limit=100\")",
+      "Bash(node -e \"require\\('@anthropic-ai/sdk'\\)\")"
     ]
   }
 }

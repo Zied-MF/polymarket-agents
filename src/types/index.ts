@@ -55,6 +55,28 @@ export interface BetRecommendation {
   agent: string;
 }
 
+/**
+ * Prévision d'ensemble GFS (31 membres) pour un jour donné.
+ * Retournée par fetchEnsembleForecast() depuis l'API Open-Meteo Ensemble.
+ * Toutes les températures sont en °C.
+ */
+export interface EnsembleForecast {
+  /** Températures max des membres (°C) — pour les marchés "high temp". */
+  membersMax:  number[];
+  /** Températures min des membres (°C) — pour les marchés "low temp". */
+  membersMin:  number[];
+  /** Moyenne de membersMax. */
+  mean:        number;
+  /** Écart-type de membersMax. */
+  stdDev:      number;
+  /** Amplitude max-min de membersMax. */
+  spread:      number;
+  /** Date cible (YYYY-MM-DD). */
+  date:        string;
+  /** Nombre de membres effectivement récupérés (cible : 31). */
+  memberCount: number;
+}
+
 /** Températures prévues par chaque modèle météo (°C). */
 export interface ModelTemps {
   gfs?: number;

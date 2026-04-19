@@ -11,8 +11,9 @@
  *   - normalizeCity(raw)        → forme canonique ("NYC" → "New York City")
  */
 
-import { createClient }    from "@supabase/supabase-js";
-import { STATION_MAPPING } from "@/lib/data/station-mapping";
+import { createClient }       from "@supabase/supabase-js";
+import { STATION_MAPPING }    from "@/lib/data/station-mapping";
+import { getAirportStation }  from "@/lib/data/airport-stations";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -222,6 +223,13 @@ async function fetchFromOpenMeteo(cityName: string): Promise<GeoResult | null> {
 export async function getCoordinates(cityName: string): Promise<GeoResult | null> {
   const normalized = normalizeCity(cityName);
   const cacheKey   = normalized.toLowerCase();
+
+  // 0. PRIORITÉ : coordonnées aéroport (stations utilisées par Polymarket pour résolution)
+  const airport = getAirportStation(cityName) ?? getAirportStation(normalized);
+  if (airport) {
+    console.log(`[geocoding] ✈️ Airport: ${normalized} → ${airport.icao} (${airport.lat}, ${airport.lon})`);
+    return { lat: airport.lat, lon: airport.lon, country: airport.country };
+  }
 
   // 1. Cache mémoire
   if (MEMORY_CACHE.has(cacheKey)) {

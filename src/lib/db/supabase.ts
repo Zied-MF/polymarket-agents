@@ -122,12 +122,14 @@ export interface PaperTradeRow {
   polymarket_outcome: string | null;
   /** true si notre prédiction correspond à l'outcome officiel Polymarket. */
   outcome_match: boolean | null;
+  /** true une fois que le post-mortem a été généré pour ce trade. */
+  post_mortem_done: boolean | null;
 }
 
 export type SavePaperTradeInput = Omit<
   PaperTradeRow,
   // Champs auto-générés ou remplis à la résolution
-  "id" | "created_at" | "actual_result" | "won" | "resolved_at" | "polymarket_outcome" | "outcome_match"
+  "id" | "created_at" | "actual_result" | "won" | "resolved_at" | "polymarket_outcome" | "outcome_match" | "post_mortem_done"
 >;
 
 export type SaveBetInput = {
@@ -729,6 +731,49 @@ export async function getAgentPerformance24h(agentType: string): Promise<AgentPe
     winRate: Math.round((wins / trades) * 100),
     pnl:     Math.round(pnl * 100) / 100,
   };
+}
+
+// ---------------------------------------------------------------------------
+// Post-Mortem
+//
+// Colonnes requises (à ajouter via Supabase SQL Editor si absentes) :
+//   ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS post_mortem_done BOOLEAN DEFAULT false;
+// ---------------------------------------------------------------------------
+
+/**
+ * Retourne les paper trades résolus (won IS NOT NULL) sans post-mortem généré.
+ * Exclut les trades shadow et les trades sans city (non-weather).
+ * Limité à `limit` pour éviter de surcharger Claude lors des premiers runs.
+ */
+export async function getResolvedTradesForPostMortem(
+  limit = 20
+): Promise<PaperTradeRow[]> {
+  const db = getClient();
+
+  const { data, error } = await db
+    .from("paper_trades")
+    .select("*")
+    .not("won", "is", null)
+    .or("post_mortem_done.is.null,post_mortem_done.eq.false")
+    .eq("agent", "weather")
+    .order("resolved_at", { ascending: true })
+    .limit(limit);
+
+  if (error) throw new Error(`[supabase][getResolvedTradesForPostMortem] ${error.message}`);
+  return data ?? [];
+}
+
+/**
+ * Marque un paper trade comme ayant un post-mortem généré.
+ */
+export async function markPostMortemDone(id: string): Promise<void> {
+  const db = getClient();
+  const { error } = await db
+    .from("paper_trades")
+    .update({ post_mortem_done: true })
+    .eq("id", id);
+
+  if (error) throw new Error(`[supabase][markPostMortemDone] ${error.message}`);
 }
 
 export async function incrementDailyOpportunities(

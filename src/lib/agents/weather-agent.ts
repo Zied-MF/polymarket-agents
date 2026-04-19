@@ -21,8 +21,7 @@
  */
 
 import type { WeatherMarket } from "@/lib/polymarket/gamma-api";
-import type { WeatherForecast } from "@/types";
-import type { Outcome } from "@/types";
+import type { WeatherForecast, EnsembleForecast, Outcome } from "@/types";
 
 // ---------------------------------------------------------------------------
 // Constantes
@@ -163,12 +162,16 @@ function resolveMarketUnit(
 // Parsing des outcomes
 // ---------------------------------------------------------------------------
 
-interface ParsedOutcome {
+export interface ParsedOutcome {
   type: "exact" | "range" | "above" | "below" | "unknown";
   /** Température cible pour les types "exact" et "range" — dans l'unité du marché. */
   target?: number;
   /** Seuil pour les types "above" et "below" — dans l'unité du marché. */
   threshold?: number;
+  /** Borne basse de la plage (type "range") — dans l'unité du marché. */
+  lo?: number;
+  /** Borne haute de la plage (type "range") — dans l'unité du marché. */
+  hi?: number;
 }
 
 /**
@@ -213,7 +216,7 @@ function parseOutcome(label: string, binaryQ?: BinaryQuestion): ParsedOutcome {
   if (rangeMatch) {
     const lo = parseFloat(rangeMatch[1]);
     const hi = parseFloat(rangeMatch[2]);
-    return { type: "range", target: (lo + hi) / 2 };
+    return { type: "range", target: (lo + hi) / 2, lo, hi };
   }
 
   // 4. "Above X" / "≥ X" / "> X" (sans unité suffixée)
@@ -284,7 +287,69 @@ function extractBinaryQuestion(question: string): BinaryQuestion | undefined {
 }
 
 // ---------------------------------------------------------------------------
-// Calcul de probabilité d'un outcome
+// Calcul de probabilité — méthode ensemble (31 membres GFS)
+// ---------------------------------------------------------------------------
+
+/**
+ * Calcule P(outcome) en comptant les membres GFS qui satisfont la condition.
+ *
+ * Plus précis que la gaussienne car utilise 31 vraies simulations NWP.
+ * Les températures de l'ensemble sont en °C et converties vers l'unité du marché.
+ * Retourne NaN si le type est "unknown" ou si aucun membre n'est disponible.
+ *
+ * @param ensemble    Prévision d'ensemble GFS (fetchEnsembleForecast)
+ * @param parsed      Outcome parsé (type + seuil dans l'unité du marché)
+ * @param unit        Unité effective du marché ("F" ou "C")
+ * @param measureType "high" → membersMax, "low" → membersMin
+ */
+function calculateEnsembleProbability(
+  ensemble:    EnsembleForecast,
+  parsed:      ParsedOutcome,
+  unit:        "F" | "C",
+  measureType: "high" | "low"
+): number {
+  if (parsed.type === "unknown") return NaN;
+
+  const rawMembers = measureType === "high" ? ensemble.membersMax : ensemble.membersMin;
+  if (rawMembers.length === 0) return NaN;
+
+  // Convertir les membres vers l'unité du marché
+  const members = unit === "F"
+    ? rawMembers.map(celsiusToFahrenheit)
+    : rawMembers;
+
+  // Tolérance pour les types "exact" et "range" (mi-plage)
+  const EXACT_TOL = unit === "F" ? 1.0 : 0.55;  // ±1 °F ou ±0.55 °C
+  const RANGE_TOL = unit === "F" ? 2.5 : 1.4;   // ≈ demi-largeur d'une plage typique
+
+  let count = 0;
+  for (const t of members) {
+    switch (parsed.type) {
+      case "exact":
+        if (parsed.target != null && Math.abs(t - parsed.target) <= EXACT_TOL) count++;
+        break;
+      case "range":
+        if (parsed.target != null && Math.abs(t - parsed.target) <= RANGE_TOL) count++;
+        break;
+      case "above":
+        if (parsed.threshold != null && t >= parsed.threshold) count++;
+        break;
+      case "below":
+        if (parsed.threshold != null && t < parsed.threshold) count++;
+        break;
+    }
+  }
+
+  const prob = count / members.length;
+  console.log(
+    `[ensemble-prob] ${parsed.type} ${parsed.target ?? parsed.threshold}°${unit}: ` +
+    `${count}/${members.length} membres = ${(prob * 100).toFixed(1)}%`
+  );
+  return prob;
+}
+
+// ---------------------------------------------------------------------------
+// Calcul de probabilité — méthode gaussienne (fallback)
 // ---------------------------------------------------------------------------
 
 /**
@@ -325,6 +390,25 @@ function probabilityForOutcome(
 }
 
 // ---------------------------------------------------------------------------
+// Helpers exportés — utilisés par les adapters et multi-model
+// ---------------------------------------------------------------------------
+
+/**
+ * Parse l'outcome d'un marché pour obtenir le type et les seuils.
+ * Combine extractBinaryQuestion (question) + parseOutcome (label).
+ *
+ * Retourne null si l'outcome n'est pas reconnu.
+ */
+export function parseOutcomeForMarket(
+  question:     string,
+  outcomeLabel: string
+): ParsedOutcome | null {
+  const binaryQ = extractBinaryQuestion(question);
+  const parsed  = parseOutcome(outcomeLabel, binaryQ);
+  return parsed.type === "unknown" ? null : parsed;
+}
+
+// ---------------------------------------------------------------------------
 // Fonction principale
 // ---------------------------------------------------------------------------
 
@@ -336,7 +420,8 @@ function probabilityForOutcome(
  */
 export function analyzeMarket(
   market:   WeatherMarket,
-  forecast: WeatherForecast
+  forecast: WeatherForecast,
+  ensemble?: EnsembleForecast | null
 ): Outcome[] {
   // 1. Unité effective — hiérarchie : question → outcomes → géographie → market.unit
   const effectiveUnit = resolveMarketUnit(
@@ -399,7 +484,24 @@ export function analyzeMarket(
       continue;
     }
 
-    const estimatedProbability = probabilityForOutcome(parsed, forecastTemp, sigma, label);
+    // Préférer l'ensemble GFS (31 membres) à la gaussienne quand disponible
+    let estimatedProbability: number;
+    if (ensemble && ensemble.memberCount > 0) {
+      const ep = calculateEnsembleProbability(ensemble, parsed, effectiveUnit, market.measureType);
+      if (!isNaN(ep)) {
+        estimatedProbability = ep;
+        console.log(
+          `[weather-agent] 🎯 Ensemble (${ensemble.memberCount} membres): ` +
+          `"${label}" = ${(ep * 100).toFixed(1)}%`
+        );
+      } else {
+        // Type unknown ou membres vides → fallback gaussienne
+        estimatedProbability = probabilityForOutcome(parsed, forecastTemp, sigma, label);
+        console.log(`[weather-agent] ⚠️ Fallback gaussienne pour "${label}"`);
+      }
+    } else {
+      estimatedProbability = probabilityForOutcome(parsed, forecastTemp, sigma, label);
+    }
 
     if (isNaN(estimatedProbability)) continue;
 

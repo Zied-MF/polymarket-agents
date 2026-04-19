@@ -15,9 +15,9 @@
  *   J+3+          → sigma = 3.5°C, confidence = "low"
  */
 
-import { STATION_MAPPING }                    from "@/lib/data/station-mapping";
-import { getCoordinates }                     from "@/lib/data-sources/geocoding";
-import type { WeatherForecast, ModelTemps }   from "@/types";
+import { STATION_MAPPING }                              from "@/lib/data/station-mapping";
+import { getCoordinates }                               from "@/lib/data-sources/geocoding";
+import type { WeatherForecast, ModelTemps, EnsembleForecast } from "@/types";
 
 const OPEN_METEO_BASE = "https://api.open-meteo.com/v1/forecast";
 
@@ -281,6 +281,130 @@ export async function fetchForecastForStation(
   );
 
   return result;
+}
+
+// ---------------------------------------------------------------------------
+// Ensemble GFS — 31 membres, prévision probabiliste
+// ---------------------------------------------------------------------------
+
+const ENSEMBLE_BASE = "https://ensemble-api.open-meteo.com/v1/ensemble";
+const ENSEMBLE_CACHE_TTL = 15 * 60 * 1000; // 15 minutes
+
+interface EnsembleCacheEntry {
+  data:      EnsembleForecast;
+  timestamp: number;
+}
+
+const ensembleCache = new Map<string, EnsembleCacheEntry>();
+
+/** Réponse brute de l'API Open-Meteo Ensemble. */
+interface EnsembleApiResponse {
+  daily?: Record<string, (number | null)[]>;
+}
+
+/**
+ * Récupère la prévision d'ensemble GFS (31 membres) pour une position et une date.
+ *
+ * Retourne null si l'API échoue ou si la date n'est pas dans la fenêtre.
+ * Les températures sont en °C (max et min séparément).
+ *
+ * @param lat        Latitude décimale (coordonnées aéroport recommandées)
+ * @param lon        Longitude décimale
+ * @param targetDate YYYY-MM-DD
+ */
+export async function fetchEnsembleForecast(
+  lat:        number,
+  lon:        number,
+  targetDate: string
+): Promise<EnsembleForecast | null> {
+  const cacheKey = `${lat.toFixed(3)},${lon.toFixed(3)},${targetDate}`;
+
+  const cached = ensembleCache.get(cacheKey);
+  if (cached && Date.now() - cached.timestamp < ENSEMBLE_CACHE_TTL) {
+    console.log(`[ensemble] 📦 Cache hit: ${cacheKey}`);
+    return cached.data;
+  }
+
+  try {
+    const url = new URL(ENSEMBLE_BASE);
+    url.searchParams.set("latitude",      String(lat));
+    url.searchParams.set("longitude",     String(lon));
+    url.searchParams.set("models",        "gfs_seamless");
+    url.searchParams.set("daily",         "temperature_2m_max,temperature_2m_min");
+    url.searchParams.set("timezone",      "auto");
+    url.searchParams.set("forecast_days", "7");
+
+    const res = await fetch(url.toString(), {
+      signal:  AbortSignal.timeout(10_000),
+      headers: { Accept: "application/json" },
+    });
+
+    if (!res.ok) {
+      console.error(`[ensemble] API error ${res.status} for (${lat}, ${lon})`);
+      return null;
+    }
+
+    const json: EnsembleApiResponse = await res.json();
+    const daily = json.daily;
+    if (!daily) return null;
+
+    // Trouve l'index du jour cible
+    const times    = (daily["time"] as unknown as string[] | undefined) ?? [];
+    const dayIndex = times.indexOf(targetDate);
+    if (dayIndex === -1) {
+      console.warn(`[ensemble] Date ${targetDate} not found in response`);
+      return null;
+    }
+
+    // Collecte les 31 membres pour max et min
+    const membersMax: number[] = [];
+    const membersMin: number[] = [];
+
+    for (let i = 0; i <= 30; i++) {
+      const pad   = i.toString().padStart(2, "0");
+      const keyMax = `temperature_2m_max_member${pad}`;
+      const keyMin = `temperature_2m_min_member${pad}`;
+
+      const vMax = daily[keyMax]?.[dayIndex];
+      const vMin = daily[keyMin]?.[dayIndex];
+
+      if (vMax != null && isFinite(vMax)) membersMax.push(vMax);
+      if (vMin != null && isFinite(vMin)) membersMin.push(vMin);
+    }
+
+    if (membersMax.length === 0) {
+      console.warn(`[ensemble] No members found for ${targetDate}`);
+      return null;
+    }
+
+    const mean     = membersMax.reduce((a, b) => a + b, 0) / membersMax.length;
+    const variance = membersMax.reduce((s, v) => s + Math.pow(v - mean, 2), 0) / membersMax.length;
+    const stdDev   = Math.sqrt(variance);
+    const spread   = Math.max(...membersMax) - Math.min(...membersMax);
+
+    const result: EnsembleForecast = {
+      membersMax,
+      membersMin,
+      mean:        Math.round(mean   * 10) / 10,
+      stdDev:      Math.round(stdDev * 100) / 100,
+      spread:      Math.round(spread * 10) / 10,
+      date:        targetDate,
+      memberCount: membersMax.length,
+    };
+
+    ensembleCache.set(cacheKey, { data: result, timestamp: Date.now() });
+
+    console.log(
+      `[ensemble] ${targetDate} (${lat.toFixed(2)}, ${lon.toFixed(2)}): ` +
+      `mean=${result.mean}°C spread=${result.spread}°C stdDev=${result.stdDev}°C ` +
+      `(${result.memberCount} members)`
+    );
+
+    return result;
+  } catch (err) {
+    console.error(`[ensemble] Fetch error:`, err instanceof Error ? err.message : err);
+    return null;
+  }
 }
 
 // ---------------------------------------------------------------------------

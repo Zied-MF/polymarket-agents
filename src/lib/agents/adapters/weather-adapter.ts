@@ -35,6 +35,7 @@ import {
 }                                                                                from "@/lib/db/lessons";
 import type { AgentConfig, AnalyzeResult }                                       from "@/lib/agents/orchestrator";
 import type { WeatherForecast, EnsembleForecast }                                from "@/types";
+import { logActivity }                                                           from "@/lib/logger";
 
 // ---------------------------------------------------------------------------
 // Constantes
@@ -258,43 +259,64 @@ export const weatherAdapter: AgentConfig = {
       console.warn(`[weather-adapter] hasRecentTradeForCityDate échoué (non-bloquant):`, err instanceof Error ? err.message : err);
     }
 
+    // ── scan-debug : marché qui passe tous les filtres de base ──────────────
+    const noPrice       = 1 - yesPrice;
+    const spreadEstimate = estimateSpread(m.liquidity);
+    const edgeNet        = best.edge - spreadEstimate;
+    const debugPrefix    = `[scan-debug] ${m.city}`;
+    console.log(
+      `${debugPrefix}: edge=${(best.edge * 100).toFixed(1)}% net=${(edgeNet * 100).toFixed(1)}%` +
+      ` yesPrice=${(yesPrice * 100).toFixed(0)}¢ noPrice=${(noPrice * 100).toFixed(0)}¢` +
+      ` outcome=${best.outcome} prob=${(best.estimatedProbability * 100).toFixed(1)}%` +
+      ` liq=$${m.liquidity} ${hoursToResolution.toFixed(1)}h`
+    );
+    logActivity(
+      "info",
+      `SCAN: ${m.city} edge=${(best.edge * 100).toFixed(1)}% net=${(edgeNet * 100).toFixed(1)}%` +
+      ` | ${best.outcome} @ ${(best.marketPrice * 100).toFixed(0)}¢ prob=${(best.estimatedProbability * 100).toFixed(1)}%` +
+      ` | liq=$${m.liquidity} ${hoursToResolution.toFixed(1)}h`
+    ).catch(() => {});
+
     // Filtre YES price (mode-based)
     if (best.outcome === "Yes" && best.marketPrice > mode.yesMaxPrice) {
-      console.log(`[weather-adapter] ⏭ YES trop cher: ${(best.marketPrice * 100).toFixed(0)}¢ > ${(mode.yesMaxPrice * 100).toFixed(0)}¢ (mode: ${mode.name})`);
-      return { skipReason: `YES ${(best.marketPrice * 100).toFixed(0)}¢ > ${(mode.yesMaxPrice * 100).toFixed(0)}¢ (mode: ${mode.name})` };
+      const reason = `YES ${(best.marketPrice * 100).toFixed(0)}¢ > ${(mode.yesMaxPrice * 100).toFixed(0)}¢ (mode: ${mode.name})`;
+      console.log(`${debugPrefix}: SKIP: ${reason}`);
+      logActivity("skip", `SKIP: ${m.city} - ${reason} (edge=${(edgeNet * 100).toFixed(1)}%, price=${(best.marketPrice * 100).toFixed(0)}¢)`).catch(() => {});
+      return { skipReason: reason };
     }
 
     // Filtre NO price (mode-based)
     if (best.outcome === "No" && yesPrice < mode.noMinYesPrice) {
-      console.log(`[weather-adapter] ⏭ NO pas rentable: YES ${(yesPrice * 100).toFixed(0)}¢ < ${(mode.noMinYesPrice * 100).toFixed(0)}¢ (mode: ${mode.name})`);
-      return { skipReason: `NO not worth: YES only ${(yesPrice * 100).toFixed(0)}¢ < ${(mode.noMinYesPrice * 100).toFixed(0)}¢` };
+      const reason = `NO not worth: YES only ${(yesPrice * 100).toFixed(0)}¢ < ${(mode.noMinYesPrice * 100).toFixed(0)}¢`;
+      console.log(`${debugPrefix}: SKIP: ${reason}`);
+      logActivity("skip", `SKIP: ${m.city} - ${reason} (edge=${(edgeNet * 100).toFixed(1)}%, price=${(best.marketPrice * 100).toFixed(0)}¢)`).catch(() => {});
+      return { skipReason: reason };
     }
 
     // Filet de sécurité : prix max 70¢ pour tout outcome
     if (best.marketPrice > 0.70) {
-      return { skipReason: `Price ${(best.marketPrice * 100).toFixed(0)}¢ > 70¢ (favori évident)` };
+      const reason = `Price ${(best.marketPrice * 100).toFixed(0)}¢ > 70¢ (favori évident)`;
+      console.log(`${debugPrefix}: SKIP: ${reason}`);
+      logActivity("skip", `SKIP: ${m.city} - ${reason} (edge=${(edgeNet * 100).toFixed(1)}%, price=${(best.marketPrice * 100).toFixed(0)}¢)`).catch(() => {});
+      return { skipReason: reason };
     }
 
     // Forte conviction sur YES cheap (< 20¢, forecast > 70%) → STRONG BUY
     let confidenceOverride: "high" | "medium" | "low" | undefined = forecast.confidenceLevel;
     if (best.outcome === "Yes" && best.marketPrice < 0.20 && best.estimatedProbability > 0.70) {
       console.log(
-        `[weather-adapter] 🎯 STRONG BUY: YES à ${(best.marketPrice * 100).toFixed(0)}¢ ` +
+        `${debugPrefix}: 🎯 STRONG BUY: YES à ${(best.marketPrice * 100).toFixed(0)}¢ ` +
         `avec forecast ${(best.estimatedProbability * 100).toFixed(0)}%`
       );
       confidenceOverride = "high";
     }
 
     // Filtre edge (mode-based, après spread)
-    const spreadEstimate = estimateSpread(m.liquidity);
-    const edgeNet        = best.edge - spreadEstimate;
     if (edgeNet < mode.minEdge) {
-      console.log(
-        `[weather-adapter] ⏭ Edge insuffisant: gross=${(best.edge * 100).toFixed(1)}%, ` +
-        `spread≈${(spreadEstimate * 100).toFixed(1)}%, net=${(edgeNet * 100).toFixed(1)}% ` +
-        `< ${(mode.minEdge * 100).toFixed(0)}% (mode: ${mode.name})`
-      );
-      return { skipReason: `Edge net ${(edgeNet * 100).toFixed(1)}% < ${(mode.minEdge * 100).toFixed(0)}% (mode: ${mode.name})` };
+      const reason = `Edge net ${(edgeNet * 100).toFixed(1)}% < ${(mode.minEdge * 100).toFixed(0)}% (mode: ${mode.name})`;
+      console.log(`${debugPrefix}: SKIP: ${reason} (gross=${(best.edge * 100).toFixed(1)}% spread=${(spreadEstimate * 100).toFixed(1)}%)`);
+      logActivity("skip", `SKIP: ${m.city} - ${reason} (edge=${(edgeNet * 100).toFixed(1)}%, price=${(best.marketPrice * 100).toFixed(0)}¢)`).catch(() => {});
+      return { skipReason: reason };
     }
 
     // === CLAUDE AI — validation finale ===
@@ -386,14 +408,18 @@ export const weatherAdapter: AgentConfig = {
     const claudeAnalysis = await analyzeWithClaude(context);
 
     if (claudeAnalysis.decision === "SKIP") {
-      console.log(`[weather-adapter] 🤖 Claude SKIP: ${claudeAnalysis.reason}`);
-      return { skipReason: `Claude: ${claudeAnalysis.reason}` };
+      const reason = `Claude SKIP: ${claudeAnalysis.reason}`;
+      console.log(`[scan-debug] ${m.city}: SKIP: ${reason} (edge=${(edgeNet * 100).toFixed(1)}%, price=${(best.marketPrice * 100).toFixed(0)}¢)`);
+      logActivity("skip", `SKIP: ${m.city} - ${reason} (edge=${(edgeNet * 100).toFixed(1)}%, price=${(best.marketPrice * 100).toFixed(0)}¢)`).catch(() => {});
+      return { skipReason: reason };
     }
 
     // Filtre confiance Claude (mode-based)
     if (!isConfidenceAtLeast(claudeAnalysis.confidence, mode.minConfidence)) {
-      console.log(`[weather-adapter] ⏭ Confiance insuffisante: ${claudeAnalysis.confidence} < ${mode.minConfidence} (mode: ${mode.name})`);
-      return { skipReason: `Confidence ${claudeAnalysis.confidence} < ${mode.minConfidence} (mode: ${mode.name})` };
+      const reason = `Confidence ${claudeAnalysis.confidence} < ${mode.minConfidence} (mode: ${mode.name})`;
+      console.log(`[scan-debug] ${m.city}: SKIP: ${reason} (edge=${(edgeNet * 100).toFixed(1)}%, price=${(best.marketPrice * 100).toFixed(0)}¢)`);
+      logActivity("skip", `SKIP: ${m.city} - ${reason} (edge=${(edgeNet * 100).toFixed(1)}%, price=${(best.marketPrice * 100).toFixed(0)}¢)`).catch(() => {});
+      return { skipReason: reason };
     }
 
     // Kelly sizing dynamique (mode-based) — Claude size 1-10 → % du bankroll

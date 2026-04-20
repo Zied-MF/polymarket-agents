@@ -251,12 +251,30 @@ export async function GET(): Promise<NextResponse<ScanResult | { status: string;
     );
   }
 
-  // 4. Update bot last-scan timestamp + activity log (best-effort)
+  // 4. Update bot last-scan timestamp + detailed activity logs (best-effort)
   updateLastScan().catch(() => {});
-  logActivity("info", `Scan complete: ${opps.length} opportunities, ${savedCount} saved, ${skipped.length} skipped`).catch(() => {});
+
+  // Log each trade signal with full detail
   for (const opp of opps) {
-    logActivity("trade", `New signal: ${opp.question} — ${opp.outcome} @ ${(opp.marketPrice * 100).toFixed(0)}¢`).catch(() => {});
+    const edge  = ((opp.estimatedProbability - opp.marketPrice) * 100).toFixed(1);
+    const price = (opp.marketPrice * 100).toFixed(0);
+    const label = opp.city ?? opp.ticker ?? opp.token ?? opp.marketId;
+    logActivity(
+      "trade",
+      `TRADE: ${label} ${opp.outcome} @ ${price}¢ (edge=${edge}%, bet=$${opp.suggestedBet.toFixed(2)}, conf=${opp.confidence ?? "?"})`
+    ).catch(() => {});
   }
+
+  // Log basic skips from orchestrator (horizon, anti-churn, consensus, etc.)
+  // Detailed edge/Claude skips are already logged from inside weather-adapter
+  for (const sk of skipped) {
+    logActivity(
+      "skip",
+      `SKIP: ${sk.question.slice(0, 60)} - ${sk.reason}`
+    ).catch(() => {});
+  }
+
+  logActivity("info", `Scan complete: ${opps.length} trades, ${savedCount} saved, ${skipped.length} skipped`).catch(() => {});
 
   const duration = `${Date.now() - startTime}ms`;
   console.log(

@@ -29,6 +29,8 @@ import {
 }                                          from "@/lib/db/supabase";
 import { openPosition }                    from "@/lib/db/positions";
 import type { Opportunity, SkippedMarket, AgentStats } from "@/lib/agents/orchestrator";
+import { getBotState, updateLastScan }     from "@/lib/bot/bot-state";
+import { logActivity }                     from "@/lib/logger";
 
 // ---------------------------------------------------------------------------
 // Enregistrement des agents — idempotent (no-op si déjà enregistré)
@@ -72,6 +74,12 @@ interface ScanResult {
 export async function GET(): Promise<NextResponse<ScanResult | { status: string; reason: string }>> {
   ensureAgentsRegistered();
 
+  // Vérifier si le bot est actif
+  const botState = await getBotState().catch(() => null);
+  if (botState && !botState.isRunning) {
+    return NextResponse.json({ status: "skipped", reason: "Bot is stopped", state: botState });
+  }
+
   // Verrou anti-double exécution
   const hasLock = await acquireScanLock();
   if (!hasLock) {
@@ -80,7 +88,9 @@ export async function GET(): Promise<NextResponse<ScanResult | { status: string;
   }
 
   const startTime = Date.now();
-  console.log(`[scan-markets] ▶ Démarrage scan — ${new Date().toISOString()}`);
+  const scanMode  = botState?.mode ?? "balanced";
+  console.log(`[scan-markets] ▶ Démarrage scan — ${new Date().toISOString()} (mode: ${scanMode})`);
+  await logActivity("scan", `Scan started (mode: ${scanMode})`);
 
   try {
   const errors: ScanResult["errors"] = [];
@@ -239,7 +249,13 @@ export async function GET(): Promise<NextResponse<ScanResult | { status: string;
     );
   }
 
-  // 4. Résumé
+  // 4. Update bot last-scan timestamp + activity log (best-effort)
+  updateLastScan().catch(() => {});
+  logActivity("info", `Scan complete: ${opps.length} opportunities, ${savedCount} saved, ${skipped.length} skipped`).catch(() => {});
+  for (const opp of opps) {
+    logActivity("trade", `New signal: ${opp.question} — ${opp.outcome} @ ${(opp.marketPrice * 100).toFixed(0)}¢`).catch(() => {});
+  }
+
   const duration = `${Date.now() - startTime}ms`;
   console.log(
     `[scan-markets] ■ Terminé en ${duration} — ` +

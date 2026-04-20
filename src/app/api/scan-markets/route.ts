@@ -16,7 +16,8 @@
 import { NextResponse }                    from "next/server";
 import { orchestrator }                    from "@/lib/agents/orchestrator";
 import { weatherAdapter }                  from "@/lib/agents/adapters/weather-adapter";
-import { financeAdapter }                  from "@/lib/agents/adapters/finance-adapter";
+// Finance Agent — shadow mode (analyse uniquement, pas de trades réels) — 2026-04-20
+// import { financeAdapter }               from "@/lib/agents/adapters/finance-adapter";
 // import { cryptoAdapter } from "@/lib/agents/adapters/crypto-adapter"; // DÉSACTIVÉ 2026-04-18
 import { sendDiscordNotification }         from "@/lib/utils/discord";
 import {
@@ -41,14 +42,15 @@ let agentsRegistered = false;
 function ensureAgentsRegistered(): void {
   if (agentsRegistered) return;
   orchestrator.registerAgent(weatherAdapter);
-  orchestrator.registerAgent(financeAdapter);
+  // Finance Agent désactivé — shadow mode, pas de trades réels (2026-04-20)
+  // orchestrator.registerAgent(financeAdapter);
   // Crypto Agent désactivé le 2026-04-18
   // Raison: Win rate 26.4%, P&L -87€
   // Le modèle momentum ne fonctionne pas sur les marchés crypto Polymarket
   // TODO: Implémenter une stratégie mean-reversion ou event-driven
   // orchestrator.registerAgent(cryptoAdapter);
   agentsRegistered = true;
-  console.log(`[scan-markets] Agents enregistrés: weather, finance`);
+  console.log(`[scan-markets] Agents enregistrés: weather only (finance/crypto en shadow mode)`);
 }
 
 // ---------------------------------------------------------------------------

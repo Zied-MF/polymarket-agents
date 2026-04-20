@@ -38,6 +38,7 @@ export default function Dashboard() {
   const [stats,    setStats]    = useState<Stats | null>(null);
   const [loading,  setLoading]  = useState(true);
   const [error,    setError]    = useState<string | null>(null);
+  const [scanning, setScanning] = useState(false);
 
   // ── Fetch status ────────────────────────────────────────────────────────
 
@@ -137,6 +138,29 @@ export default function Dashboard() {
           onChange={handleModeChange}
           disabled={botState?.isRunning ?? false}
         />
+
+        {/* ── Manual scan button ── */}
+        <button
+          onClick={async () => {
+            setScanning(true);
+            try {
+              const res  = await fetch("/api/scan-markets");
+              const data = await res.json();
+              console.log("Scan result:", data);
+              fetchStatus();
+            } catch (e) {
+              console.error("Scan failed:", e);
+            } finally {
+              setScanning(false);
+            }
+          }}
+          disabled={scanning || !(botState?.isRunning)}
+          className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white font-medium rounded-lg disabled:opacity-50 disabled:cursor-not-allowed transition flex items-center gap-2"
+        >
+          {scanning
+            ? <><span className="animate-spin inline-block">🔄</span> Scanning…</>
+            : "🔍 Scanner les marchés"}
+        </button>
 
         {/* ── Positions + Recent trades ── */}
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">

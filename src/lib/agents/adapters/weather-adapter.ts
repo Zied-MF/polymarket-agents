@@ -20,6 +20,7 @@ import { fetchAllWeatherMarkets, type WeatherMarket }                           
 import { fetchForecastForStation, fetchEnsembleForecast }                        from "@/lib/data-sources/weather-sources";
 import { analyzeMarket, parseOutcomeForMarket }                                  from "@/lib/agents/weather-agent";
 import { BANKROLL }                                                              from "@/lib/utils/kelly";
+import { calculateBetSize }                                                      from "@/lib/utils/sizing";
 import { getAirportStation, isUSCity }                                           from "@/lib/data/airport-stations";
 import { analyzeWithClaude, type MarketContext }                                 from "@/lib/agents/claude-analyst";
 import { fetchMultiModelForecast, calculateMultiModelProbability,
@@ -77,7 +78,13 @@ export const weatherAdapter: AgentConfig = {
       return true;
     });
 
-    console.log(`[weather-adapter] ${filtered.length}/${markets.length} marchés après filtre consensus`);
+    // Trier par horizon de résolution — les plus proches en premier (forecast plus fiable)
+    const now = Date.now();
+    filtered.sort((a, b) =>
+      (a.endDate.getTime() - now) - (b.endDate.getTime() - now)
+    );
+
+    console.log(`[weather-adapter] ${filtered.length}/${markets.length} marchés après filtre consensus (triés par horizon)`);
     return filtered;
   },
 
@@ -132,13 +139,22 @@ export const weatherAdapter: AgentConfig = {
       return { skipReason: "Date de résolution invalide" };
     }
     const hoursToResolution = (m.endDate.getTime() - Date.now()) / (1000 * 60 * 60);
-    if (hoursToResolution > MAX_RESOLUTION_HOURS) {
-      console.log(`[weather-adapter] ⏭ Résolution trop lointaine: ${Math.round(hoursToResolution)}h > ${MAX_RESOLUTION_HOURS}h — ${m.city}`);
-      return { skipReason: `Résolution dans ${Math.round(hoursToResolution)}h > ${MAX_RESOLUTION_HOURS}h` };
-    }
+    console.log(`[weather-adapter] ${m.city}: ${hoursToResolution.toFixed(1)}h to resolution`);
+
     if (hoursToResolution < 1) {
       console.log(`[weather-adapter] ⏭ Résolution trop proche: ${Math.round(hoursToResolution * 60)}min — ${m.city}`);
-      return { skipReason: "Résolution < 1h (trop tard pour entrer)" };
+      return { skipReason: "Too close to resolution (< 1h)" };
+    }
+
+    // Mode-dependent horizon cap
+    const currentModeName = getCurrentMode();
+    if (currentModeName === "balanced" && hoursToResolution > 24) {
+      console.log(`[weather-adapter] ⏭ ${m.city}: ${hoursToResolution.toFixed(1)}h > 24h (balanced prefers same-day)`);
+      return { skipReason: `Resolution > 24h (balanced mode prefers same-day)` };
+    }
+    if (hoursToResolution > MAX_RESOLUTION_HOURS) {
+      console.log(`[weather-adapter] ⏭ Résolution trop lointaine: ${Math.round(hoursToResolution)}h > ${MAX_RESOLUTION_HOURS}h — ${m.city}`);
+      return { skipReason: `Resolution > ${MAX_RESOLUTION_HOURS}h (forecast unreliable)` };
     }
 
     if (!forecast) {
@@ -212,12 +228,26 @@ export const weatherAdapter: AgentConfig = {
       }
     }
 
+    // Bonus edge pour les marchés proches de résolution (forecast plus fiable)
+    let edgeMultiplier = 1.0;
+    if (hoursToResolution <= 6)       edgeMultiplier = 1.2;   // +20 % confiance
+    else if (hoursToResolution <= 12) edgeMultiplier = 1.1;   // +10 % confiance
+    if (edgeMultiplier > 1.0) {
+      const rawEdge = best.edge;
+      best.edge               = round(best.edge * edgeMultiplier, 4);
+      best.estimatedProbability = round(best.marketPrice + best.edge, 4);
+      console.log(
+        `[weather-adapter] ⏰ Edge bonus ×${edgeMultiplier} (${hoursToResolution.toFixed(1)}h): ` +
+        `${(rawEdge * 100).toFixed(1)}% → ${(best.edge * 100).toFixed(1)}%`
+      );
+    }
+
     // === TRADING MODE (WeatherBot.finance alignement) ===
-    const mode    = TRADING_MODES[getCurrentMode()];
+    const mode    = TRADING_MODES[currentModeName];
     const yesPrice = m.outcomePrices[0];
 
     // Anti-churn : une seule position par ville/date
-    const targetDateStr = m.targetDate.toISOString().slice(0, 10);
+    const targetDateStr  = m.targetDate.toISOString().slice(0, 10);
     try {
       const alreadyOpen = await hasRecentTradeForCityDate(m.city, targetDateStr);
       if (alreadyOpen) {
@@ -367,12 +397,15 @@ export const weatherAdapter: AgentConfig = {
     }
 
     // Kelly sizing dynamique (mode-based) — Claude size 1-10 → % du bankroll
-    const claudeSize   = claudeAnalysis.size ?? 5;
-    const sizePercent  = (claudeSize / 10) * mode.maxBetPercent;
-    const adjustedBet  = Math.max(0.10, Math.min(BANKROLL * sizePercent, BANKROLL * mode.maxBetPercent));
+    // Puis cap sur 5 % de la liquidité disponible pour éviter le slippage.
+    const claudeSize  = claudeAnalysis.size ?? 5;
+    const sizePercent = (claudeSize / 10) * mode.maxBetPercent;
+    const kellyBet    = BANKROLL * sizePercent;
+    const adjustedBet = calculateBetSize(kellyBet, m.liquidity, BANKROLL, mode.maxBetPercent);
     console.log(
-      `[weather-adapter] 💰 Kelly sizing: Claude size=${claudeSize}/10 → ` +
-      `${(sizePercent * 100).toFixed(1)}% → ${adjustedBet.toFixed(2)}€ (mode: ${mode.name})`
+      `[weather-adapter] 💰 Sizing: Claude=${claudeSize}/10 Kelly=${kellyBet.toFixed(2)}$ ` +
+      `Liquidity=$${m.liquidity} (5%=$${(m.liquidity * 0.05).toFixed(2)}) ` +
+      `→ Final=${adjustedBet.toFixed(2)}$ (mode: ${mode.name})`
     );
 
     // Confiance : VERY_HIGH → high, HIGH → high, MEDIUM → medium, LOW → low

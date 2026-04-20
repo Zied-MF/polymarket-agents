@@ -32,6 +32,7 @@ import { openPosition }                    from "@/lib/db/positions";
 import type { Opportunity, SkippedMarket, AgentStats } from "@/lib/agents/orchestrator";
 import { getBotState, updateLastScan }     from "@/lib/bot/bot-state";
 import { logActivity }                     from "@/lib/logger";
+import { setWeatherAdapterMode }           from "@/lib/agents/adapters/weather-adapter";
 
 // ---------------------------------------------------------------------------
 // Enregistrement des agents — idempotent (no-op si déjà enregistré)
@@ -91,6 +92,9 @@ export async function GET(): Promise<NextResponse<ScanResult | { status: string;
 
   const startTime = Date.now();
   const scanMode  = botState?.mode ?? "balanced";
+
+  // Propager le mode DB vers le weather-adapter (écrase l'env var TRADING_MODE)
+  setWeatherAdapterMode(scanMode);
   console.log(`[scan-markets] ▶ Démarrage scan — ${new Date().toISOString()} (mode: ${scanMode})`);
   await logActivity("scan", `Scan started (mode: ${scanMode})`);
 

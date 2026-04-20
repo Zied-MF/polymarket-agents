@@ -38,11 +38,24 @@ import type { WeatherForecast, EnsembleForecast }                               
 import { logActivity }                                                           from "@/lib/logger";
 
 // ---------------------------------------------------------------------------
-// Constantes
+// Constantes + mode override
 // ---------------------------------------------------------------------------
 
 // Pas de filtre liquidité strict (aligné WeatherBot.finance)
 const MAX_RESOLUTION_HOURS = 48;  // Ne prendre que les marchés qui expirent dans 48h max
+
+/**
+ * Mode de trading actif pour ce scan.
+ * Initialisé à getCurrentMode() (env var) mais peut être overridé par
+ * setWeatherAdapterMode() avant chaque scan pour lire depuis bot_state.
+ */
+let _activeScanMode: ReturnType<typeof getCurrentMode> = getCurrentMode();
+
+/** Appelé depuis scan-markets avant chaque scan pour propager le mode DB. */
+export function setWeatherAdapterMode(mode: ReturnType<typeof getCurrentMode>): void {
+  _activeScanMode = mode;
+  console.log(`[weather-adapter] Mode set: ${mode}`);
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -148,7 +161,7 @@ export const weatherAdapter: AgentConfig = {
     }
 
     // Mode-dependent horizon cap
-    const currentModeName = getCurrentMode();
+    const currentModeName = _activeScanMode;
     if (currentModeName === "balanced" && hoursToResolution > 24) {
       console.log(`[weather-adapter] ⏭ ${m.city}: ${hoursToResolution.toFixed(1)}h > 24h (balanced prefers same-day)`);
       return { skipReason: `Resolution > 24h (balanced mode prefers same-day)` };

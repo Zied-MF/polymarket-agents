@@ -320,6 +320,50 @@ export const weatherAdapter: AgentConfig = {
       return { skipReason: reason };
     }
 
+    // === MARGIN CHECK — filtre ranges étroits et thresholds trop proches ===
+    // N'est exécuté que si on dispose du consensus multi-modèle (stdDev fiable).
+    if (multiModel) {
+      const parsedOutcome = parseOutcomeForMarket(m.question, best.outcome);
+      if (parsedOutcome && parsedOutcome.type !== "unknown") {
+        const toC = (v: number) => isUSCity(m.city) || m.unit === "F" ? (v - 32) * 5 / 9 : v;
+        const forecastC = multiModel.consensus.temperature;
+        const stdDev    = multiModel.consensus.stdDev;
+
+        if (parsedOutcome.type === "range") {
+          const loC        = toC(parsedOutcome.lo  ?? parsedOutcome.target! - 1);
+          const hiC        = toC(parsedOutcome.hi  ?? parsedOutcome.target! + 1);
+          const rangeMid   = (loC + hiC) / 2;
+          const rangeWidth = hiC - loC;
+
+          // Rejeter si le range est trop étroit (< 2σ) — le stdDev l'enjambe entièrement
+          const minRangeWidth = stdDev * 2;
+          if (rangeWidth < minRangeWidth) {
+            const reason = `Range too narrow: ${rangeWidth.toFixed(1)}°C < required ${minRangeWidth.toFixed(1)}°C (stdDev: ${stdDev.toFixed(1)}°C)`;
+            console.log(`${debugPrefix}: SKIP: ${reason}`);
+            return { skipReason: reason };
+          }
+
+          // Rejeter si le forecast est trop proche d'un bord (marge < 0.5°C)
+          const marginDegrees = Math.abs(forecastC - rangeMid);
+          if (marginDegrees > rangeWidth / 2 - 0.5) {
+            const reason = `Forecast ${forecastC.toFixed(1)}°C too close to range edge [${loC.toFixed(1)}-${hiC.toFixed(1)}°C] (margin: ${marginDegrees.toFixed(1)}°C)`;
+            console.log(`${debugPrefix}: SKIP: ${reason}`);
+            return { skipReason: reason };
+          }
+        } else if (parsedOutcome.type === "above" || parsedOutcome.type === "below") {
+          const thresholdC    = toC(parsedOutcome.threshold!);
+          const marginDegrees = Math.abs(forecastC - thresholdC);
+
+          // Rejeter si le forecast est à moins de 2σ du seuil — trop d'incertitude
+          if (marginDegrees < 2 * stdDev) {
+            const reason = `Margin too thin: forecast ${forecastC.toFixed(1)}°C vs threshold ${thresholdC.toFixed(1)}°C (margin: ${marginDegrees.toFixed(1)}°C, required: ${(2 * stdDev).toFixed(1)}°C)`;
+            console.log(`${debugPrefix}: SKIP: ${reason}`);
+            return { skipReason: reason };
+          }
+        }
+      }
+    }
+
     // === CLAUDE AI — validation finale ===
     // Appelé uniquement sur les trades qui ont passé tous les filtres mécaniques.
     const forecastTemp = m.measureType === "high" ? forecast.highTemp : forecast.lowTemp;

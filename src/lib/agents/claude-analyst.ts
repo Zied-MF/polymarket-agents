@@ -91,6 +91,28 @@ export async function analyzeWithClaude(context: MarketContext): Promise<ClaudeA
     ? lessons.slice(-10).map((l) => `- ${l}`).join("\n")
     : "- No lessons yet.";
 
+  // Dériver des règles critiques dynamiques à partir des leçons apprises
+  const criticalRules: string[] = [];
+  const lessonsLower = lessons.join(" ").toLowerCase();
+  if (lessonsLower.includes("narrow") || lessonsLower.includes("range") || lessonsLower.includes("band")) {
+    criticalRules.push("Avoid narrow temperature bands (1°C/1°F ranges) — they resolve incorrectly too often");
+  }
+  if (lessonsLower.includes("margin") || lessonsLower.includes("thin") || lessonsLower.includes("close to threshold")) {
+    criticalRules.push("Require > 2°C margin between forecast and threshold — thin margins lead to losses");
+  }
+  if (lessonsLower.includes("spread") || lessonsLower.includes("uncertain") || lessonsLower.includes("disagreement")) {
+    criticalRules.push("Skip when model spread > 3°C — disagreement signals unreliable forecast");
+  }
+  if (lessonsLower.includes("coastal") || lessonsLower.includes("sea breeze") || lessonsLower.includes("marine")) {
+    criticalRules.push("Apply extra caution for coastal cities — sea breeze creates systematic forecast bias");
+  }
+  if (lessonsLower.includes("overnight") || lessonsLower.includes("low temp") || lessonsLower.includes("minimum")) {
+    criticalRules.push("Low temperature forecasts are less reliable — prefer high temperature markets");
+  }
+  const criticalRulesText = criticalRules.length > 0
+    ? `Apply these rules strictly — they come from real losses:\n${criticalRules.map((r) => `- ${r}`).join("\n")}`
+    : "- No critical rules derived yet (insufficient post-mortem data)";
+
   const ensembleMemberSample = forecasts.ensemble.members
     .slice(0, 10)
     .map((t, i) => `M${i + 1}: ${t.toFixed(1)}°C`)
@@ -117,6 +139,9 @@ ${calibrationText}
 
 ## Lessons from Past Trades:
 ${lessonsText}
+
+## Critical Rules from Post-Mortem Analysis:
+${criticalRulesText}
 
 ## Recent Performance:
 - ${context.city} win rate: ${(recentPerformance.cityWinRate * 100).toFixed(1)}%

@@ -1,53 +1,36 @@
-# Architecture — Polymarket Trading Agents
+# Architecture — Polymarket WeatherBot
 
-> Dernière mise à jour : 2026-04-18 (v3)  
-> Stack : Next.js 16 · React 19 · TypeScript 5 · Supabase · Tailwind CSS 4
+> Dernière mise à jour : 2026-04-23  
+> Stack : Next.js 15 · React 19 · TypeScript 5 · Supabase · Tailwind CSS 4 · Claude Sonnet 4.6
 
 ---
 
-## Contexte — Réforme après paper trading catastrophique
+## Contexte — Historique des décisions
 
-| Métrique | Résultat |
-|---|---|
-| P&L total | −85 € |
-| Win rate global | 39.8% |
-| Win rate Crypto | 26.4% |
-| Win rate Finance | ~38% |
-| Décision | Crypto désactivé, Finance + Crypto en shadow mode |
-
-**Changements majeurs (2026-04-18) :**
-- Crypto Agent **désactivé** du registre (import commenté)
-- Finance + Crypto placés en **shadow mode** — analysent sans créer de trades
-- Seuils Weather relevés : liquidité $1k→$5k, edge 7.98%→12%, net edge 5%→8%
-- Volume réduit : max 3 positions/agent (était 15)
-- Circuit breaker automatique par `getAgentPerformance24h`
-- Cron `monitor-positions` **supprimé** — HOLD > SELL confirmé (+43€)
+| Date | Décision | Raison |
+|------|----------|--------|
+| 2026-04-18 | Crypto désactivé | WR 26.4%, P&L −87€ |
+| 2026-04-18 | Finance en shadow mode | WR ~38% |
+| 2026-04-18 | Seuils relevés, volume réduit | Paper trading catastrophique (WR 39.8%, P&L −85€) |
+| 2026-04-20 | Finance retiré du registre | Shadow mode insuffisant — trades pollution |
+| 2026-04-20 | Dashboard WeatherBot + bot state DB | Contrôle manuel du bot via UI |
+| 2026-04-23 | Mode lu depuis bot_state (DB) | process.env.TRADING_MODE ignoré pour les scans |
+| 2026-04-23 | Multi-model forecasting (GFS+ECMWF+UKMO+Ensemble) | Précision accrue |
+| 2026-04-23 | Filtre liquidité supprimé | Alignement WeatherBot.finance |
+| 2026-04-23 | Bet size cap 5% liquidité | Éviter le slippage |
+| 2026-04-23 | Tri marchés par horizon de résolution | Forecasts plus fiables en premier |
 
 ---
 
 ## Vue d'ensemble
 
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│                          Next.js 16 App                             │
-│                                                                     │
-│  Pages UI            API Routes (cron)          Lib                 │
-│  ──────────          ─────────────────          ───                 │
-│  /               →   /api/scan-markets     →   Orchestrator         │
-│  /results        →   /api/check-results    →   Agents               │
-│  /positions                                →   Kelly                │
-│                      /api/results              Supabase             │
-│                      /api/positions-stats                           │
-└─────────────────────────────────────────────────────────────────────┘
+Vercel Crons
+  ├── /api/scan-markets      (*/15 min)   ← pipeline principal
+  ├── /api/monitor-positions (*/5 min)    ← exit system 6 couches
+  ├── /api/check-results     (08h00 UTC)  ← résolution des trades
+  └── /api/post-mortem       (*/6h)       ← analyse post-trade Claude
 ```
-
-**Crons Vercel actifs :**
-
-| Cron | Schedule | Description |
-|---|---|---|
-| `/api/scan-markets` | `*/15 * * * *` | Scan toutes les 15 min |
-| `/api/check-results` | `0 8 * * *` | Résolution à 8h chaque jour |
-| ~~`/api/monitor-positions`~~ | ~~supprimé~~ | Supprimé — HOLD > SELL |
 
 ---
 
@@ -56,530 +39,366 @@
 ```
 src/
 ├── app/
-│   ├── page.tsx                      # Dashboard — scan manuel (bouton)
-│   ├── results/page.tsx              # Historique paper trades + P&L
-│   ├── positions/page.tsx            # Positions ouvertes
+│   ├── page.tsx                     Dashboard WeatherBot (polling /api/bot/status toutes les 5s)
+│   ├── layout.tsx
+│   ├── results/page.tsx             Historique des trades résolus
+│   ├── positions/page.tsx           Positions ouvertes
 │   └── api/
-│       ├── scan-markets/route.ts     # Cron principal — détecte les opportunités
-│       ├── check-results/route.ts    # Cron résolution — calcule les vrais P&L
-│       ├── monitor-positions/route.ts# Disponible mais PLUS dans vercel.json
-│       ├── results/route.ts          # Lecture paper trades (dashboard)
-│       └── positions-stats/route.ts  # Stats positions (dashboard)
+│       ├── bot/
+│       │   ├── start/route.ts       POST — démarre le bot (bot_state.is_running=true)
+│       │   ├── stop/route.ts        POST — arrête le bot
+│       │   └── status/route.ts      GET  — état + stats live (win rate, P&L, positions)
+│       ├── settings/
+│       │   └── mode/route.ts        POST — change bot_state.mode en DB
+│       ├── scan-markets/route.ts    GET  — pipeline de scan complet (cron */15min)
+│       ├── monitor-positions/route.ts GET — évalue les positions ouvertes (cron */5min)
+│       ├── check-results/route.ts   GET  — résolution Polymarket (cron 8h)
+│       ├── post-mortem/route.ts     GET  — analyse post-trade (cron */6h)
+│       ├── analyze-top/route.ts     POST — analyse ad-hoc top marchés
+│       ├── dashboard-stats/route.ts GET  — stats dashboard (legacy)
+│       ├── positions/route.ts       GET  — positions ouvertes (JSON)
+│       ├── trades/recent/route.ts   GET  — derniers 20 trades
+│       ├── logs/recent/route.ts     GET  — derniers 50 logs activité
+│       └── debug-filters/route.ts   GET  — diagnostic filtres + liquidité cap
 │
-├── lib/
-│   ├── agents/
-│   │   ├── orchestrator.ts           # Chef d'orchestre — shadow mode + circuit breaker
-│   │   ├── weather-agent.ts          # Logique gaussienne météo
-│   │   ├── finance-agent.ts          # Scoring momentum actions (shadow mode)
-│   │   ├── crypto-agent.ts           # Scoring momentum crypto (désactivé)
-│   │   ├── adapters/
-│   │   │   ├── weather-adapter.ts    # Seuils relevés — seul agent actif
-│   │   │   ├── finance-adapter.ts    # Shadow mode (analyse sans trades)
-│   │   │   └── crypto-adapter.ts    # Import commenté dans scan-markets
-│   │   ├── timing-agent.ts           # (non utilisé en prod)
-│   │   └── post-mortem-agent.ts      # (non utilisé en prod)
-│   │
-│   ├── data-sources/
-│   │   ├── weather-sources.ts        # Open-Meteo API + cache mémoire 10 min
-│   │   ├── finance-sources.ts        # Finnhub API /quote
-│   │   ├── crypto-sources.ts         # CoinGecko API /simple/price
-│   │   └── geocoding.ts              # 3 couches : mémoire → Supabase → API
-│   │
-│   ├── polymarket/
-│   │   ├── gamma-api.ts              # fetchWeather/Stock/CryptoMarkets
-│   │   ├── clob-api.ts               # Ordres réels (non actif en paper)
-│   │   └── mock-data.ts              # Données de test (dev)
-│   │
-│   ├── db/
-│   │   ├── supabase.ts               # Client singleton + CRUD + circuit breaker
-│   │   ├── positions.ts              # CRUD table positions + getPositionByPaperTradeId
-│   │   └── schema.sql                # Schéma SQL de référence
-│   │
-│   ├── positions/
-│   │   └── position-manager.ts       # evaluatePosition() — logique pure
-│   │
-│   ├── utils/
-│   │   ├── kelly.ts                  # calculateHalfKelly()
-│   │   └── discord.ts                # Notifications webhook
-│   │
-│   └── data/
-│       └── station-mapping.ts        # Codes ICAO → (lat, lon, timezone, city)
+├── components/
+│   └── dashboard/
+│       ├── BotControls.tsx          Start/Stop + indicateur statut + last scan
+│       ├── TradingModeSelector.tsx  3 modes (désactivé si bot running)
+│       ├── LiveStats.tsx            6 KPI cards (win rate, P&L, trades, positions)
+│       ├── PositionsTable.tsx       Positions ouvertes (refresh 10s)
+│       ├── RecentTrades.tsx         Derniers trades WIN/LOSS/Pending (refresh 10s)
+│       └── ActivityLog.tsx          Log activité coloré scan/trade/skip/error (refresh 5s)
 │
-└── types/
-    └── index.ts                      # Market, Outcome, WeatherForecast…
+└── lib/
+    ├── agents/
+    │   ├── orchestrator.ts           Gestion agents, circuit breaker, shadow mode
+    │   ├── weather-agent.ts          Probabilité gaussienne/ensemble, parseOutcomeForMarket
+    │   ├── claude-analyst.ts         Appel Claude Sonnet avec MarketContext complet
+    │   ├── post-mortem-agent.ts      Génère leçons post-trade via Claude
+    │   ├── finance-agent.ts          Scoring momentum actions (non enregistré)
+    │   ├── crypto-agent.ts           Désactivé — WR 26.4%, P&L −87€
+    │   └── adapters/
+    │       ├── weather-adapter.ts    Agent actif — pipeline complet avec Claude + multi-model
+    │       ├── finance-adapter.ts    Non enregistré dans scan depuis 2026-04-20
+    │       └── crypto-adapter.ts    Import commenté depuis 2026-04-18
+    ├── bot/
+    │   └── bot-state.ts              CRUD bot_state Supabase (getBotState/startBot/stopBot/setMode)
+    ├── config/
+    │   └── trading-modes.ts          3 modes + seuils, isConfidenceAtLeast()
+    ├── data/
+    │   ├── airport-stations.ts       Ville → ICAO, lat, lon (getAirportStation)
+    │   └── station-mapping.ts        Mapping codes stations météo
+    ├── data-sources/
+    │   ├── weather-sources.ts        Open-Meteo GFS + cache mémoire 10min
+    │   ├── multi-model-weather.ts    GFS + ECMWF + UKMO + Ensemble (cache 15min)
+    │   ├── finance-sources.ts        Finnhub API
+    │   ├── crypto-sources.ts         CoinGecko API
+    │   └── geocoding.ts              Géocodage 3 couches (mémoire → Supabase → API)
+    ├── db/
+    │   ├── supabase.ts               Singleton getClient() exporté + CRUD
+    │   ├── positions.ts              CRUD table positions
+    │   └── lessons.ts                CRUD lessons, calibration, performances
+    ├── logger.ts                     logActivity(type, message) → table activity_logs
+    ├── positions/
+    │   └── position-manager.ts       evaluatePosition() — exit system 6 couches (logique pure)
+    ├── polymarket/
+    │   ├── gamma-api.ts              fetchAllWeatherMarkets() + fetchMarketSnapshot()
+    │   └── clob-api.ts               Ordres réels (non actif en paper trading)
+    └── utils/
+        ├── kelly.ts                  BANKROLL + calculateHalfKelly()
+        ├── sizing.ts                 calculateBetSize() — cap 5% liquidité
+        └── discord.ts                Notifications webhook Discord
 ```
 
 ---
 
-## Pipeline complet — scan-markets
+## Pipeline de scan (`/api/scan-markets`)
 
 ```
 GET /api/scan-markets
-        │
-        ├─ acquireScanLock()                     # verrou anti-double exécution
-        │
-        ├─ ensureAgentsRegistered()
-        │       weatherAdapter  ✅ ACTIF
-        │       financeAdapter  👻 shadow mode
-        │       cryptoAdapter   ✗  import commenté (désactivé 2026-04-18)
-        │
-        ├─ orchestrator.scanAllMarkets()
-        │       │
-        │       ├─ [CIRCUIT BREAKER — séquentiel]
-        │       │   pour chaque agent enregistré :
-        │       │     getAgentPerformance24h(agent.type)
-        │       │     si WR < 40% sur ≥ 10 trades → shadowModeAgents.add()
-        │       │     si P&L < −15€ sur 24h       → shadowModeAgents.add()
-        │       │
-        │       ├─ [SCAN PARALLÈLE — Promise.all]
-        │       │   ├─ weatherAdapter.fetchMarkets()  → WeatherMarket[]
-        │       │   │  weatherAdapter.fetchData(m)    → WeatherForecast
-        │       │   │  weatherAdapter.analyze(m, f)   → { dominated | skipReason }
-        │       │   │
-        │       │   └─ financeAdapter.fetchMarkets()  → StockMarket[]
-        │       │      financeAdapter.fetchData(m)    → StockData
-        │       │      financeAdapter.analyze(m, d)   → { dominated | skipReason }
-        │       │      [SHADOW] → opportunités loggées, NON retournées
-        │       │
-        │       ├─ [LOG ÉTAT AGENTS]
-        │       │   ✅ ACTIF  weather  — X marchés, Y opportunités enregistrées
-        │       │   👻 SHADOW finance  — X marchés, Y détectées (non enregistrées)
-        │       │
-        │       └─ applyRiskLimits()
-        │               ├─ tri par edge décroissant
-        │               ├─ déduplication market_id
-        │               ├─ max 3 positions par agent
-        │               └─ max 8 positions par secteur
-        │
-        ├─ déduplication DB (getRecentOpportunities 24h)
-        │
-        ├─ pour chaque opportunité nouvelle :
-        │       ├─ saveOpportunity()   → table opportunities
-        │       ├─ savePaperTrade()    → table paper_trades
-        │       └─ openPosition()     → table positions (status='open')
-        │
-        ├─ sendDiscordNotification()   # fire-and-forget
-        ├─ incrementDailyOpportunities()
-        └─ releaseScanLock()
-```
-
-### Batching interne
-
-- Chaque agent analyse par **batches de 5** en parallèle (`Promise.all`)
-- **200 ms** entre chaque batch (éviter 429 sur APIs externes)
-- Les agents actifs tournent en **parallèle** entre eux
-
----
-
-## Shadow Mode
-
-Les agents en shadow mode font tourner l'**analyse complète** (fetchMarkets → fetchData → analyze), mais leurs opportunités sont jetées avant d'être retournées à `scan-markets`.
-
-**Utilité :** mesurer en continu la qualité du signal sans risque capital. Quand le WR remonte durablement > 50%, on retire l'agent du set `shadowModeAgents`.
-
-```typescript
-// orchestrator.ts
-private shadowModeAgents: Set<AgentType> = new Set(["crypto", "finance"]);
-```
-
-**Log de monitoring :**
-```
-[orchestrator] 👻 SHADOW MODE: Finance Agent — 2 opportunités détectées (non enregistrées) en 1240ms
-[orchestrator][shadow]   "Will NVDA close above $900 on April 19?…" edge=13.2%
+  │
+  ├─ getBotState()
+  │     is_running === false → return { skipped: true }
+  │
+  ├─ setWeatherAdapterMode(botState.mode)   ← mode depuis DB, PAS process.env
+  ├─ logActivity('scan', 'Scan started (mode: X)')
+  ├─ acquireScanLock()                      ← anti-double exécution
+  │
+  ├─ orchestrator.scanAllMarkets()
+  │     │
+  │     ├─ [CIRCUIT BREAKER]
+  │     │     getAgentPerformance24h() → auto-shadow si WR < 40% ou P&L < −15€
+  │     │
+  │     └─ weatherAdapter (seul agent enregistré)
+  │           a. fetchMarkets()
+  │                fetchAllWeatherMarkets() via Gamma API
+  │                filtre consensus fort (≥ 90%)
+  │                tri ASC par endDate (résolution la plus proche en premier)
+  │           b. fetchData(market)
+  │                fetchForecastForStation()      GFS Open-Meteo (cache 10min)
+  │                fetchEnsembleForecast()        GFS Ensemble (si ville connue)
+  │                fetchMultiModelForecast()      GFS+ECMWF+UKMO+Ensemble (cache 15min)
+  │           c. analyze(market, data)
+  │                ① Date invalide → skip
+  │                ② Horizon < 1h → skip
+  │                   balanced > 24h → skip
+  │                   tout mode > 48h → skip
+  │                ③ Anti-favori > 70% → skip
+  │                ④ Multi-model agreement "weak" → skip
+  │                ⑤ analyzeMarket() → probabilité gaussienne/ensemble
+  │                ⑥ Multi-model override si écart > 2%
+  │                ⑦ Edge bonus: ≤6h ×1.2 | ≤12h ×1.1
+  │                ⑧ [scan-debug log] city, edge, net edge, yesPrice, noPrice, prob, liq, hours
+  │                ⑨ Anti-churn: hasRecentTradeForCityDate() → skip
+  │                ⑩ Filtre YES/NO price (mode-based) + log activité SKIP
+  │                ⑪ Filtre edge net = gross − spread (mode-based) + log activité SKIP
+  │                ⑫ Claude AI (MarketContext: multi-model, lessons, calibration, perfs)
+  │                   SKIP → log activité SKIP avec raison Claude
+  │                ⑬ Filtre confiance Claude (mode-based) + log activité SKIP
+  │                ⑭ calculateBetSize(kelly, liquidity, bankroll, maxBetPercent)
+  │
+  ├─ déduplication DB (getRecentOpportunities 24h)
+  ├─ pour chaque opportunité weather :
+  │     saveOpportunity() + savePaperTrade() + openPosition()
+  │     logActivity('trade', 'TRADE: city outcome @ price (edge, bet, conf)')
+  ├─ logActivity('skip', ...) pour skips orchestrateur
+  ├─ logActivity('info', 'Scan complete: X trades, Y saved, Z skipped')
+  ├─ sendDiscordNotification()     fire-and-forget
+  ├─ updateLastScan()
+  └─ releaseScanLock()
 ```
 
 ---
 
-## Circuit Breaker
+## Trading Modes
 
-Avant chaque scan, `getAgentPerformance24h(agentType)` interroge les `paper_trades` des dernières 24h pour chaque agent enregistré.
+Stocké dans `bot_state.mode` (Supabase). Lu dans `scan-markets` puis propagé via `setWeatherAdapterMode()`.  
+**Ne jamais utiliser `process.env.TRADING_MODE` pour les scans** — c'est uniquement un fallback si bot_state est absent.
 
-**Règles de désactivation automatique :**
+| Mode | YES max | edge min | confiance min | bet max |
+|------|---------|----------|---------------|---------|
+| `balanced` | 15¢ | 10% | MEDIUM | 5% bankroll |
+| `aggressive` | 50¢ | 8% | LOW | 10% bankroll |
+| `high_conviction` | 15¢ | 15% | VERY_HIGH | 5% bankroll |
 
-| Condition | Action |
-|---|---|
-| ≥ 10 trades ET WR < 40% | `shadowModeAgents.add(agent.type)` |
-| P&L < −15€ sur 24h | `shadowModeAgents.add(agent.type)` |
+**Horizon par mode :**
+- `balanced` : 1h–24h (même jour uniquement)
+- `aggressive` / `high_conviction` : 1h–48h
 
-Best-effort : si l'appel DB échoue, le scan continue normalement.
+---
+
+## Bet Sizing
+
+Pas de filtre liquidité strict — la liquidité module uniquement la mise.
+
+```
+kellyBet      = BANKROLL × (claudeSize/10) × mode.maxBetPercent
+liquidityCap  = market.liquidity × 0.05      // 5% de la liquidité disponible
+bankrollCap   = BANKROLL × mode.maxBetPercent
+finalBet      = min(kellyBet, liquidityCap, bankrollCap)
+finalBet      = max(0.10$, round(finalBet, 2))
+```
+
+`claudeSize` = 1–10 fourni par Claude dans MarketContext.
+
+---
+
+## Multi-Model Weather
+
+Source : Open-Meteo (gratuit, sans clé API).
+
+| Modèle | Poids consensus |
+|--------|----------------|
+| ECMWF | 40% |
+| GFS | 30% |
+| UKMO | 20% |
+| GFS Ensemble | 10% |
+
+**Accord des modèles :**
+- `strong` : spread < 1°C — trade autorisé
+- `moderate` : spread < 2°C — trade autorisé
+- `weak` : spread ≥ 2°C — **skip systématique**
+
+**Calcul probabilité :**
+- ≥ 20 membres ensemble → comptage direct des membres
+- < 20 membres → Gaussienne sur consensus pondéré
+
+**Cache :** 15 min en mémoire par (lat, lon, date).
+
+**Coordonnées :** uniquement via `getAirportStation(city)` — WeatherMarket n'a pas de lat/lon.
+
+---
+
+## Edge Bonus Horizon
+
+Les marchés proches ont des forecasts plus fiables :
+
+| Délai résolution | Multiplicateur edge |
+|------------------|---------------------|
+| ≤ 6h | ×1.2 (+20%) |
+| ≤ 12h | ×1.1 (+10%) |
+| > 12h | ×1.0 (pas de bonus) |
+
+Appliqué après le multi-model override, avant les filtres de mode.
+
+---
+
+## Position Exit System (6 couches)
+
+Évalué par `/api/monitor-positions` (cron */5 min) via `evaluatePosition()` :
+
+| Layer | Condition | Urgence |
+|-------|-----------|---------|
+| 1 | Grace period < 5 min | HOLD (toujours) |
+| 2 | P&L ≤ −50% | critical |
+| 3 | P&L ≤ −25% après 15 min | high |
+| 4 | Prix ≥ 80% edge capturé ET résolution < 2h | medium |
+| 5 | Trailing stop : peak ≥ +30% puis chute −15% | medium |
+| 6 | Time decay : résolution < 1h ET P&L < −10% | high |
+
+`evaluatePosition()` est une fonction pure (pas d'I/O) dans `position-manager.ts`.
+
+---
+
+## Agents
+
+| Agent | Statut | Depuis | Raison |
+|-------|--------|--------|--------|
+| Weather | Actif | — | Pipeline principal |
+| Finance | Non enregistré | 2026-04-20 | Créait des trades non désirés |
+| Crypto | Import commenté | 2026-04-18 | WR 26.4%, P&L −87€ |
+
+**Circuit breaker** (orchestrator) : auto-shadow si WR < 40% sur ≥ 10 trades OU P&L < −15€/24h.  
+**Promotion shadow → actif** : WR > 55% + P&L théorique > 0 sur ≥ 20 trades shadow.
+
+---
+
+## Bot State — Dashboard
+
+`page.tsx` est un client React qui poll `/api/bot/status` toutes les 5s.
+
+| Action | Endpoint | Effet |
+|--------|----------|-------|
+| Start Bot | `POST /api/bot/start` | `bot_state.is_running = true` |
+| Stop Bot | `POST /api/bot/stop` | `bot_state.is_running = false` |
+| Changer mode | `POST /api/settings/mode` | `bot_state.mode = X` |
+| Scanner | `GET /api/scan-markets` | Lance scan si bot running |
+
+**Contrainte UI :** mode selector désactivé si bot running. Scan button désactivé si bot stopped.
+
+---
+
+## Supabase — Tables
+
+| Table | Usage |
+|-------|-------|
+| `bot_state` | État du bot — 1 ligne `id='default'` (is_running, mode, last_scan_at) |
+| `paper_trades` | Trades weather uniquement (finance/crypto exclus depuis 2026-04-20) |
+| `positions` | Positions ouvertes (`sold_at IS NULL` = ouvert) |
+| `opportunities` | Toutes les opportunités avec déduplication 24h |
+| `activity_logs` | Logs scan/trade/skip/error — purge après 24h |
+| `lessons` | Post-mortems Claude — calibration confiance par ville |
+| `daily_stats` | Métriques journalières agrégées |
+| `scan_locks` | Anti-double exécution (timeout 5 min) |
+
+**Tables requises créées manuellement (pas dans le code) :**
+```sql
+CREATE TABLE IF NOT EXISTS bot_state (
+  id            TEXT PRIMARY KEY DEFAULT 'default',
+  is_running    BOOLEAN DEFAULT false,
+  mode          TEXT DEFAULT 'balanced',
+  started_at    TIMESTAMPTZ,
+  last_scan_at  TIMESTAMPTZ,
+  updated_at    TIMESTAMPTZ DEFAULT NOW()
+);
+INSERT INTO bot_state (id) VALUES ('default') ON CONFLICT DO NOTHING;
+
+CREATE TABLE IF NOT EXISTS activity_logs (
+  id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  type       TEXT NOT NULL,         -- scan|trade|skip|error|info|exit
+  message    TEXT NOT NULL,
+  metadata   JSONB,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX idx_activity_logs_created ON activity_logs(created_at DESC);
+```
+
+---
+
+## Activity Logs — Format
+
+| Type | Format message |
+|------|---------------|
+| `scan` | `Scan started (mode: aggressive)` |
+| `info` | `SCAN: London edge=11.4% net=8.4% \| Yes @ 23¢ prob=34.5% \| liq=$4200 18.3h` |
+| `skip` | `SKIP: London - Edge net 8.4% < 10% (mode: balanced) (edge=8.4%, price=23¢)` |
+| `skip` | `SKIP: Paris - Claude SKIP: reason (edge=X%, price=Y¢)` |
+| `trade` | `TRADE: NYC Yes @ 12¢ (edge=14.3%, bet=$0.34, conf=high)` |
+| `info` | `Scan complete: 2 trades, 2 saved, 47 skipped` |
+
+---
+
+## Claude AI — MarketContext
 
 ```typescript
-// supabase.ts
-export async function getAgentPerformance24h(agentType: string): Promise<AgentPerformance> {
-  // SELECT won, potential_pnl FROM paper_trades
-  // WHERE agent = agentType AND created_at >= yesterday AND won IS NOT NULL
-  // → { trades, wins, winRate, pnl }
+interface MarketContext {
+  question, city, targetDate, outcomes, prices
+  forecasts: { gfs, ensemble: { mean, min, max, stdDev, members } }
+  multiModel: { consensus, agreement, spreadDegrees, gfs?, ecmwf?, ukmo?, method, probability }
+  gaussianEdge, measureType
+  recentPerformance: { cityWinRate, overallWinRate, last7DaysPnL }
+  lessons:               string[]   // dernières 20 leçons post-mortem
+  confidenceCalibration: object     // calibration par niveau de confiance
 }
 ```
 
----
-
-## Agents — logique métier
-
-### Weather Agent — seul agent actif
-
-**Source :** Open-Meteo (gratuit, sans clé)
-
-**Seuils (relevés le 2026-04-18) :**
-
-| Paramètre | Avant | Après |
-|---|---|---|
-| `MIN_LIQUIDITY` | $1 000 | $2 000 |
-| `MIN_EDGE` (gross) | 7.98% | **12%** |
-| `NET_EDGE_MIN` (après spread) | 5% | **8%** |
-| Filtre consensus | ≥ 90% | ≥ 90% (fetchMarkets) |
-| Filtre anti-favori | — | **> 70%** (analyze) |
-
-**Modèle probabiliste :**
-
-| Type d'outcome | Formule |
-|---|---|
-| `exact` / `range` | PDF gaussien : `exp(−0.5 × ((target − forecast) / σ)²)` |
-| `above X` | CDF : `1 − Φ((X − forecast) / σ)` |
-| `below X` | CDF : `Φ((X − forecast) / σ)` |
-| `Yes/No` binaire | Résolution sémantique → type ci-dessus |
-
-**Sigma dynamique :**
-
-| Délai | σ (°C) | Confiance |
-|---|---|---|
-| J+1 | 1.5 | high |
-| J+2 | 2.5 | medium |
-| J+3+ | 3.5 | low |
-
-**Fat tails :** `σ_final = σ × (1 + |forecast − 15°C| / 10 × 0.2)`
-
-**Unité °C/°F :** Hiérarchie : question → outcomes → code ICAO (K… = US = °F) → ville US → `market.unit`.
-
-**Cache prévisions :** `Map<"lat,lon,date", WeatherForecast>` TTL 10 min.
-
-**Pipeline analyze() :**
-```
-1. Filtre anti-favori : outcomePrices.some(p > 0.70) → skip
-2. analyzeMarket() → outcomes triés par edge
-3. best.edge < 12%  → skip (gross edge insuffisant)
-4. edgeNet = best.edge − spread < 8% → skip
-5. calculateHalfKelly() → betAmount = 0 → skip
-6. → { dominated }
-```
-
----
-
-### Finance Agent — shadow mode
-
-**Source :** Finnhub `/quote` (60 req/min, `FINNHUB_API_KEY`)
-
-**Scoring :** changePercent + position dans le range du jour → score UP/DOWN  
-**Mean-reversion penalty :** change > 2% ET marketPrice > 75% → score × 0.5  
-**Probabilité :** `clamp(0.5 + (up−down)/100, 0.55, 0.85)`
-
-Analyse complète à chaque scan — aucun trade créé tant qu'en shadow mode.
-
----
-
-### Crypto Agent — désactivé
-
-Import commenté dans `scan-markets/route.ts` depuis le 2026-04-18.  
-Raison : WR 26.4%, P&L −87€. Le modèle momentum pur ne fonctionne pas sur Polymarket.
-
-```typescript
-// import { cryptoAdapter } from "@/lib/agents/adapters/crypto-adapter"; // DÉSACTIVÉ 2026-04-18
-// TODO: stratégie mean-reversion ou event-driven
-```
-
----
-
-## Kelly Criterion
-
-`calculateHalfKelly(probability, marketPrice, bankroll, spreadEstimate)`
-
-```
-Bankroll        = 10 USDC
-GAS_FEE         = 0.01 USDC
-PLATFORM_FEE    = 2%
-MIN_BET_AMOUNT  = 0.10 USDC
-MAX_BET_PERCENT = 10%  (plafond = 1 USDC)
-
-Pipeline :
-  1. effectiveProbability = probability − spreadEstimate
-  2. grossOdds = 1/marketPrice − 1
-  3. netOdds   = grossOdds × (1 − 0.02)
-  4. kellyFraction = (p_eff × netOdds − (1−p_eff)) / netOdds
-  5. halfKelly  = kellyFraction / 2
-  6. fraction   = min(halfKelly, 0.10)
-  7. betAmount  = fraction × bankroll − GAS_FEE
-  8. betAmount < 0.10 → 0  ← adapters: return { skipReason }
-```
-
-**Spread par liquidité :**
-
-| Liquidité | Spread |
-|---|---|
-| ≥ $10 000 | 2% |
-| ≥ $2 000 | 3% |
-| < $2 000 | 4% |
-
----
-
-## Filtres de risque — Orchestrateur
-
-```
-applyRiskLimits(opportunities[]) :
-  1. tri par edge décroissant
-  2. seenMarketIds Set → déduplique market_id (2 agents sur même marché)
-  3. countByAgent[agent] ≥ 3  → skip  (était 15)
-  4. countBySector[sector] ≥ 8 → skip
-```
-
-**Secteurs granulaires :**
-
-| Agent | Secteur | Tokens / Tickers |
-|---|---|---|
-| crypto | `crypto_l1` | BTC, ETH, SOL, AVAX, ADA, DOT |
-| crypto | `crypto_meme` | DOGE, SHIB, PEPE, BONK, WIF, TRUMP |
-| crypto | `crypto_defi` | UNI, AAVE, LINK, MKR, CRV, ARB, OP |
-| finance | `finance_tech` | AAPL, MSFT, GOOGL, META, NVDA, AMZN, TSLA |
-| finance | `finance_banks` | JPM, BAC, GS, MS, V, MA, ALLY |
-| finance | `finance_energy` | XOM, CVX, COP, SLB |
-| weather | `weather_us` | NYC, LA, Chicago, Miami… |
-| weather | `weather_eu` | Londres, Paris, Berlin… |
-| weather | `weather_asia` | Tokyo, Seoul, Singapore… |
-
----
-
-## Pipeline check-results
-
-```
-GET /api/check-results  (cron : 0 8 * * *)
-        │
-        ├─ getPendingPaperTrades()
-        │       WHERE won IS NULL
-        │         AND resolution_date < today
-        │         AND actual_result != 'sold'
-        │
-        └─ pour chaque trade :
-                │
-                ├─ [PRIORITÉ] getPositionByPaperTradeId(trade.id)
-                │       Si position.status === 'sold' ET sell_pnl !== null :
-                │         → resolvePaperTrade(won=sell_pnl>=0, pnl=sell_pnl)
-                │         → continue  (skip résolution normale)
-                │
-                ├─ [weather] fetchActualTemperature(city, date)
-                │             → Open-Meteo Archive (ERA5)
-                │             selectTemp → resolveOutcome → WIN|LOSE
-                │
-                ├─ [finance] fetchActualStockResult(ticker, date) → WIN|LOSE
-                ├─ [crypto]  fetchActualCryptoResult(token, date) → WIN|LOSE
-                │
-                ├─ fetchPolymarketOutcome(market_id)  # validation officielle
-                │       outcomeMatch = polymarketOutcome == trade.outcome
-                │
-                ├─ won         = outcomeMatch ?? (ourResult === "WIN")
-                ├─ marketPrice  = Number(trade.market_price)   # coercition défensive
-                ├─ suggestedBet = Number(trade.suggested_bet)  # coercition défensive
-                ├─ pnl = computePnl(won, marketPrice, suggestedBet)
-                │       won  → (1/marketPrice − 1) × suggestedBet
-                │       lost → −suggestedBet
-                │       bet=0 → 0
-                │
-                └─ resolvePaperTrade(id, { won, potential_pnl: pnl })
-```
-
----
-
-## Pipeline monitor-positions
-
-> **Cron supprimé de vercel.json.** La route `/api/monitor-positions` existe encore dans le code mais n'est plus exécutée automatiquement. Les positions restent ouvertes jusqu'à `check-results` (HOLD > SELL : +43€ observé).
-
-La route peut être appelée manuellement si nécessaire. Quand elle tourne :
-
-```
-GET /api/monitor-positions
-        │
-        ├─ getOpenPositions()
-        ├─ filtre âge < 30 min → ignorées
-        └─ pour chaque position éligible :
-                ├─ fetchMarketSnapshot(market_id)
-                ├─ log : age, priceChange, probChange
-                ├─ priceChange < 1% → HOLD sans évaluation
-                ├─ evaluatePosition()
-                │       SELL si probDrop ≥ 25 pts
-                │       SELL si priceRatio < 0.5
-                ├─ si SELL : executeSell() + markPaperTradeSold()
-                │       sell_pnl = (sell−entry)/entry × suggestedBet
-                └─ si HOLD : updatePosition()
-```
-
----
-
-## Base de données Supabase
-
-### Table `opportunities`
-
-| Colonne | Type | Description |
-|---|---|---|
-| `id` | UUID | PK |
-| `market_id` | TEXT | ID Polymarket |
-| `question` | TEXT | Libellé |
-| `outcome` | TEXT | Outcome ciblé |
-| `market_price` | DECIMAL | Prix implicite [0,1] |
-| `estimated_probability` | DECIMAL | Notre estimation |
-| `edge` | DECIMAL | Différence |
-| `multiplier` | DECIMAL | 1/market_price |
-| `status` | TEXT | detected/bet_placed/won/lost/skipped |
-
-### Table `paper_trades`
-
-| Colonne | Type | Description |
-|---|---|---|
-| `id` | UUID | PK |
-| `market_id` | TEXT | ID Polymarket |
-| `agent` | TEXT | weather/finance/crypto |
-| `outcome` | TEXT | Outcome ciblé |
-| `market_price` | DECIMAL | Prix d'entrée |
-| `suggested_bet` | DECIMAL | Mise Kelly (USDC) |
-| `confidence` | TEXT | high/medium/low |
-| `resolution_date` | DATE | Date de résolution |
-| `won` | BOOLEAN | NULL = en attente |
-| `potential_pnl` | DECIMAL | P&L réel (mis à jour à résolution) |
-| `actual_result` | TEXT | Description du résultat |
-| `market_context` | JSONB | Snapshot marché à l'entrée |
-| `polymarket_outcome` | TEXT | Outcome officiel Polymarket |
-| `outcome_match` | BOOLEAN | Notre prédiction = Polymarket ? |
-| `resolved_at` | TIMESTAMPTZ | Horodatage de résolution |
-
-### Table `positions`
-
-| Colonne | Type | Description |
-|---|---|---|
-| `id` | UUID | PK |
-| `paper_trade_id` | UUID | FK → paper_trades |
-| `market_id` | TEXT | ID Polymarket |
-| `entry_price` | DECIMAL | Prix d'entrée |
-| `entry_probability` | DECIMAL | Probabilité estimée à l'entrée |
-| `current_price` | DECIMAL | Dernière mise à jour |
-| `status` | TEXT | open/hold/sell_signal/sold/resolved |
-| `sell_price` | DECIMAL | Prix de vente simulée |
-| `sell_pnl` | DECIMAL | `(sell−entry)/entry × bet` |
-| `sold_at` | TIMESTAMPTZ | Horodatage de vente |
-
-### Table `scan_locks`
-
-Anti-double exécution. `locked_at = NULL` = verrou libre. Timeout 5 min.
-
-### Table `city_coordinates`
-
-Cache géocodage persistant entre redémarrages. PK = `city_name` (minuscules).
-
-### Table `daily_stats`
-
-Agrège par jour : `opportunities_detected`, `wins`, `losses`, `total_pnl`. Upsert idempotent.
-
----
-
-## Géocodage — 3 couches
-
-```
-getCoordinates(cityName)
-    │
-    ├─ 1. Cache mémoire (Map)   — pré-peuplé depuis STATION_MAPPING
-    ├─ 2. Cache Supabase         — persistant entre redémarrages
-    └─ 3. Open-Meteo Geocoding   — résultat persisté en Supabase
-```
-
-**Normalisations :** "NYC" → "New York City", "LA" → "Los Angeles", etc.
-
----
-
-## API externes utilisées
-
-| API | Usage | Auth | Limite |
-|---|---|---|---|
-| Open-Meteo Forecast | Prévisions météo (scan) | — | Gratuit |
-| Open-Meteo Archive | Températures réelles (check-results) | — | Gratuit |
-| Open-Meteo Geocoding | Résolution ville → coords | — | Gratuit |
-| Finnhub `/quote` | Prix actions (scan) | `FINNHUB_API_KEY` | 60 req/min |
-| CoinGecko `/simple/price` | Prix crypto (scan) | — | ~30 req/min |
-| Polymarket Gamma API | Marchés, outcomes, résolutions | — | Non documentée |
-| Polymarket CLOB API | Ordres réels | Non actif | — |
-| Discord Webhook | Notifications | `DISCORD_WEBHOOK_URL` | — |
-
-**Gamma API — endpoints utilisés :**
-```
-/events?tag_slug=weather&active=true&closed=false&order=endDate&ascending=true&limit=100
-/events?tag_slug=crypto&active=true&closed=false&order=startDate&ascending=false&limit=100
-/markets?tag_slug=finance&active=true&closed=false&order=endDate&ascending=true&limit=100
-/markets/{market_id}   ← fetchMarketSnapshot (monitor-positions)
-```
-
-**Deux structures de réponse Gamma :** `event.markets[]` (nested) ou `event` direct.
+Claude retourne : `{ decision: "TRADE"|"SKIP", confidence: "VERY_HIGH"|"HIGH"|"MEDIUM"|"LOW", size: 1-10, reason, risks[], edgeEstimate? }`
 
 ---
 
 ## Variables d'environnement
 
 ```env
-NEXT_PUBLIC_SUPABASE_URL     # URL projet Supabase
-SUPABASE_SERVICE_ROLE_KEY    # Clé service role (bypass RLS)
-FINNHUB_API_KEY              # Clé API Finnhub
-DISCORD_WEBHOOK_URL          # Webhook Discord (optionnel)
+NEXT_PUBLIC_SUPABASE_URL      URL projet Supabase
+SUPABASE_SERVICE_ROLE_KEY     Clé service (server-side uniquement, bypass RLS)
+ANTHROPIC_API_KEY             Claude Sonnet 4.6
+DISCORD_WEBHOOK_URL           Notifications (optionnel)
+TRADING_MODE                  Fallback uniquement si bot_state absent (défaut: balanced)
+FINNHUB_API_KEY               Finance agent (shadow mode, optionnel)
 ```
 
 ---
 
-## Seuils et constantes clés
+## Constantes clés
 
 | Constante | Valeur | Fichier |
-|---|---|---|
+|-----------|--------|---------|
 | `BANKROLL` | 10 USDC | `kelly.ts` |
-| `GAS_FEE` | 0.01 USDC | `kelly.ts` |
-| `PLATFORM_FEE` | 2% | `kelly.ts` |
-| `MIN_BET_AMOUNT` | 0.10 USDC | `kelly.ts` |
-| `MIN_LIQUIDITY` | **$2 000** | `weather-adapter.ts`, `finance-adapter.ts` |
-| `MIN_EDGE` (gross) | **12%** | `weather-adapter.ts` |
-| `NET_EDGE_MIN` | **8%** | `weather-adapter.ts` |
-| Anti-favori | **> 70%** | `weather-adapter.ts` |
-| `MIN_EDGE` orchestrateur | **12%** | `orchestrator.ts` |
-| `maxPositionsPerAgent` | **3** | `orchestrator.ts` |
+| `MAX_RESOLUTION_HOURS` | 48h | `weather-adapter.ts` |
+| Filtre consensus | ≥ 90% | `weather-adapter.ts` (fetchMarkets) |
+| Anti-favori | > 70% | `weather-adapter.ts` (analyze) |
+| Liquidity cap | 5% de la liquidité | `sizing.ts` |
+| Multi-model cache TTL | 15 min | `multi-model-weather.ts` |
+| Weather cache TTL | 10 min | `weather-sources.ts` |
+| Scan lock timeout | 5 min | `supabase.ts` |
+| Grace period | 5 min | `position-manager.ts` |
+| `maxPositionsPerAgent` | 3 | `orchestrator.ts` |
 | `maxPositionsPerSector` | 8 | `orchestrator.ts` |
 | `batchSize` | 5 | `orchestrator.ts` |
-| `batchDelayMs` | 200ms | `orchestrator.ts` |
-| Circuit breaker WR seuil | < 40% / ≥ 10 trades | `orchestrator.ts` |
-| Circuit breaker P&L seuil | < −15€/24h | `orchestrator.ts` |
-| `CACHE_TTL` météo | 10 min | `weather-sources.ts` |
-| `LOCK_TIMEOUT_MS` | 5 min | `supabase.ts` |
-| `AbortSignal.timeout` | 15 000ms | `weather-sources.ts` |
-| `MIN_POSITION_AGE_MS` | 30 min | `monitor-positions` |
-| `MIN_PRICE_CHANGE_RATIO` | 1% | `monitor-positions` |
-| `probDrop` SELL seuil | 25 pts | `position-manager.ts` |
+| Circuit breaker WR | < 40% / ≥ 10 trades | `orchestrator.ts` |
+| Circuit breaker P&L | < −15€/24h | `orchestrator.ts` |
 
 ---
 
-## Protections et déduplication
+## API externes
 
-| Mécanisme | Où | Effet |
-|---|---|---|
-| Verrou `scan_locks` | `scan-markets` | Empêche 2 scans simultanés |
-| `getRecentOpportunities(24h)` | `scan-markets` | Pas de double sauvegarde |
-| Shadow mode | orchestrateur | Finance + Crypto scannent sans créer de trades |
-| Circuit breaker | orchestrateur | Auto-désactive les agents < WR 40% ou P&L < −15€/24h |
-| `seenMarketIds` Set | orchestrateur | market_id unique même si 2 agents le voient |
-| `kelly.betAmount === 0 → skipReason` | adapters | Pas de trade sans mise valide |
-| Anti-favori > 70% | `weather-adapter` | Pas de bet sur marché déjà décidé |
-| Filtre edge brut 12% | `weather-adapter` | Seuil relevé post-bilan |
-| `Number(market_price/suggested_bet)` | `check-results` | Coercition défensive null/undefined |
-| Sold-check `getPositionByPaperTradeId` | `check-results` | Utilise `sell_pnl` réel si vendu |
-| `MIN_POSITION_AGE_MS` 30 min | `monitor-positions` | Pas de vente immédiate après ouverture |
-| `MIN_PRICE_CHANGE_RATIO` 1% | `monitor-positions` | Pas d'évaluation si prix inchangé |
-| `edge > 50%` → skip | agents | Filtre erreurs de données |
-| `marketPrice < 0.01 \|\| > 0.99` | agents | Filtre marchés déjà résolus |
-
----
-
-## État des agents (résumé)
-
-| Agent | État | Depuis | Raison |
-|---|---|---|---|
-| Weather | ✅ **ACTIF** | — | WR à améliorer avec nouveaux seuils |
-| Finance | 👻 **Shadow mode** | 2026-04-18 | WR ~38%, surveillance sans trades |
-| Crypto | ✗ **Désactivé** | 2026-04-18 | WR 26.4%, P&L −87€ — momentum inefficace sur Polymarket |
+| API | Usage | Auth | Limite |
+|-----|-------|------|--------|
+| Open-Meteo Forecast | GFS + ECMWF + UKMO + Ensemble | — | Gratuit |
+| Open-Meteo Archive | Températures réelles (check-results) | — | Gratuit |
+| Open-Meteo Geocoding | Ville → coords | — | Gratuit |
+| Polymarket Gamma API | Marchés météo, outcomes, résolutions | — | Non documentée |
+| Anthropic API | Claude Sonnet 4.6 (analyse + post-mortem) | `ANTHROPIC_API_KEY` | Pay-per-use |
+| Discord Webhook | Notifications | `DISCORD_WEBHOOK_URL` | — |
+| Finnhub | Prix actions (finance, shadow) | `FINNHUB_API_KEY` | 60 req/min |

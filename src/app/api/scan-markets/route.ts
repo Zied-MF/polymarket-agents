@@ -28,6 +28,7 @@ import {
   acquireScanLock,
   releaseScanLock,
 }                                          from "@/lib/db/supabase";
+import { cleanOldLogs }                    from "@/lib/logger";
 import { openPosition }                    from "@/lib/db/positions";
 import type { Opportunity, SkippedMarket, AgentStats } from "@/lib/agents/orchestrator";
 import { getBotState, updateLastScan }     from "@/lib/bot/bot-state";
@@ -258,27 +259,12 @@ export async function GET(): Promise<NextResponse<ScanResult | { status: string;
   // 4. Update bot last-scan timestamp + detailed activity logs (best-effort)
   updateLastScan().catch(() => {});
 
-  // Log each trade signal with full detail
-  for (const opp of opps) {
-    const edge  = ((opp.estimatedProbability - opp.marketPrice) * 100).toFixed(1);
-    const price = (opp.marketPrice * 100).toFixed(0);
-    const label = opp.city ?? opp.ticker ?? opp.token ?? opp.marketId;
-    logActivity(
-      "trade",
-      `TRADE: ${label} ${opp.outcome} @ ${price}¢ (edge=${edge}%, bet=$${opp.suggestedBet.toFixed(2)}, conf=${opp.confidence ?? "?"})`
-    ).catch(() => {});
+  // One summary line per scan — no per-skip logs to avoid DB bloat
+  if (savedCount > 0) {
+    const labels = opps.map((o) => `${o.city ?? o.ticker ?? o.marketId} ${o.outcome}`).join(", ");
+    logActivity("trade", `${savedCount} trade(s): ${labels}`).catch(() => {});
   }
-
-  // Log basic skips from orchestrator (horizon, anti-churn, consensus, etc.)
-  // Detailed edge/Claude skips are already logged from inside weather-adapter
-  for (const sk of skipped) {
-    logActivity(
-      "skip",
-      `SKIP: ${sk.question.slice(0, 60)} - ${sk.reason}`
-    ).catch(() => {});
-  }
-
-  logActivity("info", `Scan complete: ${opps.length} trades, ${savedCount} saved, ${skipped.length} skipped`).catch(() => {});
+  logActivity("info", `Scan complete: ${savedCount} saved, ${skipped.length} skipped`).catch(() => {});
 
   const duration = `${Date.now() - startTime}ms`;
   console.log(
@@ -300,6 +286,7 @@ export async function GET(): Promise<NextResponse<ScanResult | { status: string;
   });
 
   } finally {
+    cleanOldLogs().catch(() => {});
     await releaseScanLock();
   }
 }

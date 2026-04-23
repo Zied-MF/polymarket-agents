@@ -83,6 +83,8 @@ Respond with JSON only:
   "category": "pricing" | "forecast" | "timing" | "city_bias" | "model_error"
 }`;
 
+  console.log(`[post-mortem] Analyzing trade for ${trade.city} (${trade.won ? "WIN" : "LOSS"})...`);
+
   const response = await anthropic.messages.create({
     model:      MODEL,
     max_tokens: 256,
@@ -92,11 +94,22 @@ Respond with JSON only:
   const block = response.content[0];
   if (block.type !== "text") throw new Error("Unexpected response type");
 
+  console.log(`[post-mortem] Claude response:`, block.text);
+
   const jsonMatch = block.text.match(/\{[\s\S]*\}/);
   if (!jsonMatch) throw new Error("No JSON in post-mortem response");
 
   const result = JSON.parse(jsonMatch[0]) as PostMortemResult;
 
+  const lesson = result.lesson?.trim() ?? "";
+  console.log(`[post-mortem] Parsed lesson: "${lesson}" (${lesson.length} chars)`);
+
+  if (lesson.length <= 5 || lesson.length >= 500) {
+    console.log(`[post-mortem] ❌ Lesson rejected (length=${lesson.length})`);
+    throw new Error(`Lesson length out of bounds: ${lesson.length}`);
+  }
+
+  result.lesson = lesson;
   console.log(`[post-mortem] ${trade.city} (${trade.won ? "WIN" : "LOSS"}): [${result.category}] ${result.lesson}`);
 
   return result;

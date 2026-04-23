@@ -87,13 +87,17 @@ export async function saveLesson(
   sourceTradeId?: string
 ): Promise<void> {
   try {
-    const { error } = await getClient().from("trading_lessons").insert({
+    const { data, error } = await getClient().from("trading_lessons").insert({
       lesson,
       category,
       city:            city ?? null,
       source_trade_id: sourceTradeId ?? null,
-    });
-    if (error) console.error(`[lessons] saveLesson: ${error.message}`);
+    }).select();
+    if (error) {
+      console.error(`[lessons] DB Insert error:`, error);
+    } else {
+      console.log(`[lessons] ✅ Lesson saved:`, data);
+    }
   } catch (err) {
     console.error("[lessons] saveLesson exception:", err instanceof Error ? err.message : err);
   }

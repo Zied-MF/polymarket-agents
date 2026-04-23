@@ -35,7 +35,6 @@ import {
 }                                                                                from "@/lib/db/lessons";
 import type { AgentConfig, AnalyzeResult }                                       from "@/lib/agents/orchestrator";
 import type { WeatherForecast, EnsembleForecast }                                from "@/types";
-import { logActivity }                                                           from "@/lib/logger";
 
 // ---------------------------------------------------------------------------
 // Constantes + mode override
@@ -283,18 +282,10 @@ export const weatherAdapter: AgentConfig = {
       ` outcome=${best.outcome} prob=${(best.estimatedProbability * 100).toFixed(1)}%` +
       ` liq=$${m.liquidity} ${hoursToResolution.toFixed(1)}h`
     );
-    logActivity(
-      "info",
-      `SCAN: ${m.city} edge=${(best.edge * 100).toFixed(1)}% net=${(edgeNet * 100).toFixed(1)}%` +
-      ` | ${best.outcome} @ ${(best.marketPrice * 100).toFixed(0)}¢ prob=${(best.estimatedProbability * 100).toFixed(1)}%` +
-      ` | liq=$${m.liquidity} ${hoursToResolution.toFixed(1)}h`
-    ).catch(() => {});
-
     // Filtre YES price (mode-based)
     if (best.outcome === "Yes" && best.marketPrice > mode.yesMaxPrice) {
       const reason = `YES ${(best.marketPrice * 100).toFixed(0)}¢ > ${(mode.yesMaxPrice * 100).toFixed(0)}¢ (mode: ${mode.name})`;
       console.log(`${debugPrefix}: SKIP: ${reason}`);
-      logActivity("skip", `SKIP: ${m.city} - ${reason} (edge=${(edgeNet * 100).toFixed(1)}%, price=${(best.marketPrice * 100).toFixed(0)}¢)`).catch(() => {});
       return { skipReason: reason };
     }
 
@@ -302,7 +293,6 @@ export const weatherAdapter: AgentConfig = {
     if (best.outcome === "No" && yesPrice < mode.noMinYesPrice) {
       const reason = `NO not worth: YES only ${(yesPrice * 100).toFixed(0)}¢ < ${(mode.noMinYesPrice * 100).toFixed(0)}¢`;
       console.log(`${debugPrefix}: SKIP: ${reason}`);
-      logActivity("skip", `SKIP: ${m.city} - ${reason} (edge=${(edgeNet * 100).toFixed(1)}%, price=${(best.marketPrice * 100).toFixed(0)}¢)`).catch(() => {});
       return { skipReason: reason };
     }
 
@@ -310,7 +300,6 @@ export const weatherAdapter: AgentConfig = {
     if (best.marketPrice > 0.70) {
       const reason = `Price ${(best.marketPrice * 100).toFixed(0)}¢ > 70¢ (favori évident)`;
       console.log(`${debugPrefix}: SKIP: ${reason}`);
-      logActivity("skip", `SKIP: ${m.city} - ${reason} (edge=${(edgeNet * 100).toFixed(1)}%, price=${(best.marketPrice * 100).toFixed(0)}¢)`).catch(() => {});
       return { skipReason: reason };
     }
 
@@ -328,7 +317,6 @@ export const weatherAdapter: AgentConfig = {
     if (edgeNet < mode.minEdge) {
       const reason = `Edge net ${(edgeNet * 100).toFixed(1)}% < ${(mode.minEdge * 100).toFixed(0)}% (mode: ${mode.name})`;
       console.log(`${debugPrefix}: SKIP: ${reason} (gross=${(best.edge * 100).toFixed(1)}% spread=${(spreadEstimate * 100).toFixed(1)}%)`);
-      logActivity("skip", `SKIP: ${m.city} - ${reason} (edge=${(edgeNet * 100).toFixed(1)}%, price=${(best.marketPrice * 100).toFixed(0)}¢)`).catch(() => {});
       return { skipReason: reason };
     }
 
@@ -423,7 +411,6 @@ export const weatherAdapter: AgentConfig = {
     if (claudeAnalysis.decision === "SKIP") {
       const reason = `Claude SKIP: ${claudeAnalysis.reason}`;
       console.log(`[scan-debug] ${m.city}: SKIP: ${reason} (edge=${(edgeNet * 100).toFixed(1)}%, price=${(best.marketPrice * 100).toFixed(0)}¢)`);
-      logActivity("skip", `SKIP: ${m.city} - ${reason} (edge=${(edgeNet * 100).toFixed(1)}%, price=${(best.marketPrice * 100).toFixed(0)}¢)`).catch(() => {});
       return { skipReason: reason };
     }
 
@@ -431,7 +418,6 @@ export const weatherAdapter: AgentConfig = {
     if (!isConfidenceAtLeast(claudeAnalysis.confidence, mode.minConfidence)) {
       const reason = `Confidence ${claudeAnalysis.confidence} < ${mode.minConfidence} (mode: ${mode.name})`;
       console.log(`[scan-debug] ${m.city}: SKIP: ${reason} (edge=${(edgeNet * 100).toFixed(1)}%, price=${(best.marketPrice * 100).toFixed(0)}¢)`);
-      logActivity("skip", `SKIP: ${m.city} - ${reason} (edge=${(edgeNet * 100).toFixed(1)}%, price=${(best.marketPrice * 100).toFixed(0)}¢)`).catch(() => {});
       return { skipReason: reason };
     }
 

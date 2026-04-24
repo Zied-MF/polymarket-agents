@@ -27,6 +27,7 @@ import {
   savePaperTrade,
   acquireScanLock,
   releaseScanLock,
+  getCurrentBankroll,
 }                                          from "@/lib/db/supabase";
 import { cleanOldLogs }                    from "@/lib/logger";
 import { openPosition }                    from "@/lib/db/positions";
@@ -96,8 +97,9 @@ export async function GET(): Promise<NextResponse<ScanResult | { status: string;
 
   // Propager le mode DB vers le weather-adapter (écrase l'env var TRADING_MODE)
   setWeatherAdapterMode(scanMode);
-  console.log(`[scan-markets] ▶ Démarrage scan — ${new Date().toISOString()} (mode: ${scanMode})`);
-  await logActivity("scan", `Scan started (mode: ${scanMode})`);
+  const bankroll = await getCurrentBankroll().catch(() => 10);
+  console.log(`[scan-markets] ▶ Démarrage scan — ${new Date().toISOString()} (mode: ${scanMode}, bankroll: ${bankroll.toFixed(2)}$)`);
+  await logActivity("scan", `Scan started (mode: ${scanMode}, bankroll: ${bankroll.toFixed(2)}$)`);
 
   try {
   const errors: ScanResult["errors"] = [];

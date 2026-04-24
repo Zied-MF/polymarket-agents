@@ -1,6 +1,6 @@
-import { NextResponse }  from "next/server";
-import { getBotState }   from "@/lib/bot/bot-state";
-import { getClient }     from "@/lib/db/supabase";
+import { NextResponse }                    from "next/server";
+import { getBotState }                    from "@/lib/bot/bot-state";
+import { getClient, getCurrentBankroll }  from "@/lib/db/supabase";
 
 export async function GET() {
   const db    = getClient();
@@ -8,10 +8,11 @@ export async function GET() {
 
   const today = new Date().toISOString().slice(0, 10);
 
-  const [todayRes, allRes, posRes] = await Promise.all([
+  const [todayRes, allRes, posRes, bankroll] = await Promise.all([
     db.from("paper_trades").select("won, potential_pnl").gte("created_at", today),
     db.from("paper_trades").select("won, potential_pnl").not("won", "is", null),
     db.from("positions").select("id").is("sold_at", null),
+    getCurrentBankroll(),
   ]);
 
   const todayTrades = todayRes.data ?? [];
@@ -31,14 +32,20 @@ export async function GET() {
     .reduce((s, t) => s + (Number(t.potential_pnl) || 0), 0)
     .toFixed(2);
 
+  const INITIAL_BANKROLL = 10;
+  const roi = ((bankroll - INITIAL_BANKROLL) / INITIAL_BANKROLL * 100).toFixed(1);
+
   const stats = {
-    tradesToday:   todayTrades.length,
-    totalTrades:   allTrades.length,
+    tradesToday:      todayTrades.length,
+    totalTrades:      allTrades.length,
     wins,
     winRate,
     pnlToday,
     totalPnl,
-    openPositions: positions.length,
+    openPositions:    positions.length,
+    currentBankroll:  bankroll.toFixed(2),
+    initialBankroll:  INITIAL_BANKROLL,
+    roi,
   };
 
   return NextResponse.json({ state, stats });

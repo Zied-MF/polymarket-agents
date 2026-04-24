@@ -1,12 +1,15 @@
 "use client";
 
 interface Stats {
-  tradesToday:   number;
-  totalTrades:   number;
-  winRate:       string;
-  pnlToday:      string;
-  totalPnl:      string;
-  openPositions: number;
+  tradesToday:      number;
+  totalTrades:      number;
+  winRate:          string;
+  pnlToday:         string;
+  totalPnl:         string;
+  openPositions:    number;
+  currentBankroll?: string;
+  initialBankroll?: number;
+  roi?:             string;
 }
 
 interface LiveStatsProps {
@@ -15,6 +18,15 @@ interface LiveStatsProps {
 
 export function LiveStats({ stats }: LiveStatsProps) {
   const cards = [
+    {
+      label:    "Bankroll",
+      value:    stats?.currentBankroll ? `${stats.currentBankroll}$` : "—",
+      icon:     "💵",
+      color:    stats?.currentBankroll && parseFloat(stats.currentBankroll) > (stats.initialBankroll ?? 10)
+                  ? "text-green-400"
+                  : "text-gray-400",
+      subtitle: stats?.roi ? `ROI: ${parseFloat(stats.roi) >= 0 ? "+" : ""}${stats.roi}%` : undefined,
+    },
     {
       label: "Win Rate",
       value: stats ? `${stats.winRate}%` : "—",
@@ -58,7 +70,7 @@ export function LiveStats({ stats }: LiveStatsProps) {
   ];
 
   return (
-    <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-4">
+    <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-7 gap-4">
       {cards.map((card) => (
         <div key={card.label} className="bg-gray-900 rounded-xl border border-gray-800 p-4">
           <div className="flex items-center gap-1.5 mb-2">
@@ -66,6 +78,9 @@ export function LiveStats({ stats }: LiveStatsProps) {
             <span className="text-xs text-gray-400">{card.label}</span>
           </div>
           <div className={`text-2xl font-bold ${card.color}`}>{card.value}</div>
+          {"subtitle" in card && card.subtitle && (
+            <div className="text-xs text-gray-500 mt-1">{card.subtitle}</div>
+          )}
         </div>
       ))}
     </div>

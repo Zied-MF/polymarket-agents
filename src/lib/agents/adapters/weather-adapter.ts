@@ -19,7 +19,7 @@
 import { fetchAllWeatherMarkets, type WeatherMarket }                           from "@/lib/polymarket/gamma-api";
 import { fetchForecastForStation, fetchEnsembleForecast }                        from "@/lib/data-sources/weather-sources";
 import { analyzeMarket, parseOutcomeForMarket }                                  from "@/lib/agents/weather-agent";
-import { BANKROLL }                                                              from "@/lib/utils/kelly";
+import { getCurrentBankroll }                                                    from "@/lib/db/supabase";
 import { calculateBetSize }                                                      from "@/lib/utils/sizing";
 import { getAirportStation, isUSCity }                                           from "@/lib/data/airport-stations";
 import { analyzeWithClaude, type MarketContext }                                 from "@/lib/agents/claude-analyst";
@@ -467,12 +467,14 @@ export const weatherAdapter: AgentConfig = {
 
     // Kelly sizing dynamique (mode-based) — Claude size 1-10 → % du bankroll
     // Puis cap sur 5 % de la liquidité disponible pour éviter le slippage.
+    // Bankroll dynamique : initial 10$ + P&L net cumulé (compound).
+    const bankroll    = await getCurrentBankroll();
     const claudeSize  = claudeAnalysis.size ?? 5;
     const sizePercent = (claudeSize / 10) * mode.maxBetPercent;
-    const kellyBet    = BANKROLL * sizePercent;
-    const adjustedBet = calculateBetSize(kellyBet, m.liquidity, BANKROLL, mode.maxBetPercent);
+    const kellyBet    = bankroll * sizePercent;
+    const adjustedBet = calculateBetSize(kellyBet, m.liquidity, bankroll, mode.maxBetPercent);
     console.log(
-      `[weather-adapter] 💰 Sizing: Claude=${claudeSize}/10 Kelly=${kellyBet.toFixed(2)}$ ` +
+      `[weather-adapter] 💰 Sizing: bankroll=${bankroll.toFixed(2)}$ Claude=${claudeSize}/10 Kelly=${kellyBet.toFixed(2)}$ ` +
       `Liquidity=$${m.liquidity} (5%=$${(m.liquidity * 0.05).toFixed(2)}) ` +
       `→ Final=${adjustedBet.toFixed(2)}$ (mode: ${mode.name})`
     );

@@ -274,6 +274,28 @@ export async function updateBetResult(
 }
 
 /**
+ * Calcule le bankroll courant : initial + P&L net de tous les trades résolus.
+ * Plancher = INITIAL_BANKROLL pour ne jamais descendre en dessous.
+ */
+export async function getCurrentBankroll(): Promise<number> {
+  const INITIAL_BANKROLL = 10;
+  const db = getClient();
+
+  const { data } = await db
+    .from("paper_trades")
+    .select("potential_pnl")
+    .not("won", "is", null);
+
+  const totalPnL = data?.reduce((sum, t) => sum + (Number(t.potential_pnl) || 0), 0) ?? 0;
+  const current  = Math.max(INITIAL_BANKROLL, INITIAL_BANKROLL + totalPnL);
+
+  console.log(
+    `[bankroll] Initial: ${INITIAL_BANKROLL}$, Net P&L: ${totalPnL.toFixed(2)}$, Current: ${current.toFixed(2)}$`
+  );
+  return current;
+}
+
+/**
  * Retourne les opportunités détectées au cours des dernières `hours` heures.
  * Utilisé par scan-markets pour dédupliquer avant d'insérer.
  */

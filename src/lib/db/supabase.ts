@@ -518,6 +518,7 @@ export async function getPendingPaperTrades(): Promise<PaperTradeRow[]> {
  * Résout un paper trade après vérification du résultat réel.
  * Met à jour actual_result, won, potential_pnl, resolved_at,
  * et optionnellement polymarket_outcome + outcome_match pour audit.
+ * sold_early=true quand vendu par le Position Manager avant expiration.
  */
 export async function resolvePaperTrade(
   id: string,
@@ -527,6 +528,7 @@ export async function resolvePaperTrade(
     potential_pnl:       number;
     polymarket_outcome?: string | null;
     outcome_match?:      boolean | null;
+    sold_early?:         boolean;
   }
 ): Promise<void> {
   const db = getClient();
@@ -539,6 +541,7 @@ export async function resolvePaperTrade(
       resolved_at:        new Date().toISOString(),
       polymarket_outcome: data.polymarket_outcome ?? null,
       outcome_match:      data.outcome_match      ?? null,
+      sold_early:         data.sold_early         ?? false,
     })
     .eq("id", id);
 

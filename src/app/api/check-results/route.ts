@@ -341,6 +341,7 @@ export async function GET(): Promise<NextResponse<CheckSummary>> {
           actual_result: "sold",
           won:           position.sell_pnl >= 0,
           potential_pnl: position.sell_pnl,
+          sold_early:    true,
         });
         paperResolved.push({
           id:           trade.id,
@@ -407,6 +408,7 @@ export async function GET(): Promise<NextResponse<CheckSummary>> {
           potential_pnl:      pnl,
           polymarket_outcome: polymarketOutcome,
           outcome_match:      outcomeMatch,
+          sold_early:         false,
         });
         paperResolved.push({ id: trade.id, agent: trade.agent, outcome: trade.outcome, actualResult: actualStr, won, pnl });
       } catch (err) {

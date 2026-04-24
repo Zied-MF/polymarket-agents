@@ -2,7 +2,7 @@
  * Post-Mortem — génère une leçon d'apprentissage après chaque trade résolu.
  *
  * Appelé par check-results après résolution d'un paper trade.
- * Sauvegarde la leçon dans `trading_lessons` et met à jour la calibration.
+ * Sauvegarde la leçon dans `lessons_learned` et met à jour la calibration.
  */
 
 import Anthropic from "@anthropic-ai/sdk";
@@ -48,7 +48,7 @@ export async function generateAndSavePostMortem(
     const result = await generatePostMortem(trade);
 
     // Persiste la leçon en arrière-plan
-    await saveLesson(result.lesson, result.category, trade.city, trade.tradeId);
+    await saveLesson(result.lesson, "weather", trade.tradeId);
 
     // Met à jour la calibration si le trade avait un niveau de confiance Claude
     if (trade.confidence) {

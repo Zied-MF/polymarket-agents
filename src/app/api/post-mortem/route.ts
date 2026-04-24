@@ -6,7 +6,7 @@
  * Pipeline :
  *   1. Récupère les paper trades résolus sans post-mortem (post_mortem_done=false)
  *   2. Pour chaque trade, génère une leçon via Claude Haiku
- *   3. Persiste la leçon dans trading_lessons
+ *   3. Persiste la leçon dans lessons_learned
  *   4. Met à jour confidence_calibration
  *   5. Marque le trade comme post_mortem_done=true
  *

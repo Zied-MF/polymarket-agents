@@ -3,13 +3,13 @@
  *
  * Tables requises (à créer dans Supabase SQL Editor) :
  *
- *   CREATE TABLE IF NOT EXISTS trading_lessons (
+ *   CREATE TABLE IF NOT EXISTS lessons_learned (
  *     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+ *     agent           TEXT NOT NULL,
  *     lesson          TEXT NOT NULL,
- *     category        TEXT NOT NULL,
- *     city            TEXT,
+ *     source_trade_id UUID REFERENCES paper_trades(id),
  *     created_at      TIMESTAMPTZ DEFAULT NOW(),
- *     source_trade_id UUID REFERENCES paper_trades(id)
+ *     times_applied   INT DEFAULT 0
  *   );
  *
  *   CREATE TABLE IF NOT EXISTS confidence_calibration (
@@ -44,11 +44,11 @@ function getClient(): SupabaseClient {
 
 export interface LessonRow {
   id:              string;
+  agent:           string;
   lesson:          string;
-  category:        string;
-  city:            string | null;
-  created_at:      string;
   source_trade_id: string | null;
+  created_at:      string;
+  times_applied:   number;
 }
 
 // ---------------------------------------------------------------------------
@@ -62,7 +62,7 @@ export interface LessonRow {
 export async function getRecentLessons(n = 20): Promise<LessonRow[]> {
   try {
     const { data, error } = await getClient()
-      .from("trading_lessons")
+      .from("lessons_learned")
       .select("*")
       .order("created_at", { ascending: false })
       .limit(n);
@@ -81,16 +81,14 @@ export async function getRecentLessons(n = 20): Promise<LessonRow[]> {
  * Persiste une leçon post-mortem.
  */
 export async function saveLesson(
-  lesson:        string,
-  category:      string,
-  city?:         string,
+  lesson:         string,
+  agent:          string,
   sourceTradeId?: string
 ): Promise<void> {
   try {
-    const { data, error } = await getClient().from("trading_lessons").insert({
+    const { data, error } = await getClient().from("lessons_learned").insert({
       lesson,
-      category,
-      city:            city ?? null,
+      agent,
       source_trade_id: sourceTradeId ?? null,
     }).select();
     if (error) {

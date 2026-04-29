@@ -1,8 +1,9 @@
 /**
  * Test Real Trade endpoint
  *
- * GET /api/test-real-trade?dry_run=true   → signe l'ordre sans soumettre (défaut)
- * GET /api/test-real-trade?dry_run=false  → soumet un ordre live de $0.50 USDC
+ * GET /api/test-real-trade               → dry_run=true (défaut) : signe, ne soumet pas
+ * GET /api/test-real-trade?dry_run=false → soumet un ordre live de $0.50 via placeOrder()
+ *                                          + vérifie en DB que clob_order_id est bien persisté
  *
  * Diagnostics retournés :
  *   - wallet address + balance USDC
@@ -10,6 +11,7 @@
  *   - tokenId CLOB résolu
  *   - signature EIP-712 (toujours effectuée)
  *   - orderId si soumis en live
+ *   - dbVerification : { positionId, clobOrderIdInDb, isRealInDb, ok } si dry_run=false
  */
 
 import { NextRequest, NextResponse } from "next/server";
@@ -19,6 +21,8 @@ import {
   placeOrder,
   getAccountBalance,
 }                                    from "@/lib/polymarket/clob-api";
+import { executeBuy }                from "@/lib/trade-executor";
+import { getPositionByPaperTradeId } from "@/lib/db/positions";
 
 // ---------------------------------------------------------------------------
 // Gamma — cherche un marché météo ouvert peu cher
@@ -27,14 +31,14 @@ import {
 const GAMMA_BASE = "https://gamma-api.polymarket.com";
 
 interface GammaMarket {
-  id:            string;
-  conditionId?:  string;
-  question?:     string;
-  outcomes?:     string | string[];
+  id:             string;
+  conditionId?:   string;
+  question?:      string;
+  outcomes?:      string | string[];
   outcomePrices?: string | string[];
-  active?:       boolean;
-  closed?:       boolean;
-  endDate?:      string;
+  active?:        boolean;
+  closed?:        boolean;
+  endDate?:       string;
 }
 
 function parseJsonField<T>(raw: string | T[] | undefined): T[] {
@@ -71,14 +75,9 @@ async function findCheapWeatherMarket(): Promise<{
       const yesIdx      = outcomes.findIndex((o) => o.toLowerCase() === "yes");
       if (yesIdx < 0 || prices.length !== outcomes.length) continue;
       const yesPrice = prices[yesIdx];
-      if (yesPrice < 0.05 || yesPrice > 0.95) continue; // trop extrême → skip
+      if (yesPrice < 0.05 || yesPrice > 0.95) continue;
       if (!best || yesPrice < best.yesPrice) {
-        best = {
-          gammaId:     m.id,
-          conditionId,
-          question:    m.question ?? m.id,
-          yesPrice,
-        };
+        best = { gammaId: m.id, conditionId, question: m.question ?? m.id, yesPrice };
       }
     }
 
@@ -175,34 +174,131 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
     yesPrice:    yesToken.price,
   };
 
-  // 6. Signer (et éventuellement soumettre) l'ordre
-  const BET_USDC = 0.50;
-  try {
-    const placed = await placeOrder({
-      tokenId:    yesToken.tokenId,
-      side:       "BUY",
-      amountUsdc: BET_USDC,
-      price:      market.yesPrice,
-      negRisk:    clobMarket.negRisk,
-      dryRun,
-    });
+  // ── DRY RUN ────────────────────────────────────────────────────────────────
+  // Signe l'ordre EIP-712 mais ne l'envoie pas et n'écrit rien en DB.
+  if (dryRun) {
+    try {
+      const placed = await placeOrder({
+        tokenId:    yesToken.tokenId,
+        side:       "BUY",
+        amountUsdc: 0.50,
+        price:      market.yesPrice,
+        negRisk:    clobMarket.negRisk,
+        dryRun:     true,
+      });
 
-    diag.order = {
-      tokenId:    yesToken.tokenId,
-      side:       "BUY",
-      amountUsdc: BET_USDC,
-      price:      market.yesPrice,
-      orderId:    placed.orderId ?? null,
-      gasFeeUsdc: placed.gasFeeUsdc,
-      submitted:  !dryRun,
-    };
+      diag.order = {
+        tokenId:    yesToken.tokenId,
+        side:       "BUY",
+        amountUsdc: 0.50,
+        price:      market.yesPrice,
+        orderId:    placed.orderId,   // "dry-run"
+        gasFeeUsdc: placed.gasFeeUsdc,
+        submitted:  false,
+      };
+    } catch (err) {
+      return NextResponse.json(
+        { ...diag, error: `placeOrder (dry-run): ${err instanceof Error ? err.message : err}` },
+        { status: 500 }
+      );
+    }
+
+    diag.status = "DRY_RUN_OK";
+    return NextResponse.json(diag);
+  }
+
+  // ── LIVE ORDER — passe par executeBuy() pour tester la persistance en DB ──
+  // executeBuy() appelle patchRealPosition() qui doit écrire clob_order_id.
+  // On vérifie ensuite directement en DB que le champ est bien rempli.
+  const BET_USDC = 0.50;
+
+  let buyResult: Awaited<ReturnType<typeof executeBuy>>;
+  try {
+    // Force REAL_TRADING_ENABLED pour ce test, quelle que soit l'env var
+    process.env.REAL_TRADING_ENABLED = "true";
+    buyResult = await executeBuy({
+      marketId:             market.conditionId,
+      question:             market.question,
+      city:                 null,
+      ticker:               null,
+      agent:                "weather",
+      outcome:              "Yes",
+      marketPrice:          market.yesPrice,
+      estimatedProbability: market.yesPrice,
+      edge:                 0,
+      suggestedBet:         BET_USDC,
+      confidence:           "test",
+      targetDate:           undefined,
+      targetDateTime:       undefined,
+      marketContext:        null,
+      potentialPnl:         0,
+    });
   } catch (err) {
     return NextResponse.json(
-      { ...diag, error: `placeOrder: ${err instanceof Error ? err.message : err}` },
+      { ...diag, error: `executeBuy: ${err instanceof Error ? err.message : err}` },
       { status: 500 }
     );
   }
 
-  diag.status = dryRun ? "DRY_RUN_OK" : "LIVE_ORDER_PLACED";
-  return NextResponse.json(diag);
+  diag.order = {
+    paperTradeId: buyResult.paperTradeId,
+    positionId:   buyResult.positionId,
+    orderId:      buyResult.orderId ?? null,
+    isReal:       buyResult.isReal,
+    gasFeeUsdc:   buyResult.gasFeeUsdc ?? null,
+    submitted:    true,
+  };
+
+  // ── Vérification DB : clob_order_id et is_real bien persistés ─────────────
+  let dbVerification: Record<string, unknown> = { checked: false };
+  try {
+    const positionRow = await getPositionByPaperTradeId(buyResult.paperTradeId);
+
+    if (!positionRow) {
+      dbVerification = {
+        checked: false,
+        error:   `Position introuvable pour paperTradeId=${buyResult.paperTradeId}`,
+        ok:      false,
+      };
+    } else {
+      const clobOrderIdInDb = positionRow.clob_order_id;
+      const isRealInDb      = positionRow.is_real;
+      const clobMatchesApi  = clobOrderIdInDb === (buyResult.orderId ?? null);
+      const ok              = isRealInDb === true && clobOrderIdInDb !== null && clobMatchesApi;
+
+      dbVerification = {
+        checked:         true,
+        positionId:      positionRow.id,
+        isRealInDb,
+        clobOrderIdInDb,
+        clobOrderIdFromApi: buyResult.orderId ?? null,
+        clobMatchesApi,
+        ok,
+        // Verdict lisible
+        verdict: ok
+          ? "✅ clob_order_id et is_real correctement persistés"
+          : [
+              !isRealInDb           ? "❌ is_real est false ou null en DB"               : null,
+              clobOrderIdInDb === null ? "❌ clob_order_id est NULL en DB (bug critique)" : null,
+              !clobMatchesApi       ? "❌ clob_order_id ne correspond pas à l'orderId API" : null,
+            ].filter(Boolean).join(" | "),
+      };
+    }
+  } catch (err) {
+    dbVerification = {
+      checked: false,
+      error:   err instanceof Error ? err.message : String(err),
+      ok:      false,
+    };
+  }
+
+  diag.dbVerification = dbVerification;
+  diag.status = (dbVerification as { ok?: boolean }).ok
+    ? "LIVE_ORDER_PLACED_AND_DB_VERIFIED"
+    : "LIVE_ORDER_PLACED_BUT_DB_VERIFICATION_FAILED";
+
+  return NextResponse.json(
+    diag,
+    { status: (dbVerification as { ok?: boolean }).ok ? 200 : 500 }
+  );
 }

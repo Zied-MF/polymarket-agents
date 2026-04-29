@@ -179,9 +179,15 @@ export async function executeBuy(input: BuyInput): Promise<ExecuteBuyResult> {
 
   const position = await openPosition(positionInput);
 
-  // Marquer is_real sur la position si real trade réussi
-  if (isReal) {
-    await patchIsReal("positions", position.id).catch(() => {});
+  // Marquer is_real + clob_order_id sur la position si real trade réussi.
+  // Ces deux champs DOIVENT être persistés ensemble : clob_order_id est
+  // indispensable pour que cancelOrder() fonctionne lors du sell réel.
+  if (isReal && orderId) {
+    await patchRealPosition(position.id, orderId).catch((err) => {
+      // Erreur critique : sans clob_order_id, le sell réel ne pourra pas
+      // annuler l'ordre. On log en erreur (pas warn) et on alerte Discord.
+      logRealError(`patchRealPosition(${position.id})`, err);
+    });
   }
 
   return {
@@ -212,11 +218,22 @@ export async function executeSell(
 
   if (position.isReal) {
     try {
-      // 1. Annuler l'ordre CLOB si encore ouvert
+      // 1. Annuler l'ordre CLOB si encore ouvert.
+      // Guard explicite : si clob_order_id est null sur une position is_real,
+      // c'est un bug de persistance — on alerte plutôt que de silencer.
       if (position.clobOrderId) {
         await cancelOrder(position.clobOrderId).catch((err) => {
           console.warn(`[trade-executor] cancelOrder non-bloquant: ${err instanceof Error ? err.message : err}`);
         });
+      } else {
+        console.error(
+          `[trade-executor] ⚠ REAL position ${position.id} n'a pas de clob_order_id — ` +
+          `cancelOrder ignoré (bug de persistance lors du buy ?)`
+        );
+        sendDiscordAlert(
+          `⚠️ **clob_order_id manquant** — position \`${position.id}\` (real=true)\n` +
+          `L'ordre CLOB n'a pas pu être annulé. Vérifier manuellement sur Polymarket.`
+        ).catch(() => {});
       }
 
       // 2. Calculer le P&L réel (même formule que paper + gas fee)
@@ -276,9 +293,31 @@ async function patchIsReal(
   table: "paper_trades" | "positions",
   id:   string
 ): Promise<void> {
-  // Import dynamique pour éviter la dépendance circulaire
   const { getClient } = await import("@/lib/db/supabase");
   const db = getClient();
   const { error } = await db.from(table).update({ is_real: true }).eq("id", id);
   if (error) console.warn(`[trade-executor] patchIsReal(${table}/${id}): ${error.message}`);
+}
+
+/**
+ * Patch atomique sur une position réelle :
+ *   is_real = true
+ *   clob_order_id = orderId
+ *
+ * Ces deux champs sont mis à jour ensemble pour garantir la cohérence.
+ * Si clob_order_id n'est pas persisté, cancelOrder() sera inopérant au sell.
+ */
+async function patchRealPosition(positionId: string, orderId: string): Promise<void> {
+  const { getClient } = await import("@/lib/db/supabase");
+  const db = getClient();
+  const { error } = await db
+    .from("positions")
+    .update({ is_real: true, clob_order_id: orderId })
+    .eq("id", positionId);
+
+  if (error) {
+    throw new Error(`patchRealPosition(${positionId}): ${error.message}`);
+  }
+
+  console.log(`[trade-executor] 📝 Position ${positionId.slice(0, 8)} — is_real=true, clob_order_id=${orderId}`);
 }

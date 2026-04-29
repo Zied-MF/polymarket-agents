@@ -31,9 +31,14 @@ import {
   getClobMarket,
   placeOrder,
   cancelOrder,
+  getAccountBalance,
+  checkCTFAllowance,
   type PlacedOrder,
 }                                    from "@/lib/polymarket/clob-api";
-import { sendDiscordAlert }          from "@/lib/utils/discord";
+import {
+  sendDiscordAlert,
+  sendRealTradeBuy,
+}                                    from "@/lib/utils/discord";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -42,6 +47,18 @@ import { sendDiscordAlert }          from "@/lib/utils/discord";
 /** Lit REAL_TRADING_ENABLED à chaque appel (runtime, pas build-time). */
 export function isRealTradingEnabled(): boolean {
   return process.env.REAL_TRADING_ENABLED === "true";
+}
+
+/**
+ * Cache de l'état d'allowance CTF Exchange.
+ * null = pas encore vérifié ; true = OK ; false = insuffisant.
+ * Réinitialisé à null entre les redémarrages du process.
+ */
+let _allowanceOk: boolean | null = null;
+
+/** Réinitialise le cache d'allowance (utile après approveCTF()). */
+export function resetAllowanceCache(): void {
+  _allowanceOk = null;
 }
 
 function logRealError(context: string, err: unknown): void {
@@ -125,6 +142,44 @@ export async function executeBuy(input: BuyInput): Promise<ExecuteBuyResult> {
 
   if (real) {
     try {
+      // ── Guard 1 : Allowance CTF Exchange ──────────────────────────────────
+      // Vérifié une seule fois par process (cache module-level).
+      // Si le wallet n'a pas approuvé le contrat, aucun ordre ne passera.
+      if (_allowanceOk === null) {
+        const { sufficient, allowance } = await checkCTFAllowance();
+        _allowanceOk = sufficient;
+        if (!sufficient) {
+          const msg =
+            `CTF Exchange allowance insuffisante (${(Number(allowance) / 1_000_000).toFixed(2)} USDC). ` +
+            `Appeler approveCTF() depuis /api/test-real-trade ou Supabase Edge Function.`;
+          sendDiscordAlert(
+            `🚨 **Real trading bloqué — allowance insuffisante**\n` +
+            `Wallet n'a pas approuvé CTF Exchange pour dépenser USDC.\n` +
+            `\`approveCTF()\` requis avant tout trade réel.`
+          ).catch(() => {});
+          throw new Error(msg);
+        }
+      } else if (_allowanceOk === false) {
+        throw new Error("CTF Exchange allowance insuffisante (cache) — appeler approveCTF()");
+      }
+
+      // ── Guard 2 : Balance USDC suffisante ─────────────────────────────────
+      // Marge de sécurité 5% pour absorber les micro-variations de frais.
+      const balance    = await getAccountBalance();
+      const minBalance = input.suggestedBet * 1.05;
+      if (balance < minBalance) {
+        const msg =
+          `Insufficient balance: ${balance.toFixed(2)}$ dispo, ` +
+          `${minBalance.toFixed(2)}$ requis (bet=${input.suggestedBet.toFixed(2)}$ + 5% marge)`;
+        sendDiscordAlert(
+          `⚠️ **Real trade skipped: insufficient balance**\n` +
+          `Balance: \`${balance.toFixed(2)} USDC\` — ` +
+          `requis: \`${minBalance.toFixed(2)} USDC\`\n` +
+          `Marché: ${input.question.slice(0, 80)}`
+        ).catch(() => {});
+        throw new Error(msg);
+      }
+
       // 1. Récupérer les token IDs depuis le CLOB
       const clobMarket = await getClobMarket(input.marketId);
       if (!clobMarket) throw new Error(`Marché introuvable dans CLOB: ${input.marketId}`);
@@ -153,6 +208,20 @@ export async function executeBuy(input: BuyInput): Promise<ExecuteBuyResult> {
         `[trade-executor] ✅ REAL BUY placed: ${input.marketId}/${input.outcome} ` +
         `orderId=${placed.orderId} bet=${input.suggestedBet}$ fee=${placed.gasFeeUsdc}$`
       );
+
+      // Notification Discord — trade réel exécuté avec succès (fire-and-forget)
+      sendRealTradeBuy(
+        {
+          question:    input.question,
+          outcome:     input.outcome,
+          agent:       input.agent,
+          marketPrice: input.marketPrice,
+          amountUsdc:  input.suggestedBet,
+          orderId:     placed.orderId,
+          gasFeeUsdc:  placed.gasFeeUsdc,
+        },
+        new Date()
+      ).catch(() => {});
 
       // Marquer is_real=true dans paper_trade (best-effort)
       await patchIsReal("paper_trades", paperTrade.id).catch(() => {});

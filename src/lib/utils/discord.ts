@@ -324,6 +324,55 @@ export async function sendSellSignals(
   }
 }
 
+// ---------------------------------------------------------------------------
+// Real trade buy notification
+// ---------------------------------------------------------------------------
+
+export interface RealTradeBuyNotification {
+  question:    string;
+  outcome:     string;
+  agent:       "weather" | "finance" | "crypto";
+  marketPrice: number;
+  amountUsdc:  number;
+  orderId:     string;
+  gasFeeUsdc:  number;
+}
+
+/**
+ * Envoie un embed Discord vert pour confirmer un trade réel exécuté avec succès.
+ * Fire-and-forget depuis trade-executor — ne bloque pas le scan.
+ */
+export async function sendRealTradeBuy(
+  trade:     RealTradeBuyNotification,
+  placedAt:  Date
+): Promise<void> {
+  const webhookUrl = process.env.DISCORD_WEBHOOK_URL;
+  if (!webhookUrl) return;
+
+  const embed: DiscordEmbed = {
+    title: `✅ REAL TRADE — ${trade.question.slice(0, 60)}`,
+    color: 0x2ecc71, // vert
+    fields: [
+      { name: "🎯 Outcome",    value: trade.outcome,                                      inline: true  },
+      { name: "🤖 Agent",      value: trade.agent,                                        inline: true  },
+      { name: "💰 Prix",       value: `${(trade.marketPrice * 100).toFixed(1)}%`,         inline: true  },
+      { name: "💵 Mise",       value: `${trade.amountUsdc.toFixed(2)} USDC`,              inline: true  },
+      { name: "⛽ Gas",        value: `${trade.gasFeeUsdc.toFixed(3)} USDC`,              inline: true  },
+      { name: "🔑 Order ID",   value: `\`${trade.orderId.slice(0, 20)}…\``,               inline: false },
+    ],
+    footer: {
+      text: `Ordre placé à ${placedAt.toLocaleString("fr-FR", { timeZone: "UTC", timeZoneName: "short" })}`,
+    },
+  };
+
+  try {
+    await postWebhook(webhookUrl, { username: "Polymarket Real Trader", embeds: [embed] });
+    console.log(`[discord] ✅ Real trade notification envoyée (${trade.orderId})`);
+  } catch (err) {
+    console.error("[discord] ✗ Échec real trade notification :", err instanceof Error ? err.message : err);
+  }
+}
+
 export async function sendDiscordNotification(
   opportunities: OpportunityNotification[],
   scannedAt: Date

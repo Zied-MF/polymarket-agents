@@ -13,8 +13,10 @@
  * Dépendances : viem (déjà installé), node:crypto (Node.js built-in)
  */
 
-import { createHmac } from "crypto";
-import { privateKeyToAccount } from "viem/accounts";
+import { createHmac }                                          from "crypto";
+import { privateKeyToAccount }                                  from "viem/accounts";
+import { createPublicClient, createWalletClient, http }         from "viem";
+import { polygon }                                              from "viem/chains";
 
 // ---------------------------------------------------------------------------
 // Constantes réseau Polygon / Polymarket
@@ -26,9 +28,30 @@ const USDC_DECIMALS       = 1_000_000;   // 10^6
 const POLYGON_GAS_FEE     = 0.01;        // ~0.01 USDC par transaction (Polygon = très cheap)
 
 /** Contrat CTF Exchange standard (marchés binaires Yes/No). */
-const CTF_EXCHANGE        = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E" as const;
+const CTF_EXCHANGE          = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E" as const;
 /** Contrat pour les marchés negRisk (multi-choix). */
 const NEG_RISK_CTF_EXCHANGE = "0xC5d563A36AE78145C45a50134d48A1215220f80a" as const;
+/** USDC natif sur Polygon (utilisé par Polymarket). */
+const USDC_ADDRESS          = "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359" as `0x${string}`;
+/** uint256 max — allowance illimitée. */
+const MAX_UINT256           = BigInt("0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+
+/** ABI minimal ERC-20 pour lire/écrire l'allowance. */
+const ERC20_ABI = [
+  {
+    name: "allowance", type: "function", stateMutability: "view",
+    inputs:  [{ name: "owner", type: "address" }, { name: "spender", type: "address" }],
+    outputs: [{ type: "uint256" }],
+  },
+  {
+    name: "approve", type: "function", stateMutability: "nonpayable",
+    inputs:  [{ name: "spender", type: "address" }, { name: "amount", type: "uint256" }],
+    outputs: [{ type: "bool" }],
+  },
+] as const;
+
+/** Polygon RPC public (override via POLYGON_RPC_URL). */
+const POLYGON_RPC = () => process.env.POLYGON_RPC_URL ?? "https://polygon-rpc.com";
 
 /** Types EIP-712 pour la signature d'un ordre CTF Exchange. */
 const ORDER_EIP712_TYPES = {
@@ -557,4 +580,90 @@ export async function getAccountBalance(): Promise<number> {
 
   const data = await res.json() as { balance?: string | number };
   return parseFloat(String(data.balance ?? "0"));
+}
+
+// ---------------------------------------------------------------------------
+// checkCTFAllowance
+// ---------------------------------------------------------------------------
+
+export interface AllowanceResult {
+  /** Allowance actuelle en micro-USDC (10^6). */
+  allowance:  bigint;
+  /** true si allowance > 1 000 USDC (seuil arbitraire "prêt à trader"). */
+  sufficient: boolean;
+  /** Adresse du wallet vérifié. */
+  owner:      string;
+  /** Adresse du spender vérifié (CTF Exchange). */
+  spender:    string;
+}
+
+/**
+ * Lit l'allowance USDC accordée au CTF Exchange sur Polygon.
+ *
+ * À appeler au démarrage du bot (REAL_TRADING_ENABLED=true) pour s'assurer
+ * que le wallet a approuvé le contrat avant de tenter tout trade réel.
+ *
+ * Pré-requis : POLYGON_PRIVATE_KEY défini.
+ * Optionnel  : POLYGON_RPC_URL (fallback : https://polygon-rpc.com).
+ */
+export async function checkCTFAllowance(): Promise<AllowanceResult> {
+  const privateKey = process.env.POLYGON_PRIVATE_KEY;
+  if (!privateKey) throw new Error("[clob] POLYGON_PRIVATE_KEY non défini");
+
+  const account = getAccount(privateKey);
+  const client  = createPublicClient({ chain: polygon, transport: http(POLYGON_RPC()) });
+
+  const allowance = await client.readContract({
+    address:      USDC_ADDRESS,
+    abi:          ERC20_ABI,
+    functionName: "allowance",
+    args:         [account.address, CTF_EXCHANGE],
+  }) as bigint;
+
+  // Seuil : 1 000 USDC en micro-USDC
+  const sufficient = allowance > BigInt(1_000 * USDC_DECIMALS);
+
+  console.log(
+    `[clob] checkCTFAllowance: ${account.address} → CTF_EXCHANGE ` +
+    `allowance=${(Number(allowance) / USDC_DECIMALS).toFixed(2)} USDC ` +
+    `(${sufficient ? "✅ sufficient" : "❌ INSUFFICIENT"})`
+  );
+
+  return { allowance, sufficient, owner: account.address, spender: CTF_EXCHANGE };
+}
+
+// ---------------------------------------------------------------------------
+// approveCTF
+// ---------------------------------------------------------------------------
+
+/**
+ * Soumet une transaction `approve(CTF_EXCHANGE, MAX_UINT256)` sur le contrat USDC.
+ *
+ * À n'appeler qu'une seule fois, manuellement, avant d'activer le real trading.
+ * Retourne le hash de la transaction.
+ *
+ * ⚠️  Nécessite que le wallet ait du MATIC pour payer le gas Polygon (~0.001$).
+ */
+export async function approveCTF(): Promise<string> {
+  const privateKey = process.env.POLYGON_PRIVATE_KEY;
+  if (!privateKey) throw new Error("[clob] POLYGON_PRIVATE_KEY non défini");
+
+  const account      = getAccount(privateKey);
+  const walletClient = createWalletClient({
+    account,
+    chain:     polygon,
+    transport: http(POLYGON_RPC()),
+  });
+
+  console.log(`[clob] approveCTF: approve(${CTF_EXCHANGE}, MAX_UINT256) depuis ${account.address}`);
+
+  const txHash = await walletClient.writeContract({
+    address:      USDC_ADDRESS,
+    abi:          ERC20_ABI,
+    functionName: "approve",
+    args:         [CTF_EXCHANGE, MAX_UINT256],
+  });
+
+  console.log(`[clob] ✅ Approval soumise: txHash=${txHash}`);
+  return txHash;
 }

@@ -124,12 +124,14 @@ export interface PaperTradeRow {
   outcome_match: boolean | null;
   /** true une fois que le post-mortem a été généré pour ce trade. */
   post_mortem_done: boolean | null;
+  /** true si ce trade a été exécuté en réel (CLOB Polymarket). false = paper only. */
+  is_real: boolean | null;
 }
 
 export type SavePaperTradeInput = Omit<
   PaperTradeRow,
   // Champs auto-générés ou remplis à la résolution
-  "id" | "created_at" | "actual_result" | "won" | "resolved_at" | "polymarket_outcome" | "outcome_match" | "post_mortem_done"
+  "id" | "created_at" | "actual_result" | "won" | "resolved_at" | "polymarket_outcome" | "outcome_match" | "post_mortem_done" | "is_real"
 >;
 
 export type SaveBetInput = {

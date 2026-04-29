@@ -35,6 +35,11 @@
  *
  *   CREATE INDEX positions_status_idx ON positions(status);
  *   CREATE INDEX positions_market_id_idx ON positions(market_id);
+ *
+ *   -- Colonnes real trading (à ajouter si la table existe déjà) :
+ *   ALTER TABLE positions    ADD COLUMN IF NOT EXISTS is_real        BOOLEAN DEFAULT false;
+ *   ALTER TABLE positions    ADD COLUMN IF NOT EXISTS clob_order_id  TEXT;
+ *   ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS is_real        BOOLEAN DEFAULT false;
  */
 
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
@@ -92,6 +97,10 @@ export interface PositionRow {
   sell_pnl: number | null;
   opened_at: string;
   resolution_date: string | null;
+  /** true si la position a été placée en réel sur le CLOB Polymarket. */
+  is_real: boolean | null;
+  /** Order ID CLOB — permet d'annuler l'ordre lors d'un sell réel. */
+  clob_order_id: string | null;
 }
 
 export type OpenPositionInput = {
@@ -131,6 +140,8 @@ function rowToPosition(row: PositionRow): Position {
     sellReason:          row.sell_reason,
     openedAt:            new Date(row.opened_at),
     resolutionDate:      row.resolution_date ? new Date(row.resolution_date) : null,
+    isReal:              row.is_real,
+    clobOrderId:         row.clob_order_id,
   };
 }
 

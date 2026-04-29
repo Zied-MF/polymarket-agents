@@ -113,6 +113,20 @@ function buildEmbed(opp: OpportunityNotification, scannedAt: Date): DiscordEmbed
 // Envoi HTTP
 // ---------------------------------------------------------------------------
 
+/**
+ * Envoie un message texte brut (contenu Markdown).
+ * Utilisé par trade-executor pour les alertes d'erreur real-trading.
+ */
+export async function sendDiscordAlert(content: string): Promise<void> {
+  const webhookUrl = process.env.DISCORD_WEBHOOK_URL;
+  if (!webhookUrl) return;
+  await fetch(webhookUrl, {
+    method:  "POST",
+    headers: { "Content-Type": "application/json" },
+    body:    JSON.stringify({ username: "WeatherBot", content }),
+  });
+}
+
 /** Envoie un seul payload webhook. Throw si Discord répond avec une erreur. */
 async function postWebhook(
   webhookUrl: string,

@@ -40,6 +40,10 @@ export interface Position {
   resolutionDate:     Date | null;
   /** Peak P&L % observed since entry — for trailing stop (Layer 5). Null if not tracked. */
   peakPnlPercent?:    number | null;
+  /** true si placée en réel sur le CLOB Polymarket. */
+  isReal?:            boolean | null;
+  /** CLOB order ID pour annulation lors du sell réel. */
+  clobOrderId?:       string | null;
 }
 
 /** Snapshot des prix actuels d'un marché Polymarket. */

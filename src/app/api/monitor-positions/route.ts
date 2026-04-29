@@ -14,7 +14,8 @@
 
 import { NextResponse }                          from "next/server";
 import { evaluatePosition, type MarketSnapshot } from "@/lib/positions/position-manager";
-import { getOpenPositions, updatePosition, executeSell, markPaperTradeSold } from "@/lib/db/positions";
+import { getOpenPositions, updatePosition, markPaperTradeSold } from "@/lib/db/positions";
+import { executeSell } from "@/lib/trade-executor";
 import { sendSellSignals, type SellSignalNotification } from "@/lib/utils/discord";
 
 // ---------------------------------------------------------------------------
@@ -250,10 +251,8 @@ export async function GET(): Promise<NextResponse<MonitorResult>> {
 
       try {
         const sellPnl = await executeSell(
-          position.id,
+          position,
           signal.currentPrice,
-          position.entryPrice,
-          position.suggestedBet,
           signal.reason
         );
 

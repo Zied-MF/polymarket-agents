@@ -24,13 +24,12 @@ import {
   saveOpportunity,
   getRecentOpportunities,
   incrementDailyOpportunities,
-  savePaperTrade,
   acquireScanLock,
   releaseScanLock,
   getCurrentBankroll,
 }                                          from "@/lib/db/supabase";
 import { cleanOldLogs }                    from "@/lib/logger";
-import { openPosition }                    from "@/lib/db/positions";
+import { executeBuy }                      from "@/lib/trade-executor";
 import type { Opportunity, SkippedMarket, AgentStats } from "@/lib/agents/orchestrator";
 import { getBotState, updateLastScan }     from "@/lib/bot/bot-state";
 import { logActivity }                     from "@/lib/logger";
@@ -181,53 +180,35 @@ export async function GET(): Promise<NextResponse<ScanResult | { status: string;
         errors.push({ marketId: opp.marketId, question: opp.question, error: msg });
       }
 
-      // 2b. paper_trades + positions
+      // 2b. paper_trade + position (+ ordre CLOB réel si REAL_TRADING_ENABLED)
       try {
-        const paperTrade = await savePaperTrade({
-          market_id:             opp.marketId,
-          question:              opp.question,
-          city:                  opp.city ?? null,
-          ticker:                opp.ticker ?? null,
-          agent:                 opp.agent,
-          outcome:               opp.outcome,
-          market_price:          opp.marketPrice,
-          estimated_probability: opp.estimatedProbability,
-          edge:                  opp.edge,
-          suggested_bet:         opp.suggestedBet,
-          confidence:            opp.confidence ?? null,
-          resolution_date:       opp.targetDate ?? null,
-          potential_pnl:         potentialPnl,
-          market_context:        opp.marketContext ?? null,
-          expected_resolution:   opp.targetDateTime ?? null,
+        const result = await executeBuy({
+          marketId:             opp.marketId,
+          question:             opp.question,
+          city:                 opp.city ?? null,
+          ticker:               opp.ticker ?? null,
+          agent:                opp.agent,
+          outcome:              opp.outcome,
+          marketPrice:          opp.marketPrice,
+          estimatedProbability: opp.estimatedProbability,
+          edge:                 opp.edge,
+          suggestedBet:         opp.suggestedBet,
+          confidence:           opp.confidence ?? null,
+          targetDate:           opp.targetDate,
+          targetDateTime:       opp.targetDateTime,
+          marketContext:        opp.marketContext ?? null,
+          potentialPnl,
         });
-        console.log(`[scan-markets] 🃏 Paper trade : ${opp.marketId}/${opp.outcome}`);
-
-        try {
-          await openPosition({
-            paperTradeId:     paperTrade.id,
-            marketId:         opp.marketId,
-            question:         opp.question,
-            city:             opp.city ?? null,
-            ticker:           opp.ticker ?? null,
-            agent:            opp.agent,
-            outcome:          opp.outcome,
-            entryPrice:       opp.marketPrice,
-            entryProbability: opp.estimatedProbability,
-            suggestedBet:     opp.suggestedBet,
-            resolutionDate:   opp.targetDate ?? null,
-          });
-          console.log(`[scan-markets] 📍 Position ouverte : ${opp.marketId}/${opp.outcome}`);
-        } catch (err) {
-          console.error(
-            `[scan-markets] ✗ openPosition (${opp.marketId}/${opp.outcome}) :`,
-            err instanceof Error ? err.message : err
-          );
-        }
+        console.log(
+          `[scan-markets] 🃏 Trade enregistré : ${opp.marketId}/${opp.outcome} ` +
+          `(paperTradeId=${result.paperTradeId.slice(0, 8)}, positionId=${result.positionId.slice(0, 8)}, ` +
+          `real=${result.isReal})`
+        );
 
         savedCount++;
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
-        console.error(`[scan-markets] ✗ savePaperTrade (${opp.marketId}/${opp.outcome}) :`, msg);
+        console.error(`[scan-markets] ✗ executeBuy (${opp.marketId}/${opp.outcome}) :`, msg);
         errors.push({ marketId: opp.marketId, question: opp.question, error: msg });
       }
     }

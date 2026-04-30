@@ -20,11 +20,11 @@ import { createPublicClient, createWalletClient, http }          from "viem";
 import { polygon }                                               from "viem/chains";
 import {
   ClobClient,
-  SignatureType,
-  Side      as ClobSide,
-  OrderType as ClobOrderType,
-  Chain     as ClobChain,
-}                                                                from "@polymarket/clob-client";
+  SignatureTypeV2,
+  Side        as ClobSide,
+  OrderType   as ClobOrderType,
+  Chain       as ClobChain,
+}                                                                from "@polymarket/clob-client-v2";
 
 // ---------------------------------------------------------------------------
 // Constantes réseau Polygon / Polymarket
@@ -179,8 +179,8 @@ async function getClobClient(): Promise<ClobClient> {
   const account     = getAccount(privateKey);
   const detection   = await detectTradingMode(account.address);
   const sigType     = detection.selectedMode === "A_PROXY"
-    ? SignatureType.POLY_PROXY
-    : SignatureType.EOA;
+    ? SignatureTypeV2.POLY_PROXY
+    : SignatureTypeV2.EOA;
   const funder      = detection.selectedMode === "A_PROXY" && detection.proxyAddress
     ? detection.proxyAddress
     : undefined;
@@ -198,31 +198,27 @@ async function getClobClient(): Promise<ClobClient> {
   });
 
   // Étape 1 : dériver les clés API (L1 auth via signer)
-  const tempClient = new ClobClient(CLOB_BASE, POLYGON_CHAIN_ID, walletClient);
+  // V2 : constructeur options object ({ host, chain, signer, … })
+  const tempClient = new ClobClient({ host: CLOB_BASE, chain: POLYGON_CHAIN_ID, signer: walletClient });
   const creds      = await tempClient.deriveApiKey();
 
   // Étape 2 : client complet avec creds + mode de signature
   // throwOnError=true : les erreurs HTTP Polymarket (400/403/…) sont levées
   // avec le message d'erreur exact au lieu d'être silencieusement retournées.
-  _cachedClient     = new ClobClient(
-    CLOB_BASE, POLYGON_CHAIN_ID,
-    walletClient,
-    { key: creds.key, secret: creds.secret, passphrase: creds.passphrase },
-    sigType,
-    funder,
-    undefined, // geoBlockToken
-    undefined, // useServerTime
-    undefined, // builderConfig
-    undefined, // getSigner
-    undefined, // retryOnError
-    undefined, // tickSizeTtlMs
-    true        // throwOnError ← expose les erreurs HTTP Polymarket
-  );
+  _cachedClient     = new ClobClient({
+    host:          CLOB_BASE,
+    chain:         POLYGON_CHAIN_ID,
+    signer:        walletClient,
+    creds:         { key: creds.key, secret: creds.secret, passphrase: creds.passphrase },
+    signatureType: sigType,
+    funderAddress: funder,
+    throwOnError:  true,
+  });
   _cachedClientMode = detection.selectedMode;
 
   console.log(
-    `[clob] ✅ ClobClient initialisé: mode=${detection.selectedMode} ` +
-    `sigType=${sigType}(${SignatureType[sigType]}) ` +
+    `[clob] ✅ ClobClient V2 initialisé: mode=${detection.selectedMode} ` +
+    `sigType=${sigType}(${SignatureTypeV2[sigType]}) ` +
     `maker=${funder ?? account.address}`
   );
 
@@ -246,7 +242,7 @@ export async function deriveClobCredentials(privateKey?: string): Promise<ClobCr
     account, chain: polygon, transport: http(POLYGON_RPC()),
   });
 
-  const tmp   = new ClobClient(CLOB_BASE, POLYGON_CHAIN_ID, walletClient);
+  const tmp   = new ClobClient({ host: CLOB_BASE, chain: POLYGON_CHAIN_ID, signer: walletClient });
   const creds = await tmp.deriveApiKey();
 
   _cachedCreds = {

@@ -786,32 +786,44 @@ export interface AllowanceResult {
  * que le wallet a approuvé le contrat avant de tenter tout trade réel.
  *
  * Pré-requis : POLYGON_PRIVATE_KEY défini.
- * Optionnel  : POLYGON_RPC_URL (fallback : https://polygon-rpc.com).
+ * Optionnel  : POLYGON_RPC_URL — si défini (ex. Alchemy), utilisé en premier.
+ *              Fallback sur plusieurs RPCs publics si non défini.
  */
 export async function checkCTFAllowance(): Promise<AllowanceResult> {
   const privateKey = process.env.POLYGON_PRIVATE_KEY;
   if (!privateKey) throw new Error("[clob] POLYGON_PRIVATE_KEY non défini");
 
   const account = getAccount(privateKey);
-  const client  = createPublicClient({ chain: polygon, transport: http(POLYGON_RPC()) });
+  let lastErr: Error = new Error("no RPC tried");
 
-  const allowance = await client.readContract({
-    address:      USDC_ADDRESS,
-    abi:          ERC20_ABI,
-    functionName: "allowance",
-    args:         [account.address, CTF_EXCHANGE],
-  }) as bigint;
+  for (const rpc of POLYGON_RPC_FALLBACKS()) {
+    try {
+      const client = createPublicClient({ chain: polygon, transport: http(rpc) });
 
-  // Seuil : 1 000 USDC en micro-USDC
-  const sufficient = allowance > BigInt(1_000 * USDC_DECIMALS);
+      const allowance = await client.readContract({
+        address:      USDC_ADDRESS,
+        abi:          ERC20_ABI,
+        functionName: "allowance",
+        args:         [account.address, CTF_EXCHANGE],
+      }) as bigint;
 
-  console.log(
-    `[clob] checkCTFAllowance: ${account.address} → CTF_EXCHANGE ` +
-    `allowance=${(Number(allowance) / USDC_DECIMALS).toFixed(2)} USDC ` +
-    `(${sufficient ? "✅ sufficient" : "❌ INSUFFICIENT"})`
-  );
+      // Seuil : 1 000 USDC en micro-USDC
+      const sufficient = allowance > BigInt(1_000 * USDC_DECIMALS);
 
-  return { allowance, sufficient, owner: account.address, spender: CTF_EXCHANGE };
+      console.log(
+        `[clob] checkCTFAllowance (rpc=${rpc}): ${account.address} → CTF_EXCHANGE ` +
+        `allowance=${(Number(allowance) / USDC_DECIMALS).toFixed(2)} USDC ` +
+        `(${sufficient ? "✅ sufficient" : "❌ INSUFFICIENT"})`
+      );
+
+      return { allowance, sufficient, owner: account.address, spender: CTF_EXCHANGE };
+    } catch (err) {
+      lastErr = err instanceof Error ? err : new Error(String(err));
+      console.warn(`[clob] checkCTFAllowance RPC ${rpc} failed: ${lastErr.message}`);
+    }
+  }
+
+  throw new Error(`[clob] checkCTFAllowance: all RPCs failed — ${lastErr.message}`);
 }
 
 // ---------------------------------------------------------------------------

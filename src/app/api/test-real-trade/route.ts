@@ -224,6 +224,27 @@ async function findMarketForTest(): Promise<MarketSearchDiag> {
 }
 
 // ---------------------------------------------------------------------------
+// Geoblock check
+// ---------------------------------------------------------------------------
+
+async function checkGeoblock(): Promise<{ blocked: boolean | null; country: string | null; region: string | null; raw: unknown }> {
+  const result = { blocked: null as boolean | null, country: null as string | null, region: null as string | null, raw: null as unknown };
+  try {
+    const res  = await fetch("https://polymarket.com/api/geoblock", {
+      headers: { "User-Agent": "polymarket-agents/diagnostic", Accept: "application/json" },
+    });
+    const body = await res.json() as Record<string, unknown>;
+    result.raw     = body;
+    result.blocked = (body.blocked ?? body.isBlocked ?? null) as boolean | null;
+    result.country = (body.country ?? body.countryCode ?? null) as string | null;
+    result.region  = (body.region ?? null) as string | null;
+  } catch (err) {
+    result.raw = { error: err instanceof Error ? err.message : String(err) };
+  }
+  return result;
+}
+
+// ---------------------------------------------------------------------------
 // Handler
 // ---------------------------------------------------------------------------
 
@@ -252,6 +273,7 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
   const diag: Record<string, unknown> = {
     dryRun,
     timestamp:       new Date().toISOString(),
+    vercelRegion:    process.env.VERCEL_REGION ?? process.env.AWS_REGION ?? "(local)",
     envVarCheck,
     realTradingFlow, // référence partagée — mutations visibles dans la réponse finale
   };
@@ -288,23 +310,19 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
     diag.balanceError = err instanceof Error ? err.message : String(err);
   }
 
-  // 3b. Trading mode detection + allowance debug — TOUJOURS dans la réponse.
-  // detectTradingMode() lit allowances EOA + proxy et choisit A_PROXY / B_EOA.
-  // debugAllowances() fournit les valeurs raw pour diagnostic.
-  try {
-    const creds = await deriveClobCredentials(privateKey).catch(() => null);
-    const eoa   = (creds?.address ?? "") as `0x${string}`;
-    if (eoa) {
-      diag.tradingModeDetection = await detectTradingMode(eoa);
-    }
-  } catch (err) {
-    diag.tradingModeDetection = { error: err instanceof Error ? err.message : String(err) };
-  }
-  try {
-    diag.allowanceDebug = await debugAllowances();
-  } catch (err) {
-    diag.allowanceDebug = { error: err instanceof Error ? err.message : String(err) };
-  }
+  // 3b. Trading mode detection + allowance debug + geoblock — TOUJOURS dans la réponse.
+  const [tradingMode, allowanceDbg, geoBlock] = await Promise.allSettled([
+    (async () => {
+      const creds = await deriveClobCredentials(privateKey).catch(() => null);
+      const eoa   = (creds?.address ?? "") as `0x${string}`;
+      return eoa ? detectTradingMode(eoa) : null;
+    })(),
+    debugAllowances(),
+    checkGeoblock(),
+  ]);
+  diag.tradingModeDetection = tradingMode.status === "fulfilled" ? tradingMode.value : { error: (tradingMode as PromiseRejectedResult).reason?.message };
+  diag.allowanceDebug       = allowanceDbg.status === "fulfilled" ? allowanceDbg.value : { error: (allowanceDbg as PromiseRejectedResult).reason?.message };
+  diag.geoBlockCheck        = geoBlock.status === "fulfilled" ? geoBlock.value : { error: (geoBlock as PromiseRejectedResult).reason?.message };
 
   // 4. Chercher un marché (3 passes, de plus en plus larges)
   const searchDiag = await findMarketForTest();
@@ -502,9 +520,18 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
     const modeDetected = diag.tradingModeDetection as { selectedMode?: string } | undefined;
     realTradingFlow.selectedTradingMode = modeDetected?.selectedMode ?? "unknown";
   } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
     realTradingFlow.step       = "FAILED_place_order";
-    realTradingFlow.error      = err instanceof Error ? err.message : String(err);
+    realTradingFlow.error      = msg;
     realTradingFlow.errorStack = err instanceof Error ? err.stack?.slice(0, 800) : null;
+    // Surface geo-blocking hint if 403
+    if (msg.includes("403") || msg.includes("Forbidden")) {
+      realTradingFlow.hint =
+        "HTTP 403 Forbidden — likely geo-blocking. " +
+        `vercelRegion=${diag.vercelRegion}. ` +
+        `geoBlock=${JSON.stringify(diag.geoBlockCheck)}. ` +
+        "Fix: set \"regions\": [\"fra1\"] in vercel.json (Frankfurt, EU).";
+    }
     diag.status = "REAL_FAILED_PLACE_ORDER";
     return NextResponse.json(diag, { status: 500 });
   }

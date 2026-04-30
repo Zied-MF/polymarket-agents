@@ -50,15 +50,17 @@ export function isRealTradingEnabled(): boolean {
 }
 
 /**
- * Cache de l'état d'allowance CTF Exchange.
+ * Cache de l'état d'allowance par type de marché (CTF normal vs NegRisk).
  * null = pas encore vérifié ; true = OK ; false = insuffisant.
  * Réinitialisé à null entre les redémarrages du process.
  */
-let _allowanceOk: boolean | null = null;
+let _allowanceOkCTF:     boolean | null = null;
+let _allowanceOkNegRisk: boolean | null = null;
 
 /** Réinitialise le cache d'allowance (utile après approveCTF()). */
 export function resetAllowanceCache(): void {
-  _allowanceOk = null;
+  _allowanceOkCTF     = null;
+  _allowanceOkNegRisk = null;
 }
 
 function logRealError(context: string, err: unknown): void {
@@ -147,25 +149,35 @@ export async function executeBuy(input: BuyInput): Promise<ExecuteBuyResult> {
       `market=${input.marketId} outcome=${input.outcome} bet=${input.suggestedBet}`
     );
     try {
-      // ── Guard 1 : Allowance CTF Exchange ──────────────────────────────────
-      // Vérifié une seule fois par process (cache module-level).
-      // Si le wallet n'a pas approuvé le contrat, aucun ordre ne passera.
-      if (_allowanceOk === null) {
-        const { sufficient, allowance } = await checkCTFAllowance();
-        _allowanceOk = sufficient;
+      // 0. Récupérer les données du marché (nécessaire pour negRisk + token IDs)
+      const clobMarket = await getClobMarket(input.marketId);
+      if (!clobMarket) throw new Error(`Marché introuvable dans CLOB: ${input.marketId}`);
+      if (!clobMarket.active) throw new Error(`Marché CLOB inactif: ${input.marketId}`);
+
+      const negRisk       = clobMarket.negRisk;
+      const allowanceCache = negRisk ? _allowanceOkNegRisk : _allowanceOkCTF;
+      const contractName  = negRisk ? "NegRisk CTF Exchange" : "CTF Exchange";
+
+      // ── Guard 1 : Allowance spender correct selon type de marché ──────────
+      // negRisk=true  → NegRisk CTF Exchange (0xC5d5…)
+      // negRisk=false → CTF Exchange         (0x4bFb…)
+      if (allowanceCache === null) {
+        const { sufficient, allowance } = await checkCTFAllowance(negRisk);
+        if (negRisk) _allowanceOkNegRisk = sufficient;
+        else         _allowanceOkCTF     = sufficient;
         if (!sufficient) {
           const msg =
-            `CTF Exchange allowance insuffisante (${(Number(allowance) / 1_000_000).toFixed(2)} USDC). ` +
-            `Appeler approveCTF() depuis /api/test-real-trade ou Supabase Edge Function.`;
+            `${contractName} allowance insuffisante (${(Number(allowance) / 1_000_000).toFixed(2)} USDC). ` +
+            `Appeler approveCTF() depuis /api/approve-ctf?execute=true.`;
           sendDiscordAlert(
             `🚨 **Real trading bloqué — allowance insuffisante**\n` +
-            `Wallet n'a pas approuvé CTF Exchange pour dépenser USDC.\n` +
-            `\`approveCTF()\` requis avant tout trade réel.`
+            `Wallet n'a pas approuvé ${contractName} pour dépenser USDC.\n` +
+            `\`GET /api/approve-ctf?execute=true\` requis avant tout trade réel.`
           ).catch(() => {});
           throw new Error(msg);
         }
-      } else if (_allowanceOk === false) {
-        throw new Error("CTF Exchange allowance insuffisante (cache) — appeler approveCTF()");
+      } else if (allowanceCache === false) {
+        throw new Error(`${contractName} allowance insuffisante (cache) — appeler /api/approve-ctf?execute=true`);
       }
 
       // ── Guard 2 : Balance USDC suffisante ─────────────────────────────────
@@ -198,17 +210,12 @@ export async function executeBuy(input: BuyInput): Promise<ExecuteBuyResult> {
         throw new Error(msg);
       }
 
-      // 1. Récupérer les token IDs depuis le CLOB
-      const clobMarket = await getClobMarket(input.marketId);
-      if (!clobMarket) throw new Error(`Marché introuvable dans CLOB: ${input.marketId}`);
-      if (!clobMarket.active) throw new Error(`Marché CLOB inactif: ${input.marketId}`);
-
       const token = clobMarket.tokens.find(
         (t) => t.outcome.toLowerCase() === input.outcome.toLowerCase()
       );
       if (!token) throw new Error(`Token introuvable pour outcome "${input.outcome}"`);
 
-      // 2. Placer l'ordre limit GTC
+      // 1. Placer l'ordre limit GTC
       const placed: PlacedOrder = await placeOrder({
         tokenId:    token.tokenId,
         side:       "BUY",

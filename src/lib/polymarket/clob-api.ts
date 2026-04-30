@@ -606,20 +606,29 @@ export async function checkAllAllowances(): Promise<SpenderAllowance[]> {
   throw new Error(`[clob] checkAllAllowances: all RPCs failed — ${lastErr.message}`);
 }
 
-export async function checkCTFAllowance(): Promise<AllowanceResult> {
+/**
+ * Vérifie que le wallet a approuvé le bon spender pour le type de marché.
+ *  - negRisk=false → CTF Exchange           (0x4bFb…)
+ *  - negRisk=true  → NegRisk CTF Exchange   (0xC5d5…)
+ */
+export async function checkCTFAllowance(negRisk = false): Promise<AllowanceResult> {
   const privateKey = process.env.POLYGON_PRIVATE_KEY;
   if (!privateKey) throw new Error("[clob] POLYGON_PRIVATE_KEY non défini");
 
-  const account = getAccount(privateKey);
-  const all     = await checkAllAllowances();
-  const sufficient = all.every((a) => a.sufficient);
-  const ctf        = all.find((a) => a.spender === CTF_EXCHANGE);
-  const allowance  = ctf ? BigInt(Math.floor(ctf.allowanceUsdc * USDC_DECIMALS)) : BigInt(0);
+  const account  = getAccount(privateKey);
+  const spender  = negRisk ? NEG_RISK_CTF_EXCHANGE : CTF_EXCHANGE;
+  const name     = negRisk ? "NegRisk CTF Exchange" : "CTF Exchange";
+  const all      = await checkAllAllowances();
+  const entry    = all.find((a) => a.spender.toLowerCase() === spender.toLowerCase());
+  const sufficient = entry?.sufficient ?? false;
+  const allowance  = entry ? BigInt(Math.floor(entry.allowanceUsdc * USDC_DECIMALS)) : BigInt(0);
 
   if (!sufficient) {
-    console.warn(`[clob] checkCTFAllowance: missing for: ${all.filter((a) => !a.sufficient).map((a) => a.name).join(", ")}`);
+    console.warn(`[clob] checkCTFAllowance(negRisk=${negRisk}): allowance insuffisante pour ${name} (${entry?.allowanceUsdc?.toFixed(2) ?? "0"} USDC)`);
+  } else {
+    console.log(`[clob] checkCTFAllowance(negRisk=${negRisk}): ✅ ${name} OK (${entry?.allowanceUsdc?.toFixed(2)} USDC)`);
   }
-  return { allowance, sufficient, owner: account.address, spender: CTF_EXCHANGE };
+  return { allowance, sufficient, owner: account.address, spender };
 }
 
 // ---------------------------------------------------------------------------

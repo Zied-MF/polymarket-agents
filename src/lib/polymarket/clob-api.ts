@@ -38,6 +38,7 @@ const POLYGON_GAS_FEE  = 0.01;              // estimation Polygon (~2 tx)
 const CTF_EXCHANGE          = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E" as `0x${string}`;
 const NEG_RISK_CTF_EXCHANGE = "0xC5d563A36AE78145C45a50134d48A1215220f80a" as `0x${string}`;
 const USDC_ADDRESS          = "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359" as `0x${string}`;
+const PUSD_ADDRESS          = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB" as `0x${string}`; // Polymarket V2 pUSD
 const MAX_UINT256           = BigInt("0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
 
 const PROXY_FACTORY_ADDRESS = "0xaB45c5A4B0c941a2F231C6058491B37517764437" as `0x${string}`;
@@ -583,9 +584,10 @@ export async function getAccountBalance(): Promise<number | null> {
       const client = createPublicClient({ chain: polygon, transport: http(rpc) });
 
       if (envFunder) {
-        const raw     = await client.readContract({ address: USDC_ADDRESS, abi: ERC20_ABI, functionName: "balanceOf", args: [envFunder] }) as bigint;
-        const balance = Number(raw) / USDC_DECIMALS;
-        console.log(`[clob] getAccountBalance (env funder ${envFunder.slice(0, 10)}…): ${balance.toFixed(4)} USDC`);
+        // Funder Polymarket V2 détient du pUSD (0xC011a7…), pas de l'USDC natif
+        const raw     = await client.readContract({ address: PUSD_ADDRESS, abi: ERC20_ABI, functionName: "balanceOf", args: [envFunder] }) as bigint;
+        const balance = Number(raw) / USDC_DECIMALS; // pUSD = 6 decimals comme USDC
+        console.log(`[clob] getAccountBalance funder=${envFunder.slice(0, 10)}… pUSD: ${balance.toFixed(4)}`);
         return balance;
       }
 

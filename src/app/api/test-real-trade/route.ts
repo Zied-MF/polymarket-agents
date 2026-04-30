@@ -39,6 +39,8 @@ interface GammaMarket {
   active?:        boolean;
   closed?:        boolean;
   endDate?:       string;
+  liquidity?:     string | number;
+  volume?:        string | number;
 }
 
 function parseJsonField<T>(raw: string | T[] | undefined): T[] {
@@ -47,44 +49,92 @@ function parseJsonField<T>(raw: string | T[] | undefined): T[] {
   try { return JSON.parse(raw) as T[]; } catch { return []; }
 }
 
-/** Retourne un marché météo ouvert avec le prix "Yes" le plus bas (mais > 0.05). */
-async function findCheapWeatherMarket(): Promise<{
-  gammaId:     string;
-  conditionId: string;
-  question:    string;
-  yesPrice:    number;
-} | null> {
+export interface FoundMarket {
+  gammaId:      string;
+  conditionId:  string;
+  question:     string;
+  yesPrice:     number;
+  liquidity:    number;
+  hoursToClose: number;
+}
+
+/**
+ * Cherche un marché température actif se résolvant dans les 48h, trié par liquidité.
+ *
+ * Filtres :
+ *   1. active=true, closed=false
+ *   2. question contient "temperature" (insensible à la casse)
+ *   3. endDate dans les 48 prochaines heures
+ *   4. Prix Yes entre 0.05 et 0.95 (marché pas trop déséquilibré)
+ *
+ * Tri : liquidité décroissante → on prend le marché le plus liquide.
+ */
+async function findTemperatureMarket(): Promise<FoundMarket | null> {
+  const HEADERS = {
+    Accept:       "application/json",
+    "User-Agent": "polymarket-agents/test",
+  };
+  const MAX_HOURS = 48;
+  const now       = Date.now();
+
+  // Gamma /markets supporte jusqu'à limit=100
+  const url = `${GAMMA_BASE}/markets?tag=weather&active=true&closed=false&limit=100`;
+  let markets: GammaMarket[];
   try {
-    const url = `${GAMMA_BASE}/markets?tag=weather&active=true&closed=false&limit=50`;
-    const res = await fetch(url, {
-      headers: {
-        Accept:       "application/json",
-        "User-Agent": "polymarket-agents/test",
-      },
-    });
-    if (!res.ok) return null;
-
-    const markets: GammaMarket[] = await res.json();
-    let best: { gammaId: string; conditionId: string; question: string; yesPrice: number } | null = null;
-
-    for (const m of markets) {
-      if (!m.active || m.closed) continue;
-      const conditionId = m.conditionId ?? m.id;
-      const outcomes    = parseJsonField<string>(m.outcomes);
-      const prices      = parseJsonField<string>(m.outcomePrices).map(Number);
-      const yesIdx      = outcomes.findIndex((o) => o.toLowerCase() === "yes");
-      if (yesIdx < 0 || prices.length !== outcomes.length) continue;
-      const yesPrice = prices[yesIdx];
-      if (yesPrice < 0.05 || yesPrice > 0.95) continue;
-      if (!best || yesPrice < best.yesPrice) {
-        best = { gammaId: m.id, conditionId, question: m.question ?? m.id, yesPrice };
-      }
+    const res = await fetch(url, { headers: HEADERS });
+    if (!res.ok) {
+      console.error(`[test-real-trade] Gamma HTTP ${res.status}`);
+      return null;
     }
-
-    return best;
-  } catch {
+    markets = await res.json() as GammaMarket[];
+  } catch (err) {
+    console.error(`[test-real-trade] Gamma fetch error: ${err instanceof Error ? err.message : err}`);
     return null;
   }
+
+  const candidates: FoundMarket[] = [];
+
+  for (const m of markets) {
+    // 1. Actif et non fermé
+    if (!m.active || m.closed) continue;
+
+    // 2. Doit contenir "temperature" dans la question
+    const question = m.question ?? "";
+    if (!question.toLowerCase().includes("temperature")) continue;
+
+    // 3. endDate dans les 48 prochaines heures
+    if (!m.endDate) continue;
+    const closeMs       = new Date(m.endDate).getTime();
+    if (isNaN(closeMs)) continue;
+    const hoursToClose  = (closeMs - now) / (1000 * 60 * 60);
+    if (hoursToClose <= 0 || hoursToClose > MAX_HOURS) continue;
+
+    // 4. Prix Yes entre 0.05 et 0.95
+    const conditionId = m.conditionId ?? m.id;
+    const outcomes    = parseJsonField<string>(m.outcomes);
+    const prices      = parseJsonField<string>(m.outcomePrices).map(Number);
+    const yesIdx      = outcomes.findIndex((o) => o.toLowerCase() === "yes");
+    if (yesIdx < 0 || prices.length !== outcomes.length) continue;
+    const yesPrice = prices[yesIdx];
+    if (yesPrice < 0.05 || yesPrice > 0.95) continue;
+
+    const liquidity = parseFloat(String(m.liquidity ?? "0"));
+
+    candidates.push({ gammaId: m.id, conditionId, question, yesPrice, liquidity, hoursToClose });
+  }
+
+  if (candidates.length === 0) return null;
+
+  // Trier par liquidité décroissante — on veut le marché le plus liquide
+  candidates.sort((a, b) => b.liquidity - a.liquidity);
+
+  console.log(
+    `[test-real-trade] ${candidates.length} marché(s) température trouvé(s) dans les 48h — ` +
+    `meilleur: "${candidates[0].question.slice(0, 60)}" ` +
+    `liq=$${candidates[0].liquidity.toFixed(0)} ${candidates[0].hoursToClose.toFixed(1)}h`
+  );
+
+  return candidates[0];
 }
 
 // ---------------------------------------------------------------------------
@@ -130,19 +180,24 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
     diag.balanceError = err instanceof Error ? err.message : String(err);
   }
 
-  // 4. Trouver un marché météo
-  const market = await findCheapWeatherMarket();
+  // 4. Trouver un marché température actif (résolution < 48h, le plus liquide)
+  const market = await findTemperatureMarket();
   if (!market) {
     return NextResponse.json(
-      { ...diag, error: "Aucun marché météo ouvert trouvé sur Gamma" },
+      {
+        ...diag,
+        error: "Aucun marché température trouvé (critères: question contient 'temperature', clôture < 48h, actif)",
+      },
       { status: 404 }
     );
   }
   diag.market = {
-    gammaId:     market.gammaId,
-    conditionId: market.conditionId,
-    question:    market.question,
-    yesPrice:    market.yesPrice,
+    gammaId:      market.gammaId,
+    conditionId:  market.conditionId,
+    question:     market.question,
+    yesPrice:     market.yesPrice,
+    liquidity:    market.liquidity,
+    hoursToClose: parseFloat(market.hoursToClose.toFixed(1)),
   };
 
   // 5. Résoudre les tokenIds via le CLOB

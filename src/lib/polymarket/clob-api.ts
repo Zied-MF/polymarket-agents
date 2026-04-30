@@ -307,15 +307,17 @@ export async function placeOrder(params: PlaceOrderParams): Promise<PlacedOrder>
     `(tokenId=${params.tokenId.slice(0, 10)}...)`
   );
 
+  // negRisk: true → order version v2 (NegRiskCTFExchange)
+  // negRisk: false/undefined → order version v1 (CTFExchange)
+  const orderOptions = { negRisk: params.negRisk };
+
   if (params.dryRun) {
     // Dry-run : construit et signe l'ordre sans le soumettre
     const client = await getClobClient();
-    const signed = await client.createOrder({
-      tokenID: params.tokenId,
-      price:   params.price,
-      size,
-      side,
-    });
+    const signed = await client.createOrder(
+      { tokenID: params.tokenId, price: params.price, size, side },
+      orderOptions
+    );
     return {
       orderId:    "dry-run",
       status:     "dry_run",
@@ -331,11 +333,11 @@ export async function placeOrder(params: PlaceOrderParams): Promise<PlacedOrder>
 
   const client = await getClobClient();
   const orderInput = { tokenID: params.tokenId, price: params.price, size, side };
-  console.log("[clob] createAndPostOrder input:", JSON.stringify(orderInput));
+  console.log("[clob] createAndPostOrder input:", JSON.stringify({ ...orderInput, ...orderOptions }));
 
   const result = await client.createAndPostOrder(
     orderInput,
-    undefined,
+    orderOptions,  // ← negRisk flag — détermine la version d'ordre (v1 vs v2)
     ClobOrderType.GTC
   ) as Record<string, unknown>;
 

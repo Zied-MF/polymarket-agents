@@ -500,37 +500,45 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
   }
 
   // ── Step 3 : Signature + soumission ordre CLOB ────────────────────────────
+  const orderPayload = {
+    tokenId:    yesToken.tokenId,
+    side:       "BUY" as const,
+    amountUsdc: BET_USDC,
+    price:      market.yesPrice,
+    size:       BET_USDC / market.yesPrice,
+    negRisk:    clobMarket.negRisk,
+  };
+  realTradingFlow.orderPayload = orderPayload; // toujours visible même en cas d'erreur
+
   let orderId: string | null = null;
   try {
     realTradingFlow.step = "place_order";
     const placed = await placeOrder({
-      tokenId:    yesToken.tokenId,
-      side:       "BUY",
-      amountUsdc: BET_USDC,
-      price:      market.yesPrice,
-      negRisk:    clobMarket.negRisk,
-      dryRun:     false,
+      ...orderPayload,
+      dryRun: false,
     });
     orderId = placed.orderId;
     realTradingFlow.step        = "place_order_ok";
     realTradingFlow.orderId     = placed.orderId;
     realTradingFlow.orderStatus = placed.status;
     realTradingFlow.gasFeeUsdc  = placed.gasFeeUsdc;
-    // sigType / maker surfacés depuis le mode détecté
     const modeDetected = diag.tradingModeDetection as { selectedMode?: string } | undefined;
     realTradingFlow.selectedTradingMode = modeDetected?.selectedMode ?? "unknown";
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    realTradingFlow.step       = "FAILED_place_order";
-    realTradingFlow.error      = msg;
-    realTradingFlow.errorStack = err instanceof Error ? err.stack?.slice(0, 800) : null;
-    // Surface geo-blocking hint if 403
+    realTradingFlow.step            = "FAILED_place_order";
+    realTradingFlow.error           = msg;
+    realTradingFlow.errorStack      = err instanceof Error ? err.stack?.slice(0, 800) : null;
+    // ApiError from @polymarket/clob-client has .data with the full response
+    const apiErr = err as Record<string, unknown>;
+    if (apiErr.data) realTradingFlow.polymarketErrorBody = apiErr.data;
     if (msg.includes("403") || msg.includes("Forbidden")) {
+      realTradingFlow.hint = `HTTP 403 — geo-block? vercelRegion=${diag.vercelRegion} blocked=${(diag.geoBlockCheck as Record<string,unknown>)?.blocked}`;
+    } else if (msg.includes("400") || msg.includes("Bad Request") || msg.includes("invalid")) {
       realTradingFlow.hint =
-        "HTTP 403 Forbidden — likely geo-blocking. " +
-        `vercelRegion=${diag.vercelRegion}. ` +
-        `geoBlock=${JSON.stringify(diag.geoBlockCheck)}. ` +
-        "Fix: set \"regions\": [\"fra1\"] in vercel.json (Frankfurt, EU).";
+        `HTTP 400 — format de l'ordre invalide. ` +
+        `price=${orderPayload.price} size=${orderPayload.size.toFixed(4)} negRisk=${orderPayload.negRisk}. ` +
+        `Vérifier: tick size, price min/max, size minimum.`;
     }
     diag.status = "REAL_FAILED_PLACE_ORDER";
     return NextResponse.json(diag, { status: 500 });

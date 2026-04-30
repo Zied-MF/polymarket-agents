@@ -202,12 +202,21 @@ async function getClobClient(): Promise<ClobClient> {
   const creds      = await tempClient.deriveApiKey();
 
   // Étape 2 : client complet avec creds + mode de signature
+  // throwOnError=true : les erreurs HTTP Polymarket (400/403/…) sont levées
+  // avec le message d'erreur exact au lieu d'être silencieusement retournées.
   _cachedClient     = new ClobClient(
     CLOB_BASE, POLYGON_CHAIN_ID,
     walletClient,
     { key: creds.key, secret: creds.secret, passphrase: creds.passphrase },
     sigType,
-    funder
+    funder,
+    undefined, // geoBlockToken
+    undefined, // useServerTime
+    undefined, // builderConfig
+    undefined, // getSigner
+    undefined, // retryOnError
+    undefined, // tickSizeTtlMs
+    true        // throwOnError ← expose les erreurs HTTP Polymarket
   );
   _cachedClientMode = detection.selectedMode;
 
@@ -321,18 +330,26 @@ export async function placeOrder(params: PlaceOrderParams): Promise<PlacedOrder>
   }
 
   const client = await getClobClient();
+  const orderInput = { tokenID: params.tokenId, price: params.price, size, side };
+  console.log("[clob] createAndPostOrder input:", JSON.stringify(orderInput));
+
   const result = await client.createAndPostOrder(
-    { tokenID: params.tokenId, price: params.price, size, side },
+    orderInput,
     undefined,
     ClobOrderType.GTC
-  );
+  ) as Record<string, unknown>;
+
+  // throwOnError=true → les erreurs HTTP lèvent une exception avec le message Polymarket.
+  // Vérification défensive au cas où throwOnError ne couvrirait pas tous les cas.
+  if (result && "error" in result) {
+    const errMsg = typeof result.error === "string" ? result.error : JSON.stringify(result);
+    console.error("[clob] ❌ Polymarket error body:", JSON.stringify(result));
+    throw new Error(`[clob] Polymarket rejected order (HTTP ${result.status ?? "?"}): ${errMsg}`);
+  }
 
   // Le résultat peut être { orderID, status } ou { id, status }
-  const orderId = (result as Record<string, string>).orderID
-                ?? (result as Record<string, string>).id
-                ?? "unknown";
-
-  console.log(`[clob] ✅ Ordre placé: ${orderId} (${(result as Record<string, string>).status})`);
+  const orderId = (result.orderID ?? result.id ?? "unknown") as string;
+  console.log(`[clob] ✅ Ordre placé: ${orderId} (${result.status})`);
 
   return {
     orderId,

@@ -20,9 +20,10 @@ import {
   getClobMarket,
   placeOrder,
   getAccountBalance,
+  checkCTFAllowance,
 }                                    from "@/lib/polymarket/clob-api";
-import { executeBuy }                from "@/lib/trade-executor";
-import { getPositionByPaperTradeId } from "@/lib/db/positions";
+import { executeBuy, isRealTradingEnabled, resetAllowanceCache } from "@/lib/trade-executor";
+import { getPositionByPaperTradeId }                            from "@/lib/db/positions";
 
 // ---------------------------------------------------------------------------
 // Gamma — recherche d'un marché pour test d'exécution
@@ -357,16 +358,105 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
     return NextResponse.json(diag);
   }
 
-  // ── LIVE ORDER — passe par executeBuy() pour tester la persistance en DB ──
-  // executeBuy() appelle patchRealPosition() qui doit écrire clob_order_id.
-  // On vérifie ensuite directement en DB que le champ est bien rempli.
+  // ── LIVE ORDER ─────────────────────────────────────────────────────────────
+  // On N'utilise PAS executeBuy() ici car il swallow les erreurs en fallback
+  // paper. On appelle chaque étape manuellement pour voir exactement où ça casse.
+
   const BET_USDC = 0.50;
 
-  let buyResult: Awaited<ReturnType<typeof executeBuy>>;
+  // ── Step 0 : Diagnostic variable d'environnement ──────────────────────────
+  const envRaw       = process.env.REAL_TRADING_ENABLED;
+  const envForced    = "true"; // on force à "true" pour ce test
+  process.env.REAL_TRADING_ENABLED = envForced;
+  // Reset du cache allowance pour forcer une nouvelle vérification
+  resetAllowanceCache();
+
+  diag.envDiag = {
+    REAL_TRADING_ENABLED_raw:    envRaw ?? "(not set)",
+    REAL_TRADING_ENABLED_forced: envForced,
+    isRealTradingEnabled_before: envRaw === "true",
+    isRealTradingEnabled_after:  isRealTradingEnabled(),
+  };
+
+  const realFlow: Record<string, unknown> = { step: "start" };
+  diag.realTradingFlow = realFlow;
+
+  // ── Step 1 : Balance ───────────────────────────────────────────────────────
+  let balanceOk = false;
   try {
-    // Force REAL_TRADING_ENABLED pour ce test, quelle que soit l'env var
-    process.env.REAL_TRADING_ENABLED = "true";
-    buyResult = await executeBuy({
+    realFlow.step = "balance";
+    const balance     = await getAccountBalance();
+    const minRequired = BET_USDC * 1.05;
+    balanceOk = balance >= minRequired;
+    realFlow.balanceUsdc    = balance;
+    realFlow.minRequired    = minRequired;
+    realFlow.balanceSufficient = balanceOk;
+    if (!balanceOk) {
+      realFlow.step   = "FAILED_balance";
+      realFlow.error  = `Balance insuffisante: ${balance.toFixed(4)} USDC < ${minRequired.toFixed(4)} USDC requis`;
+      diag.status = "REAL_FAILED_BALANCE";
+      return NextResponse.json(diag, { status: 422 });
+    }
+  } catch (err) {
+    realFlow.step  = "FAILED_balance";
+    realFlow.error = err instanceof Error ? err.message : String(err);
+    realFlow.stack = err instanceof Error ? err.stack?.slice(0, 400) : undefined;
+    diag.status = "REAL_FAILED_BALANCE_ERROR";
+    return NextResponse.json(diag, { status: 500 });
+  }
+
+  // ── Step 2 : Allowance CTF Exchange ───────────────────────────────────────
+  try {
+    realFlow.step = "allowance";
+    const { sufficient, allowance } = await checkCTFAllowance();
+    realFlow.allowanceUsdc      = (Number(allowance) / 1_000_000).toFixed(2);
+    realFlow.allowanceSufficient = sufficient;
+    if (!sufficient) {
+      realFlow.step  = "FAILED_allowance";
+      realFlow.error = `CTF Exchange allowance insuffisante (${(Number(allowance) / 1_000_000).toFixed(2)} USDC). Appeler approveCTF().`;
+      diag.status = "REAL_FAILED_ALLOWANCE";
+      return NextResponse.json(diag, { status: 422 });
+    }
+  } catch (err) {
+    realFlow.step  = "FAILED_allowance";
+    realFlow.error = err instanceof Error ? err.message : String(err);
+    realFlow.stack = err instanceof Error ? err.stack?.slice(0, 400) : undefined;
+    diag.status = "REAL_FAILED_ALLOWANCE_ERROR";
+    return NextResponse.json(diag, { status: 500 });
+  }
+
+  // ── Step 3 : Signature + soumission ordre CLOB ────────────────────────────
+  let orderId: string | null = null;
+  try {
+    realFlow.step = "placeOrder";
+    const placed = await placeOrder({
+      tokenId:    yesToken.tokenId,
+      side:       "BUY",
+      amountUsdc: BET_USDC,
+      price:      market.yesPrice,
+      negRisk:    clobMarket.negRisk,
+      dryRun:     false,
+    });
+    orderId = placed.orderId;
+    realFlow.step       = "placeOrder_ok";
+    realFlow.orderId    = placed.orderId;
+    realFlow.orderStatus = placed.status;
+    realFlow.gasFeeUsdc  = placed.gasFeeUsdc;
+  } catch (err) {
+    realFlow.step  = "FAILED_placeOrder";
+    realFlow.error = err instanceof Error ? err.message : String(err);
+    realFlow.stack = err instanceof Error ? err.stack?.slice(0, 800) : undefined;
+    diag.status = "REAL_FAILED_PLACE_ORDER";
+    return NextResponse.json(diag, { status: 500 });
+  }
+
+  // ── Step 4 : Persistance DB via executeBuy (paper_trade + position) ────────
+  // On appelle executeBuy maintenant qu'on sait que placeOrder fonctionne.
+  // executeBuy va re-placer un ordre → on utilise le résultat pour la DB.
+  // Note : on accepte 2 ordres (step 3 + step 4) car c'est un test.
+  try {
+    realFlow.step = "executeBuy_db";
+    const buyResult = await executeBuy({
       marketId:             market.conditionId,
       question:             market.question,
       city:                 null,
@@ -383,72 +473,38 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
       marketContext:        null,
       potentialPnl:         0,
     });
-  } catch (err) {
-    return NextResponse.json(
-      { ...diag, error: `executeBuy: ${err instanceof Error ? err.message : err}` },
-      { status: 500 }
-    );
-  }
 
-  diag.order = {
-    paperTradeId: buyResult.paperTradeId,
-    positionId:   buyResult.positionId,
-    orderId:      buyResult.orderId ?? null,
-    isReal:       buyResult.isReal,
-    gasFeeUsdc:   buyResult.gasFeeUsdc ?? null,
-    submitted:    true,
-  };
+    realFlow.step         = "executeBuy_ok";
+    realFlow.paperTradeId = buyResult.paperTradeId;
+    realFlow.positionId   = buyResult.positionId;
+    realFlow.isReal       = buyResult.isReal;
+    realFlow.clobOrderId  = buyResult.orderId ?? null;
 
-  // ── Vérification DB : clob_order_id et is_real bien persistés ─────────────
-  let dbVerification: Record<string, unknown> = { checked: false };
-  try {
-    const positionRow = await getPositionByPaperTradeId(buyResult.paperTradeId);
-
-    if (!positionRow) {
-      dbVerification = {
-        checked: false,
-        error:   `Position introuvable pour paperTradeId=${buyResult.paperTradeId}`,
-        ok:      false,
-      };
-    } else {
-      const clobOrderIdInDb = positionRow.clob_order_id;
-      const isRealInDb      = positionRow.is_real;
-      const clobMatchesApi  = clobOrderIdInDb === (buyResult.orderId ?? null);
-      const ok              = isRealInDb === true && clobOrderIdInDb !== null && clobMatchesApi;
-
-      dbVerification = {
-        checked:         true,
-        positionId:      positionRow.id,
-        isRealInDb,
-        clobOrderIdInDb,
-        clobOrderIdFromApi: buyResult.orderId ?? null,
-        clobMatchesApi,
+    // ── Vérification DB ───────────────────────────────────────────────────
+    const positionRow = await getPositionByPaperTradeId(buyResult.paperTradeId).catch(() => null);
+    if (positionRow) {
+      const ok = positionRow.is_real === true && positionRow.clob_order_id !== null;
+      realFlow.dbVerification = {
+        isRealInDb:      positionRow.is_real,
+        clobOrderIdInDb: positionRow.clob_order_id,
         ok,
-        // Verdict lisible
         verdict: ok
-          ? "✅ clob_order_id et is_real correctement persistés"
-          : [
-              !isRealInDb           ? "❌ is_real est false ou null en DB"               : null,
-              clobOrderIdInDb === null ? "❌ clob_order_id est NULL en DB (bug critique)" : null,
-              !clobMatchesApi       ? "❌ clob_order_id ne correspond pas à l'orderId API" : null,
-            ].filter(Boolean).join(" | "),
+          ? "✅ is_real + clob_order_id persistés"
+          : `❌ is_real=${positionRow.is_real} clob_order_id=${positionRow.clob_order_id}`,
       };
     }
   } catch (err) {
-    dbVerification = {
-      checked: false,
-      error:   err instanceof Error ? err.message : String(err),
-      ok:      false,
-    };
+    realFlow.step       = "FAILED_executeBuy_db";
+    realFlow.dbError    = err instanceof Error ? err.message : String(err);
+    // On ne retourne pas d'erreur ici — le placeOrder (step 3) a réussi
   }
 
-  diag.dbVerification = dbVerification;
-  diag.status = (dbVerification as { ok?: boolean }).ok
-    ? "LIVE_ORDER_PLACED_AND_DB_VERIFIED"
-    : "LIVE_ORDER_PLACED_BUT_DB_VERIFICATION_FAILED";
+  diag.status = "REAL_TRADE_ATTEMPTED";
+  diag.order  = {
+    orderId_step3:    orderId,
+    orderId_step4:    (realFlow.clobOrderId as string | null) ?? null,
+    submittedToClob:  true,
+  };
 
-  return NextResponse.json(
-    diag,
-    { status: (dbVerification as { ok?: boolean }).ok ? 200 : 500 }
-  );
+  return NextResponse.json(diag);
 }

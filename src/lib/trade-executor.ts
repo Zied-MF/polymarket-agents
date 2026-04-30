@@ -32,7 +32,6 @@ import {
   placeOrder,
   cancelOrder,
   getAccountBalance,
-  checkCTFAllowance,
   type PlacedOrder,
 }                                    from "@/lib/polymarket/clob-api";
 import {
@@ -49,18 +48,9 @@ export function isRealTradingEnabled(): boolean {
   return process.env.REAL_TRADING_ENABLED === "true";
 }
 
-/**
- * Cache de l'état d'allowance par type de marché (CTF normal vs NegRisk).
- * null = pas encore vérifié ; true = OK ; false = insuffisant.
- * Réinitialisé à null entre les redémarrages du process.
- */
-let _allowanceOkCTF:     boolean | null = null;
-let _allowanceOkNegRisk: boolean | null = null;
-
-/** Réinitialise le cache d'allowance (utile après approveCTF()). */
+/** Réinitialise le cache d'allowance (no-op, conservé pour compatibilité). */
 export function resetAllowanceCache(): void {
-  _allowanceOkCTF     = null;
-  _allowanceOkNegRisk = null;
+  // Allowance check supprimé — Polymarket valide côté CLOB
 }
 
 function logRealError(context: string, err: unknown): void {
@@ -154,31 +144,16 @@ export async function executeBuy(input: BuyInput): Promise<ExecuteBuyResult> {
       if (!clobMarket) throw new Error(`Marché introuvable dans CLOB: ${input.marketId}`);
       if (!clobMarket.active) throw new Error(`Marché CLOB inactif: ${input.marketId}`);
 
-      const negRisk       = clobMarket.negRisk;
-      const allowanceCache = negRisk ? _allowanceOkNegRisk : _allowanceOkCTF;
-      const contractName  = negRisk ? "NegRisk CTF Exchange" : "CTF Exchange";
-
-      // ── Guard 1 : Allowance spender correct selon type de marché ──────────
-      // negRisk=true  → NegRisk CTF Exchange (0xC5d5…)
-      // negRisk=false → CTF Exchange         (0x4bFb…)
-      if (allowanceCache === null) {
-        const { sufficient, allowance } = await checkCTFAllowance(negRisk);
-        if (negRisk) _allowanceOkNegRisk = sufficient;
-        else         _allowanceOkCTF     = sufficient;
-        if (!sufficient) {
-          const msg =
-            `${contractName} allowance insuffisante (${(Number(allowance) / 1_000_000).toFixed(2)} USDC). ` +
-            `Appeler approveCTF() depuis /api/approve-ctf?execute=true.`;
-          sendDiscordAlert(
-            `🚨 **Real trading bloqué — allowance insuffisante**\n` +
-            `Wallet n'a pas approuvé ${contractName} pour dépenser USDC.\n` +
-            `\`GET /api/approve-ctf?execute=true\` requis avant tout trade réel.`
-          ).catch(() => {});
-          throw new Error(msg);
-        }
-      } else if (allowanceCache === false) {
-        throw new Error(`${contractName} allowance insuffisante (cache) — appeler /api/approve-ctf?execute=true`);
-      }
+      // ── Guard 1 : Allowance — déléguée à Polymarket ──────────────────────
+      // L'utilisateur a tradé manuellement sans approve explicite (1 seul popup
+      // "Sign message"). Polymarket gère les approves en interne via son système
+      // de relay. Notre check on-chain vérifie la mauvaise adresse/architecture.
+      // On laisse Polymarket rejeter l'ordre si l'allowance est vraiment absente.
+      console.log("[trade-executor] ℹ️ Allowance check skipped — relying on Polymarket validation");
+      sendDiscordAlert(
+        `ℹ️ **Allowance check skipped** — relying on Polymarket validation\n` +
+        `Marché: ${input.question.slice(0, 80)} (negRisk=${clobMarket.negRisk})`
+      ).catch(() => {});
 
       // ── Guard 2 : Balance USDC suffisante ─────────────────────────────────
       // getAccountBalance() retourne null si tous les RPCs échouent.

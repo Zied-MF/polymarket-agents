@@ -2,7 +2,7 @@
  * Test Real Trade endpoint
  *
  * GET /api/test-real-trade               → dry_run=true (défaut) : signe, ne soumet pas
- * GET /api/test-real-trade?dry_run=false → soumet un ordre live de $0.50 via placeOrder()
+ * GET /api/test-real-trade?dry_run=false → soumet un ordre live de $1.05 via placeOrder()
  *                                          + vérifie en DB que clob_order_id est bien persisté
  *
  * Diagnostics retournés :
@@ -392,7 +392,7 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
       const placed = await placeOrder({
         tokenId:    yesToken.tokenId,
         side:       "BUY",
-        amountUsdc: 0.50,
+        amountUsdc: 1.05,
         price:      market.yesPrice,
         negRisk:    clobMarket.negRisk,
         dryRun:     true,
@@ -401,7 +401,7 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
       diag.order = {
         tokenId:    yesToken.tokenId,
         side:       "BUY",
-        amountUsdc: 0.50,
+        amountUsdc: 1.05,
         price:      market.yesPrice,
         orderId:    placed.orderId,   // "dry-run"
         gasFeeUsdc: placed.gasFeeUsdc,
@@ -422,7 +422,7 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
   // On N'utilise PAS executeBuy() ici car il swallow les erreurs en fallback
   // paper. On appelle chaque étape manuellement pour voir exactement où ça casse.
 
-  const BET_USDC = 0.50;
+  const BET_USDC = 1.05; // Polymarket min order = $1
 
   // ── Step 0 : Force REAL_TRADING_ENABLED pour ce test ─────────────────────
   const envRaw    = process.env.REAL_TRADING_ENABLED;

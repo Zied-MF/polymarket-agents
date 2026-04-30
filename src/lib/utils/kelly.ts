@@ -30,8 +30,9 @@ const GAS_FEE = 0.01;
 /** Frais de plateforme Polymarket sur les gains nets. */
 const PLATFORM_FEE = 0.02;
 
-/** En dessous de ce montant la mise n'est pas suggérée (frais > edge). */
-const MIN_BET_AMOUNT = 0.10;
+/** En dessous de ce montant la mise n'est pas suggérée (frais > edge).
+ *  Polymarket impose un minimum de $1 par ordre. */
+const MIN_BET_AMOUNT = 1.05;
 
 // ---------------------------------------------------------------------------
 // Types

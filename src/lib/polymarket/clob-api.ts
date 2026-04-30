@@ -413,9 +413,70 @@ interface SignedOrderBundle {
   orderType: "GTC";
 }
 
+/**
+ * Résout le mode de signature optimal :
+ *   - signatureType 1 (proxy) si l'adresse proxy Polymarket est trouvée
+ *     et que le proxy a une allowance USDC suffisante.
+ *   - signatureType 0 (EOA) sinon (fonds sur le wallet EOA directement).
+ *
+ * Polymarket UI dépose les USDC dans le proxy Safe — dans ce cas le proxy
+ * est le maker. L'EOA signe l'ordre au nom du proxy (relayer pattern).
+ */
+interface SigningMode {
+  signatureType: 0 | 1;
+  makerAddress:  `0x${string}`;  // proxy (type 1) ou EOA (type 0)
+  proxyAddress:  `0x${string}` | null;
+}
+
+async function resolveSigningMode(
+  account: ReturnType<typeof getAccount>
+): Promise<SigningMode> {
+  // Essayer de trouver le proxy sur le premier RPC disponible
+  for (const rpc of POLYGON_RPC_FALLBACKS()) {
+    try {
+      const client  = createPublicClient({ chain: polygon, transport: http(rpc) });
+      const proxy   = await getPolymarketProxyAddress(account.address, client);
+      if (!proxy) break;
+
+      // Vérifier que le proxy a bien une allowance CTF Exchange (mis en place via l'UI)
+      const spender  = CTF_EXCHANGE;
+      const rawAllow = await client.readContract({
+        address:      USDC_ADDRESS,
+        abi:          ERC20_ABI,
+        functionName: "allowance",
+        args:         [proxy, spender],
+      }) as bigint;
+
+      if (rawAllow > BigInt(0)) {
+        const usdcAmt = (Number(rawAllow) / USDC_DECIMALS).toFixed(2);
+        console.log(
+          `[clob] resolveSigningMode: proxy=${proxy} ` +
+          `allowance=${usdcAmt} USDC → signatureType=1`
+        );
+        return { signatureType: 1, makerAddress: proxy, proxyAddress: proxy };
+      }
+
+      // Proxy trouvé mais pas d'allowance — signaler pour info
+      console.warn(
+        `[clob] resolveSigningMode: proxy=${proxy} trouvé mais allowance=0 ` +
+        `(faire un approve depuis polymarket.com ou /api/approve-ctf?execute=true) ` +
+        `→ fallback signatureType=0`
+      );
+      break;
+    } catch {
+      break;
+    }
+  }
+
+  // Fallback EOA
+  console.log(`[clob] resolveSigningMode: pas de proxy utilisable → signatureType=0 (EOA)`);
+  return { signatureType: 0, makerAddress: account.address, proxyAddress: null };
+}
+
 async function buildAndSignOrder(
   params:  PlaceOrderParams,
-  account: ReturnType<typeof getAccount>
+  account: ReturnType<typeof getAccount>,
+  mode:    SigningMode
 ): Promise<SignedOrderBundle> {
   const salt = generateSalt();
 
@@ -424,15 +485,14 @@ async function buildAndSignOrder(
   const makerAmount = BigInt(Math.floor(params.amountUsdc * USDC_DECIMALS));
   const takerAmount = BigInt(Math.floor((params.amountUsdc / params.price) * USDC_DECIMALS));
 
-  const side          = params.side === "BUY" ? 0 : 1;
-  const signatureType = 0; // EOA (clé privée directe)
-
+  const side              = params.side === "BUY" ? 0 : 1;
+  const { signatureType, makerAddress } = mode;
   const verifyingContract = params.negRisk ? NEG_RISK_CTF_EXCHANGE : CTF_EXCHANGE;
 
   const orderMessage = {
     salt,
-    maker:         account.address as `0x${string}`,
-    signer:        account.address as `0x${string}`,
+    maker:         makerAddress,
+    signer:        account.address as `0x${string}`,  // toujours l'EOA qui signe
     taker:         "0x0000000000000000000000000000000000000000" as `0x${string}`,
     tokenId:       BigInt(params.tokenId),
     makerAmount,
@@ -459,7 +519,7 @@ async function buildAndSignOrder(
   return {
     order: {
       salt:          salt.toString(),
-      maker:         account.address,
+      maker:         makerAddress,
       signer:        account.address,
       taker:         "0x0000000000000000000000000000000000000000",
       tokenId:       params.tokenId,
@@ -472,7 +532,7 @@ async function buildAndSignOrder(
       signatureType,
     },
     signature,
-    owner:     account.address,
+    owner:     makerAddress,   // proxy ou EOA — indique au CLOB d'où viennent les fonds
     orderType: "GTC",
   };
 }
@@ -492,12 +552,14 @@ export async function placeOrder(params: PlaceOrderParams): Promise<PlacedOrder>
   if (!privateKey) throw new Error("[clob] POLYGON_PRIVATE_KEY non défini");
 
   const account = getAccount(privateKey);
-  const bundle  = await buildAndSignOrder(params, account);
+  const mode    = await resolveSigningMode(account);
+  const bundle  = await buildAndSignOrder(params, account, mode);
 
   console.log(
     `[clob] ${params.dryRun ? "DRY-RUN " : ""}placeOrder: ` +
     `${params.side} ${params.amountUsdc}$ @ ${params.price} ` +
-    `(tokenId=${params.tokenId.slice(0, 10)}...)`
+    `(tokenId=${params.tokenId.slice(0, 10)}...) ` +
+    `maker=${mode.makerAddress.slice(0, 10)} sigType=${mode.signatureType}`
   );
 
   if (params.dryRun) {
@@ -849,7 +911,14 @@ export async function checkAllAllowances(): Promise<SpenderAllowance[]> {
 
   for (const rpc of POLYGON_RPC_FALLBACKS()) {
     try {
-      const client  = createPublicClient({ chain: polygon, transport: http(rpc) });
+      const client = createPublicClient({ chain: polygon, transport: http(rpc) });
+
+      // Préférer le proxy — c'est là que l'USDC réside après dépôt via l'UI Polymarket.
+      // Si pas de proxy, on vérifie l'EOA (mode signatureType=0).
+      const proxy   = await getPolymarketProxyAddress(account.address, client);
+      const owner   = proxy ?? account.address;
+      const ownerLabel = proxy ? `proxy(${proxy.slice(0, 10)})` : `EOA(${account.address.slice(0, 10)})`;
+
       const results: SpenderAllowance[] = [];
 
       for (const { name, address: spender } of APPROVAL_SPENDERS) {
@@ -857,15 +926,16 @@ export async function checkAllAllowances(): Promise<SpenderAllowance[]> {
           address:      USDC_ADDRESS,
           abi:          ERC20_ABI,
           functionName: "allowance",
-          args:         [account.address, spender],
+          args:         [owner, spender],
         }) as bigint;
 
         const allowanceUsdc = Number(raw) / USDC_DECIMALS;
-        const sufficient    = raw > BigInt(1_000 * USDC_DECIMALS); // > 1 000 USDC
+        // sufficient = true si allowance > 1 000 USDC OU si c'est MAX_UINT256-like (> 1e12 USDC)
+        const sufficient    = raw > BigInt(1_000 * USDC_DECIMALS);
         results.push({ name, spender, allowanceUsdc, sufficient });
 
         console.log(
-          `[clob] allowance ${name}: ${allowanceUsdc.toFixed(2)} USDC ` +
+          `[clob] allowance ${ownerLabel} → ${name}: ${allowanceUsdc.toFixed(2)} USDC ` +
           `(${sufficient ? "✅" : "❌ need approve"})`
         );
       }

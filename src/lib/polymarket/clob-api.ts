@@ -783,62 +783,124 @@ export interface AllowanceResult {
  * Lit l'allowance USDC accordée au CTF Exchange sur Polygon.
  *
  * À appeler au démarrage du bot (REAL_TRADING_ENABLED=true) pour s'assurer
- * que le wallet a approuvé le contrat avant de tenter tout trade réel.
+ * que le wallet a approuvé le CTF Exchange avant tout trade réel.
  *
- * Pré-requis : POLYGON_PRIVATE_KEY défini.
- * Optionnel  : POLYGON_RPC_URL — si défini (ex. Alchemy), utilisé en premier.
- *              Fallback sur plusieurs RPCs publics si non défini.
+ * Délègue à checkAllAllowances() — lit CTF Exchange + NegRisk en un seul
+ * appel RPC, retourne le résultat sous le format AllowanceResult existant
+ * (sufficient = true seulement si LES DEUX spenders sont approuvés).
  */
 export async function checkCTFAllowance(): Promise<AllowanceResult> {
   const privateKey = process.env.POLYGON_PRIVATE_KEY;
   if (!privateKey) throw new Error("[clob] POLYGON_PRIVATE_KEY non défini");
 
   const account = getAccount(privateKey);
-  let lastErr: Error = new Error("no RPC tried");
+  const all     = await checkAllAllowances(); // throws if all RPCs fail
 
-  for (const rpc of POLYGON_RPC_FALLBACKS()) {
-    try {
-      const client = createPublicClient({ chain: polygon, transport: http(rpc) });
+  // sufficient = true seulement si TOUS les spenders sont OK
+  const sufficient = all.every((a) => a.sufficient);
+  const ctf        = all.find((a) => a.spender === CTF_EXCHANGE);
+  const allowance  = ctf
+    ? BigInt(Math.floor(ctf.allowanceUsdc * USDC_DECIMALS))
+    : BigInt(0);
 
-      const allowance = await client.readContract({
-        address:      USDC_ADDRESS,
-        abi:          ERC20_ABI,
-        functionName: "allowance",
-        args:         [account.address, CTF_EXCHANGE],
-      }) as bigint;
-
-      // Seuil : 1 000 USDC en micro-USDC
-      const sufficient = allowance > BigInt(1_000 * USDC_DECIMALS);
-
-      console.log(
-        `[clob] checkCTFAllowance (rpc=${rpc}): ${account.address} → CTF_EXCHANGE ` +
-        `allowance=${(Number(allowance) / USDC_DECIMALS).toFixed(2)} USDC ` +
-        `(${sufficient ? "✅ sufficient" : "❌ INSUFFICIENT"})`
-      );
-
-      return { allowance, sufficient, owner: account.address, spender: CTF_EXCHANGE };
-    } catch (err) {
-      lastErr = err instanceof Error ? err : new Error(String(err));
-      console.warn(`[clob] checkCTFAllowance RPC ${rpc} failed: ${lastErr.message}`);
-    }
+  if (!sufficient) {
+    const missing = all.filter((a) => !a.sufficient).map((a) => a.name).join(", ");
+    console.warn(`[clob] checkCTFAllowance: allowance insuffisante pour: ${missing}`);
   }
 
-  throw new Error(`[clob] checkCTFAllowance: all RPCs failed — ${lastErr.message}`);
+  return { allowance, sufficient, owner: account.address, spender: CTF_EXCHANGE };
 }
 
 // ---------------------------------------------------------------------------
-// approveCTF
+// approveCTF  &  checkAllAllowances
 // ---------------------------------------------------------------------------
 
 /**
- * Soumet une transaction `approve(CTF_EXCHANGE, MAX_UINT256)` sur le contrat USDC.
+ * Spenders Polymarket qui ont besoin d'une allowance USDC max.
  *
- * À n'appeler qu'une seule fois, manuellement, avant d'activer le real trading.
- * Retourne le hash de la transaction.
+ * Refs :
+ *   - CTF Exchange       : marchés binaires Yes/No standard
+ *   - NegRisk CTF Exch.  : marchés multi-outcomes (élections, sports…)
  *
- * ⚠️  Nécessite que le wallet ait du MATIC pour payer le gas Polygon (~0.001$).
+ * Source : https://docs.polymarket.com/developer-resources/contracts
  */
-export async function approveCTF(): Promise<string> {
+const APPROVAL_SPENDERS: Array<{ name: string; address: `0x${string}` }> = [
+  { name: "CTF Exchange",         address: CTF_EXCHANGE },
+  { name: "NegRisk CTF Exchange", address: NEG_RISK_CTF_EXCHANGE },
+];
+
+export interface SpenderAllowance {
+  name:       string;
+  spender:    string;
+  allowanceUsdc: number;
+  sufficient: boolean;
+}
+
+/**
+ * Lit l'allowance USDC pour tous les spenders Polymarket en un seul appel.
+ * Utilise POLYGON_RPC_FALLBACKS() pour la robustesse RPC.
+ */
+export async function checkAllAllowances(): Promise<SpenderAllowance[]> {
+  const privateKey = process.env.POLYGON_PRIVATE_KEY;
+  if (!privateKey) throw new Error("[clob] POLYGON_PRIVATE_KEY non défini");
+
+  const account  = getAccount(privateKey);
+  let   lastErr: Error = new Error("no RPC tried");
+
+  for (const rpc of POLYGON_RPC_FALLBACKS()) {
+    try {
+      const client  = createPublicClient({ chain: polygon, transport: http(rpc) });
+      const results: SpenderAllowance[] = [];
+
+      for (const { name, address: spender } of APPROVAL_SPENDERS) {
+        const raw = await client.readContract({
+          address:      USDC_ADDRESS,
+          abi:          ERC20_ABI,
+          functionName: "allowance",
+          args:         [account.address, spender],
+        }) as bigint;
+
+        const allowanceUsdc = Number(raw) / USDC_DECIMALS;
+        const sufficient    = raw > BigInt(1_000 * USDC_DECIMALS); // > 1 000 USDC
+        results.push({ name, spender, allowanceUsdc, sufficient });
+
+        console.log(
+          `[clob] allowance ${name}: ${allowanceUsdc.toFixed(2)} USDC ` +
+          `(${sufficient ? "✅" : "❌ need approve"})`
+        );
+      }
+
+      return results;
+    } catch (err) {
+      lastErr = err instanceof Error ? err : new Error(String(err));
+      console.warn(`[clob] checkAllAllowances RPC ${rpc} failed: ${lastErr.message}`);
+    }
+  }
+
+  throw new Error(`[clob] checkAllAllowances: all RPCs failed — ${lastErr.message}`);
+}
+
+/**
+ * Soumet approve(spender, MAX_UINT256) sur USDC pour tous les spenders
+ * Polymarket qui n'ont pas encore une allowance suffisante.
+ *
+ * Opération unique : une fois approuvée, plus besoin de re-approuver.
+ * Coût : ~0.01–0.05 POL de gas par transaction (Polygon très cheap).
+ *
+ * ⚠️  Nécessite que le wallet ait du POL (ex-MATIC) pour le gas.
+ * ⚠️  POLYGON_RPC_URL doit pointer vers un RPC valide (Alchemy recommandé).
+ */
+export interface ApproveCTFResult {
+  wallet:      string;
+  approvals:   Array<{
+    name:    string;
+    spender: string;
+    txHash:  string | null;   // null si déjà approuvé (skipped)
+    skipped: boolean;
+  }>;
+}
+
+export async function approveCTF(): Promise<ApproveCTFResult> {
   const privateKey = process.env.POLYGON_PRIVATE_KEY;
   if (!privateKey) throw new Error("[clob] POLYGON_PRIVATE_KEY non défini");
 
@@ -849,15 +911,34 @@ export async function approveCTF(): Promise<string> {
     transport: http(POLYGON_RPC()),
   });
 
-  console.log(`[clob] approveCTF: approve(${CTF_EXCHANGE}, MAX_UINT256) depuis ${account.address}`);
+  // Lire les allowances actuelles pour ne pas re-soumettre inutilement
+  const current = await checkAllAllowances();
+  const result: ApproveCTFResult = { wallet: account.address, approvals: [] };
 
-  const txHash = await walletClient.writeContract({
-    address:      USDC_ADDRESS,
-    abi:          ERC20_ABI,
-    functionName: "approve",
-    args:         [CTF_EXCHANGE, MAX_UINT256],
-  });
+  for (const { name, address: spender } of APPROVAL_SPENDERS) {
+    const existing = current.find((c) => c.spender === spender);
 
-  console.log(`[clob] ✅ Approval soumise: txHash=${txHash}`);
-  return txHash;
+    if (existing?.sufficient) {
+      console.log(`[clob] approveCTF: ${name} — déjà approuvé (${existing.allowanceUsdc.toFixed(0)} USDC) ✅ skip`);
+      result.approvals.push({ name, spender, txHash: null, skipped: true });
+      continue;
+    }
+
+    console.log(`[clob] approveCTF: approve(${name}=${spender}, MAX_UINT256) depuis ${account.address}`);
+
+    const txHash = await walletClient.writeContract({
+      address:      USDC_ADDRESS,
+      abi:          ERC20_ABI,
+      functionName: "approve",
+      args:         [spender, MAX_UINT256],
+    });
+
+    console.log(`[clob] ✅ Approval ${name} soumise: txHash=${txHash}`);
+    result.approvals.push({ name, spender, txHash, skipped: false });
+
+    // Laisser Polygon confirmer entre les txs si plusieurs approvals nécessaires
+    await new Promise((r) => setTimeout(r, 2000));
+  }
+
+  return result;
 }

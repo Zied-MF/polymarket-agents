@@ -22,6 +22,7 @@ import {
   getAccountBalance,
   checkCTFAllowance,
   debugAllowances,
+  detectTradingMode,
 }                                    from "@/lib/polymarket/clob-api";
 import { executeBuy, isRealTradingEnabled, resetAllowanceCache } from "@/lib/trade-executor";
 import { getPositionByPaperTradeId }                            from "@/lib/db/positions";
@@ -287,8 +288,18 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
     diag.balanceError = err instanceof Error ? err.message : String(err);
   }
 
-  // 3b. Allowance debug — TOUJOURS dans la réponse (dry_run ou live)
-  // Capture proxy resolution + raw allowance values pour diagnostic complet.
+  // 3b. Trading mode detection + allowance debug — TOUJOURS dans la réponse.
+  // detectTradingMode() lit allowances EOA + proxy et choisit A_PROXY / B_EOA.
+  // debugAllowances() fournit les valeurs raw pour diagnostic.
+  try {
+    const creds = await deriveClobCredentials(privateKey).catch(() => null);
+    const eoa   = (creds?.address ?? "") as `0x${string}`;
+    if (eoa) {
+      diag.tradingModeDetection = await detectTradingMode(eoa);
+    }
+  } catch (err) {
+    diag.tradingModeDetection = { error: err instanceof Error ? err.message : String(err) };
+  }
   try {
     diag.allowanceDebug = await debugAllowances();
   } catch (err) {
@@ -487,6 +498,9 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
     realTradingFlow.orderId     = placed.orderId;
     realTradingFlow.orderStatus = placed.status;
     realTradingFlow.gasFeeUsdc  = placed.gasFeeUsdc;
+    // sigType / maker surfacés depuis le mode détecté
+    const modeDetected = diag.tradingModeDetection as { selectedMode?: string } | undefined;
+    realTradingFlow.selectedTradingMode = modeDetected?.selectedMode ?? "unknown";
   } catch (err) {
     realTradingFlow.step       = "FAILED_place_order";
     realTradingFlow.error      = err instanceof Error ? err.message : String(err);

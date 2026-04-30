@@ -413,64 +413,161 @@ interface SignedOrderBundle {
   orderType: "GTC";
 }
 
+// ---------------------------------------------------------------------------
+// detectTradingMode
+// ---------------------------------------------------------------------------
+
+export type TradingModeId = "A_PROXY" | "B_EOA" | "UNKNOWN";
+
+export interface TradingModeDetection {
+  selectedMode:       TradingModeId;
+  eoaAddress:         string;
+  proxyAddress:       string | null;
+  proxyResolutionMethod: "clob_api" | "factory_contract" | "not_found";
+  /** allowance(EOA, CTF_EXCHANGE) en USDC */
+  eoaAllowanceCTF:    string;
+  /** allowance(EOA, NegRisk CTF Exchange) en USDC */
+  eoaAllowanceNegRisk: string;
+  /** allowance(proxy, CTF_EXCHANGE) en USDC — null si proxy non trouvé */
+  proxyAllowanceCTF:  string | null;
+  /** allowance(proxy, NegRisk CTF Exchange) en USDC — null si proxy non trouvé */
+  proxyAllowanceNegRisk: string | null;
+  rpcUsed:            string | null;
+  error:              string | null;
+}
+
 /**
- * Résout le mode de signature optimal :
- *   - signatureType 1 (proxy) si l'adresse proxy Polymarket est trouvée
- *     et que le proxy a une allowance USDC suffisante.
- *   - signatureType 0 (EOA) sinon (fonds sur le wallet EOA directement).
+ * Détecte automatiquement le mode de trading Polymarket du wallet :
  *
- * Polymarket UI dépose les USDC dans le proxy Safe — dans ce cas le proxy
- * est le maker. L'EOA signe l'ordre au nom du proxy (relayer pattern).
+ *   Mode A_PROXY (signatureType=1) :
+ *     - Le wallet a un proxy Polymarket Safe
+ *     - Le proxy a une allowance CTF Exchange > 0
+ *     - maker = proxy, signer = EOA
+ *
+ *   Mode B_EOA (signatureType=0) :
+ *     - Pas de proxy, ou proxy sans allowance
+ *     - L'EOA a directement une allowance CTF Exchange > 0
+ *     - maker = signer = EOA
+ *
+ *   UNKNOWN :
+ *     - Ni le proxy ni l'EOA n'a d'allowance
+ *     - Appeler /api/approve-ctf?execute=true pour débloquer
  */
+export async function detectTradingMode(
+  eoa: `0x${string}`
+): Promise<TradingModeDetection> {
+  const result: TradingModeDetection = {
+    selectedMode:            "UNKNOWN",
+    eoaAddress:              eoa,
+    proxyAddress:            null,
+    proxyResolutionMethod:   "not_found",
+    eoaAllowanceCTF:         "0",
+    eoaAllowanceNegRisk:     "0",
+    proxyAllowanceCTF:       null,
+    proxyAllowanceNegRisk:   null,
+    rpcUsed:                 null,
+    error:                   null,
+  };
+
+  for (const rpc of POLYGON_RPC_FALLBACKS()) {
+    try {
+      const client = createPublicClient({ chain: polygon, transport: http(rpc) });
+      result.rpcUsed = rpc;
+
+      // ── 1. Résoudre l'adresse proxy (best-effort) ─────────────────────────
+      const { proxy, debug } = await resolveProxyWithDebug(eoa, client);
+      result.proxyAddress          = proxy;
+      result.proxyResolutionMethod = debug.method;
+
+      // ── 2. Lire les allowances EOA ────────────────────────────────────────
+      const readAllowance = async (owner: `0x${string}`, spender: `0x${string}`) => {
+        const raw = await client.readContract({
+          address:      USDC_ADDRESS,
+          abi:          ERC20_ABI,
+          functionName: "allowance",
+          args:         [owner, spender],
+        }) as bigint;
+        return raw;
+      };
+
+      const eoaCTF      = await readAllowance(eoa, CTF_EXCHANGE);
+      const eoaNegRisk  = await readAllowance(eoa, NEG_RISK_CTF_EXCHANGE);
+      result.eoaAllowanceCTF     = (Number(eoaCTF)     / USDC_DECIMALS).toFixed(6);
+      result.eoaAllowanceNegRisk = (Number(eoaNegRisk) / USDC_DECIMALS).toFixed(6);
+
+      // ── 3. Lire les allowances proxy (si proxy trouvé) ────────────────────
+      if (proxy) {
+        const proxyCTF      = await readAllowance(proxy, CTF_EXCHANGE);
+        const proxyNegRisk  = await readAllowance(proxy, NEG_RISK_CTF_EXCHANGE);
+        result.proxyAllowanceCTF     = (Number(proxyCTF)     / USDC_DECIMALS).toFixed(6);
+        result.proxyAllowanceNegRisk = (Number(proxyNegRisk) / USDC_DECIMALS).toFixed(6);
+
+        if (proxyCTF > BigInt(0) || proxyNegRisk > BigInt(0)) {
+          result.selectedMode = "A_PROXY";
+          console.log(
+            `[clob] detectTradingMode: Mode A_PROXY — proxy=${proxy} ` +
+            `CTF=${result.proxyAllowanceCTF} NegRisk=${result.proxyAllowanceNegRisk}`
+          );
+          return result;
+        }
+      }
+
+      // ── 4. Check EOA allowance ─────────────────────────────────────────────
+      if (eoaCTF > BigInt(0) || eoaNegRisk > BigInt(0)) {
+        result.selectedMode = "B_EOA";
+        console.log(
+          `[clob] detectTradingMode: Mode B_EOA — EOA=${eoa} ` +
+          `CTF=${result.eoaAllowanceCTF} NegRisk=${result.eoaAllowanceNegRisk}`
+        );
+        return result;
+      }
+
+      // ── 5. Aucune allowance trouvée ───────────────────────────────────────
+      result.selectedMode = "UNKNOWN";
+      console.warn(
+        `[clob] detectTradingMode: UNKNOWN — ni proxy ni EOA n'a d'allowance CTF. ` +
+        `Appeler /api/approve-ctf?execute=true`
+      );
+      return result;
+
+    } catch (err) {
+      result.error = err instanceof Error ? err.message : String(err);
+      console.warn(`[clob] detectTradingMode RPC ${rpc} failed: ${result.error}`);
+    }
+  }
+
+  result.error = "All RPCs failed";
+  return result;
+}
+
 interface SigningMode {
   signatureType: 0 | 1;
-  makerAddress:  `0x${string}`;  // proxy (type 1) ou EOA (type 0)
+  makerAddress:  `0x${string}`;
   proxyAddress:  `0x${string}` | null;
+  detection:     TradingModeDetection;
 }
 
 async function resolveSigningMode(
   account: ReturnType<typeof getAccount>
 ): Promise<SigningMode> {
-  // Essayer de trouver le proxy sur le premier RPC disponible
-  for (const rpc of POLYGON_RPC_FALLBACKS()) {
-    try {
-      const client  = createPublicClient({ chain: polygon, transport: http(rpc) });
-      const proxy   = await getPolymarketProxyAddress(account.address, client);
-      if (!proxy) break;
+  const detection = await detectTradingMode(account.address);
 
-      // Vérifier que le proxy a bien une allowance CTF Exchange (mis en place via l'UI)
-      const spender  = CTF_EXCHANGE;
-      const rawAllow = await client.readContract({
-        address:      USDC_ADDRESS,
-        abi:          ERC20_ABI,
-        functionName: "allowance",
-        args:         [proxy, spender],
-      }) as bigint;
-
-      if (rawAllow > BigInt(0)) {
-        const usdcAmt = (Number(rawAllow) / USDC_DECIMALS).toFixed(2);
-        console.log(
-          `[clob] resolveSigningMode: proxy=${proxy} ` +
-          `allowance=${usdcAmt} USDC → signatureType=1`
-        );
-        return { signatureType: 1, makerAddress: proxy, proxyAddress: proxy };
-      }
-
-      // Proxy trouvé mais pas d'allowance — signaler pour info
-      console.warn(
-        `[clob] resolveSigningMode: proxy=${proxy} trouvé mais allowance=0 ` +
-        `(faire un approve depuis polymarket.com ou /api/approve-ctf?execute=true) ` +
-        `→ fallback signatureType=0`
-      );
-      break;
-    } catch {
-      break;
-    }
+  if (detection.selectedMode === "A_PROXY" && detection.proxyAddress) {
+    return {
+      signatureType: 1,
+      makerAddress:  detection.proxyAddress as `0x${string}`,
+      proxyAddress:  detection.proxyAddress as `0x${string}`,
+      detection,
+    };
   }
 
-  // Fallback EOA
-  console.log(`[clob] resolveSigningMode: pas de proxy utilisable → signatureType=0 (EOA)`);
-  return { signatureType: 0, makerAddress: account.address, proxyAddress: null };
+  // Mode B_EOA ou UNKNOWN (on tente quand même — le CLOB rejettera si aucune allowance)
+  return {
+    signatureType: 0,
+    makerAddress:  account.address,
+    proxyAddress:  null,
+    detection,
+  };
 }
 
 async function buildAndSignOrder(

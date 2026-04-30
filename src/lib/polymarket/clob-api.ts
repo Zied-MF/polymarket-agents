@@ -157,15 +157,42 @@ export function clearCredentialsCache(): void {
 // L1 Auth — signature du message Polymarket pour dériver les clés API
 // ---------------------------------------------------------------------------
 
-/** Construit les headers L1 (private key signing) pour les endpoints d'auth. */
+/**
+ * Construit les headers L1 (EIP-712 typed data) pour les endpoints d'auth.
+ *
+ * Signature EIP-712 — domaine ClobAuthDomain, type ClobAuth :
+ *   { address, timestamp, nonce, message: "This message attests that I control the given wallet" }
+ *
+ * Ref: https://docs.polymarket.com/api-reference/authentication
+ */
 async function buildL1Headers(
   account: ReturnType<typeof getAccount>,
   nonce = 0
 ): Promise<HeadersInit> {
   const timestamp = Math.floor(Date.now() / 1000).toString();
-  const message   = `ClobAuthDomain${timestamp}${nonce}`;
 
-  const signature = await account.signMessage({ message });
+  const signature = await account.signTypedData({
+    domain: {
+      name:    "ClobAuthDomain",
+      version: "1",
+      chainId: POLYGON_CHAIN_ID,
+    },
+    types: {
+      ClobAuth: [
+        { name: "address",   type: "address" },
+        { name: "timestamp", type: "string"  },
+        { name: "nonce",     type: "uint256" },
+        { name: "message",   type: "string"  },
+      ],
+    },
+    primaryType: "ClobAuth",
+    message: {
+      address:   account.address,
+      timestamp,
+      nonce:     BigInt(nonce),
+      message:   "This message attests that I control the given wallet",
+    },
+  });
 
   return {
     "POLY_ADDRESS":   account.address,
@@ -251,7 +278,7 @@ export async function deriveClobCredentials(privateKey?: string): Promise<ClobCr
 
   const res = await withRetry(
     () => fetch(`${CLOB_BASE}/auth/derive-api-key`, {
-      method:  "POST",
+      method:  "GET",   // doc officielle : GET (POST → 405)
       headers,
     }),
     "deriveClobCredentials"

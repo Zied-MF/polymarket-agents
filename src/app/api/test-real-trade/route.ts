@@ -278,10 +278,10 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
     );
   }
 
-  // 3. Balance USDC
+  // 3. Balance USDC (null = tous RPCs ont échoué)
   try {
     const balance = await getAccountBalance();
-    diag.balanceUsdc = balance;
+    diag.balanceUsdc = balance ?? "RPC_FAILURE";
   } catch (err) {
     diag.balanceError = err instanceof Error ? err.message : String(err);
   }
@@ -397,18 +397,29 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
   realTradingFlow.REAL_TRADING_ENABLED_after  = isRealTradingEnabled();
 
   // ── Step 1 : Balance ───────────────────────────────────────────────────────
+  // null = tous les RPCs Polygon ont échoué → on avertit mais on continue
+  // (Polymarket rejettera l'ordre côté CLOB si balance insuffisante).
   try {
     realTradingFlow.step = "balance_check";
     const balance     = await getAccountBalance();
     const minRequired = BET_USDC * 1.05;
-    realTradingFlow.balanceUsdc       = balance;
-    realTradingFlow.balanceMinRequired = minRequired;
-    realTradingFlow.balanceSufficient  = balance >= minRequired;
-    if (balance < minRequired) {
-      realTradingFlow.step  = "FAILED_balance";
-      realTradingFlow.error = `Balance insuffisante: ${balance.toFixed(4)} USDC < ${minRequired.toFixed(4)} USDC requis`;
-      diag.status = "REAL_FAILED_BALANCE";
-      return NextResponse.json(diag, { status: 422 });
+
+    if (balance === null) {
+      realTradingFlow.step              = "balance_check_skipped";
+      realTradingFlow.balanceUsdc       = null;
+      realTradingFlow.balanceNote       = "All Polygon RPCs failed — balance unknown, proceeding";
+      realTradingFlow.balanceSufficient = null;
+    } else {
+      realTradingFlow.balanceUsdc       = balance;
+      realTradingFlow.balanceMinRequired = minRequired;
+      realTradingFlow.balanceSufficient  = balance >= minRequired;
+      if (balance < minRequired) {
+        realTradingFlow.step  = "FAILED_balance";
+        realTradingFlow.error = `Balance insuffisante: ${balance.toFixed(4)} USDC < ${minRequired.toFixed(4)} USDC requis`;
+        diag.status = "REAL_FAILED_BALANCE";
+        return NextResponse.json(diag, { status: 422 });
+      }
+      realTradingFlow.step = "balance_check_ok";
     }
   } catch (err) {
     realTradingFlow.step       = "FAILED_balance_error";

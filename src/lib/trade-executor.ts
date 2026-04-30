@@ -169,10 +169,23 @@ export async function executeBuy(input: BuyInput): Promise<ExecuteBuyResult> {
       }
 
       // ── Guard 2 : Balance USDC suffisante ─────────────────────────────────
-      // Marge de sécurité 5% pour absorber les micro-variations de frais.
+      // getAccountBalance() retourne null si tous les RPCs échouent.
+      // Dans ce cas on avertit Discord et on continue — Polymarket rejettera
+      // l'ordre côté CLOB si la balance est réellement insuffisante.
       const balance    = await getAccountBalance();
       const minBalance = input.suggestedBet * 1.05;
-      if (balance < minBalance) {
+
+      if (balance === null) {
+        console.warn(
+          `[trade-executor] ⚠ Balance check skipped (all RPCs failed) — ` +
+          `proceeding, Polymarket will reject if insufficient`
+        );
+        sendDiscordAlert(
+          `⚠️ **Balance check skipped** — tous les RPCs Polygon ont échoué\n` +
+          `L'ordre sera soumis quand même. Polymarket rejettera si balance insuffisante.\n` +
+          `Marché: ${input.question.slice(0, 80)}`
+        ).catch(() => {});
+      } else if (balance < minBalance) {
         const msg =
           `Insufficient balance: ${balance.toFixed(2)}$ dispo, ` +
           `${minBalance.toFixed(2)}$ requis (bet=${input.suggestedBet.toFixed(2)}$ + 5% marge)`;

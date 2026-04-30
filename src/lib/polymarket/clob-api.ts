@@ -58,6 +58,34 @@ const ERC20_ABI = [
 /** Polygon RPC public (override via POLYGON_RPC_URL). */
 const POLYGON_RPC = () => process.env.POLYGON_RPC_URL ?? "https://polygon-rpc.com";
 
+/**
+ * Liste de RPCs publics Polygon — essayés dans l'ordre si le primaire échoue.
+ * Keeps the env-override first so users can pin their own RPC.
+ */
+const POLYGON_RPC_FALLBACKS = () => [
+  POLYGON_RPC(),
+  "https://rpc.ankr.com/polygon",
+  "https://polygon-bor-rpc.publicnode.com",
+  "https://1rpc.io/matic",
+];
+
+/**
+ * Polymarket Proxy Wallet Factory (Polygon mainnet).
+ * Chaque EOA Polymarket possède un Safe proxy où l'USDC de trading est déposé.
+ * Source : https://docs.polymarket.com/developer-resources/contracts
+ */
+const PROXY_FACTORY_ADDRESS = "0xaB45c5A4B0c941a2F231C6058491B37517764437" as `0x${string}`;
+
+const PROXY_FACTORY_ABI = [
+  {
+    name:            "getProxyWallet",
+    type:            "function",
+    stateMutability: "view",
+    inputs:          [{ name: "_user", type: "address" }],
+    outputs:         [{ type: "address" }],
+  },
+] as const;
+
 /** Types EIP-712 pour la signature d'un ordre CTF Exchange. */
 const ORDER_EIP712_TYPES = {
   Order: [
@@ -588,74 +616,152 @@ export async function getOrderBook(tokenId: string): Promise<OrderBook> {
 // getAccountBalance
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// getOnChainUSDCBalance
+// ---------------------------------------------------------------------------
+
 /**
- * Retourne le solde USDC du wallet en lisant directement la blockchain Polygon.
- *
- * Stratégie : on-chain balanceOf() en primary (fiable, sans auth),
- * fallback vers GET /balance-allowance si la lecture RPC échoue.
- *
- * Pourquoi on-chain plutôt que CLOB /balance-allowance :
- *   - Le CTF Exchange dépense directement l'USDC du wallet via l'allowance
- *   - balanceOf(wallet) = ce que le contrat peut réellement dépenser
- *   - Pas besoin de credentials API → plus simple et plus robuste
- *
- * Retourne la balance en USDC (pas en micro-USDC).
+ * Lit le solde USDC d'une adresse quelconque directement sur Polygon.
+ * Tente les RPCs de POLYGON_RPC_FALLBACKS() dans l'ordre.
+ * Retourne null si tous les RPCs échouent (ne throw pas).
  */
-export async function getAccountBalance(): Promise<number> {
+export async function getOnChainUSDCBalance(
+  address: `0x${string}`
+): Promise<number | null> {
+  for (const rpc of POLYGON_RPC_FALLBACKS()) {
+    try {
+      const client = createPublicClient({ chain: polygon, transport: http(rpc) });
+      const raw = await client.readContract({
+        address:      USDC_ADDRESS,
+        abi:          ERC20_ABI,
+        functionName: "balanceOf",
+        args:         [address],
+      }) as bigint;
+      const balance = Number(raw) / USDC_DECIMALS;
+      console.log(`[clob] getOnChainUSDCBalance(${address.slice(0, 10)}, rpc=${rpc}): ${balance.toFixed(4)} USDC`);
+      return balance;
+    } catch (err) {
+      console.warn(`[clob] RPC ${rpc} failed for balanceOf(${address.slice(0, 10)}): ${err instanceof Error ? err.message : err}`);
+    }
+  }
+  console.error(`[clob] getOnChainUSDCBalance: all ${POLYGON_RPC_FALLBACKS().length} RPCs failed`);
+  return null;
+}
+
+/**
+ * Résout l'adresse du proxy Polymarket (Safe proxy) pour un EOA.
+ *
+ * Essaie en premier l'endpoint public CLOB GET /proxy-wallet (rapide, sans auth),
+ * puis le contrat factory on-chain.
+ * Retourne null si aucune des deux méthodes ne fonctionne.
+ */
+async function getPolymarketProxyAddress(
+  eoa:    `0x${string}`,
+  client: ReturnType<typeof createPublicClient>
+): Promise<`0x${string}` | null> {
+  const ZERO = "0x0000000000000000000000000000000000000000";
+
+  // 1. CLOB API — GET /proxy-wallet?address= (endpoint public, pas d'auth)
+  try {
+    const res = await fetch(`${CLOB_BASE}/proxy-wallet?address=${eoa}`, {
+      headers: { Accept: "application/json" },
+    });
+    if (res.ok) {
+      const data = await res.json() as { proxy_wallet?: string; proxyWallet?: string };
+      const proxy = data.proxy_wallet ?? data.proxyWallet;
+      if (proxy && proxy !== ZERO) {
+        console.log(`[clob] Proxy via CLOB API: ${proxy}`);
+        return proxy as `0x${string}`;
+      }
+    }
+  } catch { /* fall through */ }
+
+  // 2. Factory contract on-chain
+  try {
+    const proxy = await client.readContract({
+      address:      PROXY_FACTORY_ADDRESS,
+      abi:          PROXY_FACTORY_ABI,
+      functionName: "getProxyWallet",
+      args:         [eoa],
+    }) as `0x${string}`;
+    if (proxy && proxy !== ZERO) {
+      console.log(`[clob] Proxy via factory contract: ${proxy}`);
+      return proxy;
+    }
+  } catch { /* fall through */ }
+
+  console.warn(`[clob] Could not resolve Polymarket proxy for ${eoa}`);
+  return null;
+}
+
+// ---------------------------------------------------------------------------
+// getAccountBalance
+// ---------------------------------------------------------------------------
+
+/**
+ * Retourne le solde USDC disponible pour trader, en essayant dans l'ordre :
+ *   1. Balance du proxy Polymarket (Safe proxy où l'USDC de trading est déposé)
+ *   2. Balance du wallet EOA (cas où les fonds sont encore sur le wallet direct)
+ *
+ * Utilise POLYGON_RPC_FALLBACKS() pour robustesse (RPC public peu fiable sur Vercel).
+ *
+ * Retourne null si TOUS les RPCs échouent — le Guard 2 dans trade-executor
+ * skippera alors le check avec un warning Discord (Polymarket rejettera l'ordre
+ * si balance insuffisante côté CLOB).
+ *
+ * Ne throw JAMAIS (retourne null au lieu de throw sur erreur réseau).
+ */
+export async function getAccountBalance(): Promise<number | null> {
   const privateKey = process.env.POLYGON_PRIVATE_KEY;
   if (!privateKey) throw new Error("[clob] POLYGON_PRIVATE_KEY non défini");
 
   const account = getAccount(privateKey);
 
-  // ── Primary : lecture on-chain via viem ────────────────────────────────────
-  try {
-    const client = createPublicClient({ chain: polygon, transport: http(POLYGON_RPC()) });
+  for (const rpc of POLYGON_RPC_FALLBACKS()) {
+    try {
+      const client = createPublicClient({ chain: polygon, transport: http(rpc) });
 
-    const balanceMicro = await client.readContract({
-      address:      USDC_ADDRESS,
-      abi:          ERC20_ABI,
-      functionName: "balanceOf",
-      args:         [account.address],
-    }) as bigint;
+      // 1. Proxy Polymarket (là où l'USDC tradable réside réellement)
+      const proxyAddress = await getPolymarketProxyAddress(account.address, client);
+      if (proxyAddress) {
+        const raw     = await client.readContract({
+          address:      USDC_ADDRESS,
+          abi:          ERC20_ABI,
+          functionName: "balanceOf",
+          args:         [proxyAddress],
+        }) as bigint;
+        const balance = Number(raw) / USDC_DECIMALS;
+        console.log(
+          `[clob] getAccountBalance (proxy, rpc=${rpc}): ` +
+          `${balance.toFixed(4)} USDC — proxy=${proxyAddress}`
+        );
+        return balance;
+      }
 
-    const balance = Number(balanceMicro) / USDC_DECIMALS;
-    console.log(`[clob] getAccountBalance (on-chain): ${balance.toFixed(4)} USDC (${account.address})`);
-    return balance;
-  } catch (rpcErr) {
-    console.warn(
-      `[clob] getAccountBalance on-chain failed, trying CLOB fallback: ` +
-      `${rpcErr instanceof Error ? rpcErr.message : rpcErr}`
-    );
+      // 2. EOA direct (fonds pas encore déposés dans le proxy)
+      const raw     = await client.readContract({
+        address:      USDC_ADDRESS,
+        abi:          ERC20_ABI,
+        functionName: "balanceOf",
+        args:         [account.address],
+      }) as bigint;
+      const balance = Number(raw) / USDC_DECIMALS;
+      console.log(
+        `[clob] getAccountBalance (EOA, rpc=${rpc}): ` +
+        `${balance.toFixed(4)} USDC — ${account.address}`
+      );
+      return balance;
+    } catch (err) {
+      console.warn(
+        `[clob] getAccountBalance RPC ${rpc} failed: ` +
+        `${err instanceof Error ? err.message : err}`
+      );
+    }
   }
 
-  // ── Fallback : GET /balance-allowance?signature_type=0&asset_type=0 ────────
-  // Endpoint officiel Polymarket CLOB (L2 auth required).
-  // asset_type=0 = USDC (collateral), signature_type=0 = EOA.
-  const path    = "/balance-allowance";
-  const query   = "?signature_type=0&asset_type=0";
-  const creds   = await deriveClobCredentials(privateKey);
-  const headers = buildApiHeaders(creds, "GET", path);
-
-  const res = await withRetry(
-    () => fetch(`${CLOB_BASE}${path}${query}`, { headers }),
-    "getAccountBalance(clob-fallback)"
-  );
-
-  if (!res.ok) {
-    const body = await res.text().catch(() => "");
-    throw new Error(`[clob] getAccountBalance CLOB fallback HTTP ${res.status}: ${body}`);
-  }
-
-  // Réponse CLOB : { USDC: { balance: "10.5", allowance: "..." } }
-  // ou { balance: "10.5" } selon la version API — on essaie les deux formats.
-  const data = await res.json() as Record<string, unknown>;
-  const raw  = (data?.USDC as Record<string, unknown>)?.balance
-             ?? (data as Record<string, unknown>)?.balance
-             ?? "0";
-
-  const balance = parseFloat(String(raw));
-  console.log(`[clob] getAccountBalance (clob-fallback): ${balance.toFixed(4)} USDC`);
-  return balance;
+  // Tous les RPCs ont échoué — guard skippa avec warning
+  console.error("[clob] getAccountBalance: all RPCs failed — returning null");
+  return null;
 }
 
 // ---------------------------------------------------------------------------

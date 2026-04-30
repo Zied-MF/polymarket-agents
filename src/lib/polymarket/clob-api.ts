@@ -170,27 +170,41 @@ export function clearCredentialsCache(): void {
 
 /**
  * Retourne un ClobClient initialisé avec le bon mode de signature.
- * Détecte automatiquement EOA vs Proxy, dérive les clés API, et met en cache.
+ *
+ * Priorité :
+ *   1. POLYMARKET_FUNDER_ADDRESS + POLYMARKET_SIGNATURE_TYPE définis → utilisation directe
+ *   2. Sinon → détection automatique via detectTradingMode()
  */
 async function getClobClient(): Promise<ClobClient> {
   const privateKey = process.env.POLYGON_PRIVATE_KEY;
   if (!privateKey) throw new Error("[clob] POLYGON_PRIVATE_KEY non défini");
 
-  const account     = getAccount(privateKey);
-  const detection   = await detectTradingMode(account.address);
-  const sigType     = detection.selectedMode === "A_PROXY"
-    ? SignatureTypeV2.POLY_PROXY
-    : SignatureTypeV2.EOA;
-  const funder      = detection.selectedMode === "A_PROXY" && detection.proxyAddress
-    ? detection.proxyAddress
-    : undefined;
+  const account = getAccount(privateKey);
 
-  // Retourner le cache si le mode n'a pas changé
-  if (_cachedClient && _cachedClientMode === detection.selectedMode) {
-    return _cachedClient;
+  // ── Mode explicite via env vars ──────────────────────────────────────────
+  const envFunder  = process.env.POLYMARKET_FUNDER_ADDRESS;
+  const envSigType = process.env.POLYMARKET_SIGNATURE_TYPE;
+
+  let sigType: SignatureTypeV2;
+  let funder:  string | undefined;
+  let modeKey: string;
+
+  if (envFunder && envSigType) {
+    const st = parseInt(envSigType, 10) as SignatureTypeV2;
+    sigType  = isNaN(st) ? SignatureTypeV2.POLY_GNOSIS_SAFE : st;
+    funder   = envFunder;
+    modeKey  = `env:${sigType}:${funder}`;
+    console.log(`[clob] Mode explicite via env: sigType=${SignatureTypeV2[sigType]} funder=${funder}`);
+  } else {
+    // ── Détection automatique ────────────────────────────────────────────
+    const detection = await detectTradingMode(account.address);
+    sigType  = detection.selectedMode === "A_PROXY" ? SignatureTypeV2.POLY_PROXY : SignatureTypeV2.EOA;
+    funder   = detection.selectedMode === "A_PROXY" && detection.proxyAddress ? detection.proxyAddress : undefined;
+    modeKey  = detection.selectedMode;
   }
 
-  // viem WalletClient comme signer — accepté nativement par ClobClient
+  if (_cachedClient && _cachedClientMode === modeKey) return _cachedClient;
+
   const walletClient = createWalletClient({
     account,
     chain:     polygon,
@@ -198,14 +212,11 @@ async function getClobClient(): Promise<ClobClient> {
   });
 
   // Étape 1 : dériver les clés API (L1 auth via signer)
-  // V2 : constructeur options object ({ host, chain, signer, … })
   const tempClient = new ClobClient({ host: CLOB_BASE, chain: POLYGON_CHAIN_ID, signer: walletClient });
   const creds      = await tempClient.deriveApiKey();
 
-  // Étape 2 : client complet avec creds + mode de signature
-  // throwOnError=true : les erreurs HTTP Polymarket (400/403/…) sont levées
-  // avec le message d'erreur exact au lieu d'être silencieusement retournées.
-  _cachedClient     = new ClobClient({
+  // Étape 2 : client complet
+  _cachedClient = new ClobClient({
     host:          CLOB_BASE,
     chain:         POLYGON_CHAIN_ID,
     signer:        walletClient,
@@ -214,12 +225,11 @@ async function getClobClient(): Promise<ClobClient> {
     funderAddress: funder,
     throwOnError:  true,
   });
-  _cachedClientMode = detection.selectedMode;
+  _cachedClientMode = modeKey as TradingModeId;
 
   console.log(
-    `[clob] ✅ ClobClient V2 initialisé: mode=${detection.selectedMode} ` +
-    `sigType=${sigType}(${SignatureTypeV2[sigType]}) ` +
-    `maker=${funder ?? account.address}`
+    `[clob] ✅ ClobClient V2: sigType=${SignatureTypeV2[sigType]}(${sigType}) ` +
+    `funder=${funder ?? "none(EOA)"} maker=${funder ?? account.address}`
   );
 
   return _cachedClient;
@@ -565,9 +575,20 @@ export async function getAccountBalance(): Promise<number | null> {
 
   const account = getAccount(privateKey);
 
+  // Si POLYMARKET_FUNDER_ADDRESS est défini, c'est là que sont les fonds
+  const envFunder = process.env.POLYMARKET_FUNDER_ADDRESS as `0x${string}` | undefined;
+
   for (const rpc of POLYGON_RPC_FALLBACKS()) {
     try {
       const client = createPublicClient({ chain: polygon, transport: http(rpc) });
+
+      if (envFunder) {
+        const raw     = await client.readContract({ address: USDC_ADDRESS, abi: ERC20_ABI, functionName: "balanceOf", args: [envFunder] }) as bigint;
+        const balance = Number(raw) / USDC_DECIMALS;
+        console.log(`[clob] getAccountBalance (env funder ${envFunder.slice(0, 10)}…): ${balance.toFixed(4)} USDC`);
+        return balance;
+      }
+
       const proxy  = await getPolymarketProxyAddress(account.address, client);
 
       if (proxy) {

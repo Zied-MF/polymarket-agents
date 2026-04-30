@@ -25,12 +25,20 @@ import { executeBuy }                from "@/lib/trade-executor";
 import { getPositionByPaperTradeId } from "@/lib/db/positions";
 
 // ---------------------------------------------------------------------------
-// Gamma — cherche un marché météo ouvert peu cher
+// Gamma — recherche d'un marché pour test d'exécution
 // ---------------------------------------------------------------------------
 
 const GAMMA_BASE = "https://gamma-api.polymarket.com";
 
-interface GammaMarket {
+const GAMMA_HEADERS: HeadersInit = {
+  Accept:       "application/json",
+  "User-Agent": "polymarket-agents/test",
+};
+
+/** Mots-clés météo — match si au moins un est dans la question (case-insensitive). */
+const WEATHER_KEYWORDS = ["temperature", "rain", "snow", "weather", "heat", "cold", "wind", "storm"];
+
+interface GammaRawMarket {
   id:             string;
   conditionId?:   string;
   question?:      string;
@@ -41,6 +49,15 @@ interface GammaMarket {
   endDate?:       string;
   liquidity?:     string | number;
   volume?:        string | number;
+}
+
+interface GammaEvent {
+  id:      string;
+  title?:  string;
+  endDate?: string;
+  active?:  boolean;
+  closed?:  boolean;
+  markets?: GammaRawMarket[];
 }
 
 function parseJsonField<T>(raw: string | T[] | undefined): T[] {
@@ -56,85 +73,151 @@ export interface FoundMarket {
   yesPrice:     number;
   liquidity:    number;
   hoursToClose: number;
+  matchReason:  string;  // quelle passe a sélectionné ce marché (debug)
+}
+
+export interface MarketSearchDiag {
+  eventsFromGamma:      number;
+  marketsExtracted:     number;  // tous les marchés dans tous les events
+  marketsActive:        number;
+  weatherMarketsFound:  number;  // passent filtre keyword + 7j + liq>100
+  fallbackMarketsFound: number;  // si weatherMarketsFound=0, any market 30j liq>100
+  sampleQuestions:      string[];
+  selectedMarket:       FoundMarket | null;
 }
 
 /**
- * Cherche un marché température actif se résolvant dans les 48h, trié par liquidité.
+ * Cherche un marché pour test d'exécution, en 3 passes de plus en plus larges.
  *
- * Filtres :
- *   1. active=true, closed=false
- *   2. question contient "temperature" (insensible à la casse)
- *   3. endDate dans les 48 prochaines heures
- *   4. Prix Yes entre 0.05 et 0.95 (marché pas trop déséquilibré)
+ * Passe 1 — météo stricte :
+ *   keyword météo + endDate < 7j + yesPrice 1-99% + liquidity > 100
+ * Passe 2 — n'importe quel actif :
+ *   endDate < 30j + yesPrice 1-99% + liquidity > 100
  *
- * Tri : liquidité décroissante → on prend le marché le plus liquide.
+ * Source : /events?tag_slug=weather (même endpoint que le bot)
+ * + fallback /markets?active=true pour la passe 2 si besoin.
  */
-async function findTemperatureMarket(): Promise<FoundMarket | null> {
-  const HEADERS = {
-    Accept:       "application/json",
-    "User-Agent": "polymarket-agents/test",
-  };
-  const MAX_HOURS = 48;
-  const now       = Date.now();
+async function findMarketForTest(): Promise<MarketSearchDiag> {
+  const now      = Date.now();
+  const H7       = 7  * 24 * 60 * 60 * 1000;
+  const H30      = 30 * 24 * 60 * 60 * 1000;
+  const MIN_LIQ  = 100;
 
-  // Gamma /markets supporte jusqu'à limit=100
-  const url = `${GAMMA_BASE}/markets?tag=weather&active=true&closed=false&limit=100`;
-  let markets: GammaMarket[];
+  const diag: MarketSearchDiag = {
+    eventsFromGamma:      0,
+    marketsExtracted:     0,
+    marketsActive:        0,
+    weatherMarketsFound:  0,
+    fallbackMarketsFound: 0,
+    sampleQuestions:      [],
+    selectedMarket:       null,
+  };
+
+  // ── Source 1 : /events?tag_slug=weather (même URL que le bot) ─────────────
+  let allMarkets: (GammaRawMarket & { _eventTitle?: string })[] = [];
+
   try {
-    const res = await fetch(url, { headers: HEADERS });
-    if (!res.ok) {
-      console.error(`[test-real-trade] Gamma HTTP ${res.status}`);
-      return null;
+    const url = `${GAMMA_BASE}/events?tag_slug=weather&active=true&closed=false&order=endDate&ascending=true&limit=100`;
+    const res = await fetch(url, { headers: GAMMA_HEADERS });
+    if (res.ok) {
+      const raw: unknown = await res.json();
+      const events: GammaEvent[] = Array.isArray(raw)
+        ? (raw as GammaEvent[])
+        : (((raw as Record<string, unknown>).data) as GammaEvent[] | undefined) ?? [];
+
+      diag.eventsFromGamma = events.length;
+
+      for (const ev of events) {
+        for (const m of (ev.markets ?? [])) {
+          allMarkets.push({ ...m, _eventTitle: ev.title });
+          diag.marketsExtracted++;
+        }
+      }
     }
-    markets = await res.json() as GammaMarket[];
-  } catch (err) {
-    console.error(`[test-real-trade] Gamma fetch error: ${err instanceof Error ? err.message : err}`);
-    return null;
+  } catch { /* continue avec fallback */ }
+
+  // ── Source 2 fallback : /markets?active=true si events vides ──────────────
+  if (allMarkets.length === 0) {
+    try {
+      const url = `${GAMMA_BASE}/markets?active=true&closed=false&limit=200`;
+      const res = await fetch(url, { headers: GAMMA_HEADERS });
+      if (res.ok) {
+        const raw = await res.json() as GammaRawMarket[];
+        allMarkets = raw;
+        diag.marketsExtracted = raw.length;
+      }
+    } catch { /* ignore */ }
   }
 
-  const candidates: FoundMarket[] = [];
+  // ── Stats de base ──────────────────────────────────────────────────────────
+  const activeMarkets = allMarkets.filter((m) => m.active !== false && !m.closed);
+  diag.marketsActive  = activeMarkets.length;
+  diag.sampleQuestions = activeMarkets
+    .slice(0, 5)
+    .map((m) => m.question ?? m._eventTitle ?? m.id);
 
-  for (const m of markets) {
-    // 1. Actif et non fermé
-    if (!m.active || m.closed) continue;
-
-    // 2. Doit contenir "temperature" dans la question
-    const question = m.question ?? "";
-    if (!question.toLowerCase().includes("temperature")) continue;
-
-    // 3. endDate dans les 48 prochaines heures
-    if (!m.endDate) continue;
-    const closeMs       = new Date(m.endDate).getTime();
-    if (isNaN(closeMs)) continue;
-    const hoursToClose  = (closeMs - now) / (1000 * 60 * 60);
-    if (hoursToClose <= 0 || hoursToClose > MAX_HOURS) continue;
-
-    // 4. Prix Yes entre 0.05 et 0.95
+  // ── Helper : convertir un GammaRawMarket en FoundMarket ───────────────────
+  function toFound(m: GammaRawMarket & { _eventTitle?: string }, reason: string): FoundMarket | null {
     const conditionId = m.conditionId ?? m.id;
     const outcomes    = parseJsonField<string>(m.outcomes);
     const prices      = parseJsonField<string>(m.outcomePrices).map(Number);
     const yesIdx      = outcomes.findIndex((o) => o.toLowerCase() === "yes");
-    if (yesIdx < 0 || prices.length !== outcomes.length) continue;
-    const yesPrice = prices[yesIdx];
-    if (yesPrice < 0.05 || yesPrice > 0.95) continue;
-
-    const liquidity = parseFloat(String(m.liquidity ?? "0"));
-
-    candidates.push({ gammaId: m.id, conditionId, question, yesPrice, liquidity, hoursToClose });
+    if (yesIdx < 0 || prices.length !== outcomes.length) return null;
+    const yesPrice    = prices[yesIdx];
+    if (yesPrice <= 0.01 || yesPrice >= 0.99) return null;
+    const closeMs     = m.endDate ? new Date(m.endDate).getTime() : NaN;
+    const hoursToClose = isNaN(closeMs) ? 999 : (closeMs - now) / 3_600_000;
+    const liquidity   = parseFloat(String(m.liquidity ?? "0"));
+    return {
+      gammaId:      m.id,
+      conditionId,
+      question:     m.question ?? m._eventTitle ?? m.id,
+      yesPrice,
+      liquidity,
+      hoursToClose: Math.round(hoursToClose * 10) / 10,
+      matchReason:  reason,
+    };
   }
 
-  if (candidates.length === 0) return null;
+  // ── Passe 1 : météo keyword + 7j + liq > 100 ──────────────────────────────
+  const weatherPass1: FoundMarket[] = [];
+  for (const m of activeMarkets) {
+    const q   = (m.question ?? m._eventTitle ?? "").toLowerCase();
+    const hit = WEATHER_KEYWORDS.some((kw) => q.includes(kw));
+    if (!hit) continue;
+    const closeMs = m.endDate ? new Date(m.endDate).getTime() : NaN;
+    if (!isNaN(closeMs) && (closeMs - now) > H7) continue;
+    const liq = parseFloat(String(m.liquidity ?? "0"));
+    if (liq < MIN_LIQ) continue;
+    const found = toFound(m, `weather-keyword+7d`);
+    if (found) weatherPass1.push(found);
+  }
+  diag.weatherMarketsFound = weatherPass1.length;
 
-  // Trier par liquidité décroissante — on veut le marché le plus liquide
-  candidates.sort((a, b) => b.liquidity - a.liquidity);
+  if (weatherPass1.length > 0) {
+    weatherPass1.sort((a, b) => b.liquidity - a.liquidity);
+    diag.selectedMarket = weatherPass1[0];
+    return diag;
+  }
 
-  console.log(
-    `[test-real-trade] ${candidates.length} marché(s) température trouvé(s) dans les 48h — ` +
-    `meilleur: "${candidates[0].question.slice(0, 60)}" ` +
-    `liq=$${candidates[0].liquidity.toFixed(0)} ${candidates[0].hoursToClose.toFixed(1)}h`
-  );
+  // ── Passe 2 : n'importe quel actif + 30j + liq > 100 ─────────────────────
+  const fallbackPass: FoundMarket[] = [];
+  for (const m of activeMarkets) {
+    const closeMs = m.endDate ? new Date(m.endDate).getTime() : NaN;
+    if (!isNaN(closeMs) && (closeMs - now) > H30) continue;
+    const liq = parseFloat(String(m.liquidity ?? "0"));
+    if (liq < MIN_LIQ) continue;
+    const found = toFound(m, `any-market+30d`);
+    if (found) fallbackPass.push(found);
+  }
+  diag.fallbackMarketsFound = fallbackPass.length;
 
-  return candidates[0];
+  if (fallbackPass.length > 0) {
+    fallbackPass.sort((a, b) => b.liquidity - a.liquidity);
+    diag.selectedMarket = fallbackPass[0];
+  }
+
+  return diag;
 }
 
 // ---------------------------------------------------------------------------
@@ -180,13 +263,24 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
     diag.balanceError = err instanceof Error ? err.message : String(err);
   }
 
-  // 4. Trouver un marché température actif (résolution < 48h, le plus liquide)
-  const market = await findTemperatureMarket();
+  // 4. Chercher un marché (3 passes, de plus en plus larges)
+  const searchDiag = await findMarketForTest();
+  diag.marketSearch = {
+    eventsFromGamma:      searchDiag.eventsFromGamma,
+    marketsExtracted:     searchDiag.marketsExtracted,
+    marketsActive:        searchDiag.marketsActive,
+    weatherMarketsFound:  searchDiag.weatherMarketsFound,
+    fallbackMarketsFound: searchDiag.fallbackMarketsFound,
+    sampleQuestions:      searchDiag.sampleQuestions,
+    selectedMarket:       searchDiag.selectedMarket,
+  };
+
+  const market = searchDiag.selectedMarket;
   if (!market) {
     return NextResponse.json(
       {
         ...diag,
-        error: "Aucun marché température trouvé (critères: question contient 'temperature', clôture < 48h, actif)",
+        error: `Aucun marché trouvé. Consulter marketSearch pour le diagnostic complet.`,
       },
       { status: 404 }
     );
@@ -197,7 +291,8 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
     question:     market.question,
     yesPrice:     market.yesPrice,
     liquidity:    market.liquidity,
-    hoursToClose: parseFloat(market.hoursToClose.toFixed(1)),
+    hoursToClose: market.hoursToClose,
+    matchReason:  market.matchReason,
   };
 
   // 5. Résoudre les tokenIds via le CLOB

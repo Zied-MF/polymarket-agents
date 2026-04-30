@@ -21,6 +21,7 @@ import {
   placeOrder,
   getAccountBalance,
   checkCTFAllowance,
+  debugAllowances,
 }                                    from "@/lib/polymarket/clob-api";
 import { executeBuy, isRealTradingEnabled, resetAllowanceCache } from "@/lib/trade-executor";
 import { getPositionByPaperTradeId }                            from "@/lib/db/positions";
@@ -286,6 +287,14 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
     diag.balanceError = err instanceof Error ? err.message : String(err);
   }
 
+  // 3b. Allowance debug — TOUJOURS dans la réponse (dry_run ou live)
+  // Capture proxy resolution + raw allowance values pour diagnostic complet.
+  try {
+    diag.allowanceDebug = await debugAllowances();
+  } catch (err) {
+    diag.allowanceDebug = { error: err instanceof Error ? err.message : String(err) };
+  }
+
   // 4. Chercher un marché (3 passes, de plus en plus larges)
   const searchDiag = await findMarketForTest();
   diag.marketSearch = {
@@ -430,17 +439,29 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
   }
 
   // ── Step 2 : Allowance CTF Exchange ───────────────────────────────────────
+  // allowanceDebug (step 3b above) already has full proxy + raw values.
+  // Surface key fields here for quick reading alongside the other flow steps.
   try {
     realTradingFlow.step = "allowance_check";
+
+    const ad = diag.allowanceDebug as Record<string, unknown> | null | undefined;
+    if (ad && !("error" in (ad as object))) {
+      realTradingFlow.allowanceOwnerChecked = (ad as { ownerChecked?: string }).ownerChecked ?? null;
+      realTradingFlow.allowanceOwnerType    = (ad as { ownerType?: string }).ownerType ?? null;
+      realTradingFlow.proxyResolved         =
+        (ad as { proxyResolution?: { proxyAddress?: string } }).proxyResolution?.proxyAddress ?? null;
+    }
+
     const { sufficient, allowance } = await checkCTFAllowance();
     realTradingFlow.allowanceUsdc       = (Number(allowance) / 1_000_000).toFixed(2);
     realTradingFlow.allowanceSufficient = sufficient;
     if (!sufficient) {
       realTradingFlow.step  = "FAILED_allowance";
-      realTradingFlow.error = `CTF Exchange allowance insuffisante (${(Number(allowance) / 1_000_000).toFixed(2)} USDC). Appeler approveCTF().`;
+      realTradingFlow.error = `CTF Exchange allowance insuffisante (${(Number(allowance) / 1_000_000).toFixed(2)} USDC). Appeler /api/approve-ctf?execute=true.`;
       diag.status = "REAL_FAILED_ALLOWANCE";
       return NextResponse.json(diag, { status: 422 });
     }
+    realTradingFlow.step = "allowance_check_ok";
   } catch (err) {
     realTradingFlow.step       = "FAILED_allowance_error";
     realTradingFlow.error      = err instanceof Error ? err.message : String(err);

@@ -710,50 +710,97 @@ export async function getOnChainUSDCBalance(
   return null;
 }
 
+// ---------------------------------------------------------------------------
+// Proxy resolution — verbose (debug info always captured)
+// ---------------------------------------------------------------------------
+
+export interface ProxyResolutionDebug {
+  eoa:              string;
+  proxyAddress:     string | null;
+  method:           "clob_api" | "factory_contract" | "not_found";
+  clobApiUrl:       string;
+  clobApiStatus:    number | null;
+  clobApiBody:      string | null;
+  clobApiError:     string | null;
+  factoryAddress:   string;
+  factoryResult:    string | null;
+  factoryError:     string | null;
+}
+
 /**
- * Résout l'adresse du proxy Polymarket (Safe proxy) pour un EOA.
- *
- * Essaie en premier l'endpoint public CLOB GET /proxy-wallet (rapide, sans auth),
- * puis le contrat factory on-chain.
- * Retourne null si aucune des deux méthodes ne fonctionne.
+ * Résout l'adresse du proxy Polymarket avec debug complet.
+ * Essaie CLOB API puis factory contract — capture tout pour diagnostic.
  */
-async function getPolymarketProxyAddress(
+async function resolveProxyWithDebug(
   eoa:    `0x${string}`,
   client: ReturnType<typeof createPublicClient>
-): Promise<`0x${string}` | null> {
-  const ZERO = "0x0000000000000000000000000000000000000000";
+): Promise<{ proxy: `0x${string}` | null; debug: ProxyResolutionDebug }> {
+  const ZERO  = "0x0000000000000000000000000000000000000000";
+  const url   = `${CLOB_BASE}/proxy-wallet?address=${eoa}`;
+  const debug: ProxyResolutionDebug = {
+    eoa,
+    proxyAddress:   null,
+    method:         "not_found",
+    clobApiUrl:     url,
+    clobApiStatus:  null,
+    clobApiBody:    null,
+    clobApiError:   null,
+    factoryAddress: PROXY_FACTORY_ADDRESS,
+    factoryResult:  null,
+    factoryError:   null,
+  };
 
-  // 1. CLOB API — GET /proxy-wallet?address= (endpoint public, pas d'auth)
+  // 1. CLOB API — GET /proxy-wallet?address=
   try {
-    const res = await fetch(`${CLOB_BASE}/proxy-wallet?address=${eoa}`, {
-      headers: { Accept: "application/json" },
-    });
+    const res  = await fetch(url, { headers: { Accept: "application/json" } });
+    const body = await res.text();
+    debug.clobApiStatus = res.status;
+    debug.clobApiBody   = body.slice(0, 300); // cap to avoid noise
+
     if (res.ok) {
-      const data = await res.json() as { proxy_wallet?: string; proxyWallet?: string };
-      const proxy = data.proxy_wallet ?? data.proxyWallet;
-      if (proxy && proxy !== ZERO) {
+      const data = JSON.parse(body) as Record<string, unknown>;
+      const proxy = (data.proxy_wallet ?? data.proxyWallet ?? data.address) as string | undefined;
+      if (proxy && proxy !== ZERO && proxy.startsWith("0x")) {
+        debug.proxyAddress = proxy;
+        debug.method       = "clob_api";
         console.log(`[clob] Proxy via CLOB API: ${proxy}`);
-        return proxy as `0x${string}`;
+        return { proxy: proxy as `0x${string}`, debug };
       }
     }
-  } catch { /* fall through */ }
+  } catch (err) {
+    debug.clobApiError = err instanceof Error ? err.message : String(err);
+  }
 
   // 2. Factory contract on-chain
   try {
-    const proxy = await client.readContract({
+    const result = await client.readContract({
       address:      PROXY_FACTORY_ADDRESS,
       abi:          PROXY_FACTORY_ABI,
       functionName: "getProxyWallet",
       args:         [eoa],
     }) as `0x${string}`;
-    if (proxy && proxy !== ZERO) {
-      console.log(`[clob] Proxy via factory contract: ${proxy}`);
-      return proxy;
+    debug.factoryResult = result;
+    if (result && result !== ZERO && result.startsWith("0x")) {
+      debug.proxyAddress = result;
+      debug.method       = "factory_contract";
+      console.log(`[clob] Proxy via factory contract: ${result}`);
+      return { proxy: result, debug };
     }
-  } catch { /* fall through */ }
+  } catch (err) {
+    debug.factoryError = err instanceof Error ? err.message : String(err);
+  }
 
   console.warn(`[clob] Could not resolve Polymarket proxy for ${eoa}`);
-  return null;
+  return { proxy: null, debug };
+}
+
+/** Wrapper sans debug pour usage interne. */
+async function getPolymarketProxyAddress(
+  eoa:    `0x${string}`,
+  client: ReturnType<typeof createPublicClient>
+): Promise<`0x${string}` | null> {
+  const { proxy } = await resolveProxyWithDebug(eoa, client);
+  return proxy;
 }
 
 // ---------------------------------------------------------------------------
@@ -948,6 +995,126 @@ export async function checkAllAllowances(): Promise<SpenderAllowance[]> {
   }
 
   throw new Error(`[clob] checkAllAllowances: all RPCs failed — ${lastErr.message}`);
+}
+
+// ---------------------------------------------------------------------------
+// debugAllowances  — expose tout pour diagnostic dans /api/test-real-trade
+// ---------------------------------------------------------------------------
+
+export interface AllowanceDebugEntry {
+  spenderName:      string;
+  spenderAddress:   string;
+  owner:            string;        // adresse réellement vérifiée
+  allowanceRaw:     string;        // bigint en string
+  allowanceFormatted: string;      // en USDC
+  sufficient:       boolean;
+  rpcUsed:          string;
+  error:            string | null;
+}
+
+export interface AllowanceDebugResult {
+  eoaAddress:            string;
+  proxyResolution:       ProxyResolutionDebug;
+  ownerChecked:          string;   // proxy ou EOA
+  ownerType:             "proxy" | "eoa";
+  ctfExchangeAddress:    string;
+  negRiskExchangeAddress: string;
+  spenders:              AllowanceDebugEntry[];
+  rpcAttempts:           string[];
+}
+
+/**
+ * Version complète avec debug de checkAllAllowances().
+ * Expose chaque étape (proxy resolution, RPC tentées, valeurs raw) dans la réponse.
+ */
+export async function debugAllowances(): Promise<AllowanceDebugResult> {
+  const privateKey = process.env.POLYGON_PRIVATE_KEY;
+  if (!privateKey) throw new Error("[clob] POLYGON_PRIVATE_KEY non défini");
+
+  const account = getAccount(privateKey);
+  const rpcs    = POLYGON_RPC_FALLBACKS();
+  const attempted: string[] = [];
+  let   proxyDebug: ProxyResolutionDebug | null = null;
+  let   owner: `0x${string}` = account.address;
+  let   ownerType: "proxy" | "eoa" = "eoa";
+
+  // Résoudre le proxy sur le premier RPC disponible
+  for (const rpc of rpcs) {
+    attempted.push(rpc);
+    try {
+      const client = createPublicClient({ chain: polygon, transport: http(rpc) });
+      const { proxy, debug } = await resolveProxyWithDebug(account.address, client);
+      proxyDebug = debug;
+      if (proxy) {
+        owner     = proxy;
+        ownerType = "proxy";
+      }
+      break; // RPC fonctionne, on s'arrête là
+    } catch (err) {
+      console.warn(`[clob] debugAllowances RPC ${rpc} failed: ${err instanceof Error ? err.message : err}`);
+    }
+  }
+
+  // Lire les allowances pour chaque spender
+  const spenderResults: AllowanceDebugEntry[] = [];
+
+  for (const { name, address: spender } of APPROVAL_SPENDERS) {
+    let entry: AllowanceDebugEntry = {
+      spenderName:      name,
+      spenderAddress:   spender,
+      owner,
+      allowanceRaw:     "0",
+      allowanceFormatted: "0.000000",
+      sufficient:       false,
+      rpcUsed:          "",
+      error:            null,
+    };
+
+    for (const rpc of rpcs) {
+      try {
+        const client = createPublicClient({ chain: polygon, transport: http(rpc) });
+        const raw = await client.readContract({
+          address:      USDC_ADDRESS,
+          abi:          ERC20_ABI,
+          functionName: "allowance",
+          args:         [owner, spender],
+        }) as bigint;
+
+        const formatted = (Number(raw) / USDC_DECIMALS).toFixed(6);
+        entry = {
+          ...entry,
+          allowanceRaw:       raw.toString(),
+          allowanceFormatted: formatted,
+          sufficient:         raw > BigInt(1_000 * USDC_DECIMALS),
+          rpcUsed:            rpc,
+          error:              null,
+        };
+
+        console.log(`[clob] debugAllowances: allowance(${owner.slice(0,10)}, ${name}) = ${formatted} USDC`);
+        break;
+      } catch (err) {
+        entry.error = err instanceof Error ? err.message : String(err);
+      }
+    }
+
+    spenderResults.push(entry);
+  }
+
+  return {
+    eoaAddress:             account.address,
+    proxyResolution:        proxyDebug ?? {
+      eoa: account.address, proxyAddress: null, method: "not_found",
+      clobApiUrl: `${CLOB_BASE}/proxy-wallet?address=${account.address}`,
+      clobApiStatus: null, clobApiBody: null, clobApiError: "no RPC succeeded",
+      factoryAddress: PROXY_FACTORY_ADDRESS, factoryResult: null, factoryError: null,
+    },
+    ownerChecked:           owner,
+    ownerType,
+    ctfExchangeAddress:     CTF_EXCHANGE,
+    negRiskExchangeAddress: NEG_RISK_CTF_EXCHANGE,
+    spenders:               spenderResults,
+    rpcAttempts:            attempted,
+  };
 }
 
 /**

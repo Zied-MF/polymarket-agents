@@ -36,7 +36,7 @@ const USDC_ADDRESS          = "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359" as `0
 /** uint256 max — allowance illimitée. */
 const MAX_UINT256           = BigInt("0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
 
-/** ABI minimal ERC-20 pour lire/écrire l'allowance. */
+/** ABI minimal ERC-20 pour lire/écrire l'allowance et la balance. */
 const ERC20_ABI = [
   {
     name: "allowance", type: "function", stateMutability: "view",
@@ -47,6 +47,11 @@ const ERC20_ABI = [
     name: "approve", type: "function", stateMutability: "nonpayable",
     inputs:  [{ name: "spender", type: "address" }, { name: "amount", type: "uint256" }],
     outputs: [{ type: "bool" }],
+  },
+  {
+    name: "balanceOf", type: "function", stateMutability: "view",
+    inputs:  [{ name: "account", type: "address" }],
+    outputs: [{ type: "uint256" }],
   },
 ] as const;
 
@@ -584,29 +589,73 @@ export async function getOrderBook(tokenId: string): Promise<OrderBook> {
 // ---------------------------------------------------------------------------
 
 /**
- * Retourne le solde USDC disponible du compte (via le proxy Polymarket).
- * Utile pour vérifier qu'il y a assez de fonds avant de placer un ordre.
+ * Retourne le solde USDC du wallet en lisant directement la blockchain Polygon.
+ *
+ * Stratégie : on-chain balanceOf() en primary (fiable, sans auth),
+ * fallback vers GET /balance-allowance si la lecture RPC échoue.
+ *
+ * Pourquoi on-chain plutôt que CLOB /balance-allowance :
+ *   - Le CTF Exchange dépense directement l'USDC du wallet via l'allowance
+ *   - balanceOf(wallet) = ce que le contrat peut réellement dépenser
+ *   - Pas besoin de credentials API → plus simple et plus robuste
+ *
+ * Retourne la balance en USDC (pas en micro-USDC).
  */
 export async function getAccountBalance(): Promise<number> {
   const privateKey = process.env.POLYGON_PRIVATE_KEY;
   if (!privateKey) throw new Error("[clob] POLYGON_PRIVATE_KEY non défini");
 
+  const account = getAccount(privateKey);
+
+  // ── Primary : lecture on-chain via viem ────────────────────────────────────
+  try {
+    const client = createPublicClient({ chain: polygon, transport: http(POLYGON_RPC()) });
+
+    const balanceMicro = await client.readContract({
+      address:      USDC_ADDRESS,
+      abi:          ERC20_ABI,
+      functionName: "balanceOf",
+      args:         [account.address],
+    }) as bigint;
+
+    const balance = Number(balanceMicro) / USDC_DECIMALS;
+    console.log(`[clob] getAccountBalance (on-chain): ${balance.toFixed(4)} USDC (${account.address})`);
+    return balance;
+  } catch (rpcErr) {
+    console.warn(
+      `[clob] getAccountBalance on-chain failed, trying CLOB fallback: ` +
+      `${rpcErr instanceof Error ? rpcErr.message : rpcErr}`
+    );
+  }
+
+  // ── Fallback : GET /balance-allowance?signature_type=0&asset_type=0 ────────
+  // Endpoint officiel Polymarket CLOB (L2 auth required).
+  // asset_type=0 = USDC (collateral), signature_type=0 = EOA.
+  const path    = "/balance-allowance";
+  const query   = "?signature_type=0&asset_type=0";
   const creds   = await deriveClobCredentials(privateKey);
-  const path    = "/balance";
   const headers = buildApiHeaders(creds, "GET", path);
 
   const res = await withRetry(
-    () => fetch(`${CLOB_BASE}${path}`, { headers }),
-    "getAccountBalance"
+    () => fetch(`${CLOB_BASE}${path}${query}`, { headers }),
+    "getAccountBalance(clob-fallback)"
   );
 
   if (!res.ok) {
     const body = await res.text().catch(() => "");
-    throw new Error(`[clob] getAccountBalance HTTP ${res.status}: ${body}`);
+    throw new Error(`[clob] getAccountBalance CLOB fallback HTTP ${res.status}: ${body}`);
   }
 
-  const data = await res.json() as { balance?: string | number };
-  return parseFloat(String(data.balance ?? "0"));
+  // Réponse CLOB : { USDC: { balance: "10.5", allowance: "..." } }
+  // ou { balance: "10.5" } selon la version API — on essaie les deux formats.
+  const data = await res.json() as Record<string, unknown>;
+  const raw  = (data?.USDC as Record<string, unknown>)?.balance
+             ?? (data as Record<string, unknown>)?.balance
+             ?? "0";
+
+  const balance = parseFloat(String(raw));
+  console.log(`[clob] getAccountBalance (clob-fallback): ${balance.toFixed(4)} USDC`);
+  return balance;
 }
 
 // ---------------------------------------------------------------------------

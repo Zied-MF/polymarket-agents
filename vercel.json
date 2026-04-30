@@ -1,5 +1,5 @@
 {
-  "regions": ["dub1", "arn1", "mad1"],
+  "regions": ["mad1"],
   "crons": [
     { "path": "/api/scan-markets",       "schedule": "*/15 * * * *" },
     { "path": "/api/monitor-positions",  "schedule": "*/5 * * * *"  },

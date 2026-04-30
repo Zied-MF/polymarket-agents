@@ -229,14 +229,36 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
   const dryRunParam = req.nextUrl.searchParams.get("dry_run");
   const dryRun      = dryRunParam !== "false"; // défaut true
 
+  // ── Toujours présent dans la réponse, dry_run ou pas ─────────────────────
+  const envVarCheck = {
+    REAL_TRADING_ENABLED_raw:      process.env.REAL_TRADING_ENABLED ?? "(not set)",
+    REAL_TRADING_ENABLED_isTrue:   process.env.REAL_TRADING_ENABLED === "true",
+    POLYGON_PRIVATE_KEY_present:   !!process.env.POLYGON_PRIVATE_KEY,
+    POLYGON_PRIVATE_KEY_length:    process.env.POLYGON_PRIVATE_KEY?.length ?? 0,
+    DISCORD_WEBHOOK_URL_present:   !!process.env.DISCORD_WEBHOOK_URL,
+    NEXT_PUBLIC_SUPABASE_URL_present: !!process.env.NEXT_PUBLIC_SUPABASE_URL,
+  };
+
+  // realTradingFlow est muté au fil du handler — toujours inclus dans la réponse
+  const realTradingFlow: Record<string, unknown> = {
+    attempted:  false,
+    step:       "not_started",
+    error:      null,
+    errorStack: null,
+  };
+
   const diag: Record<string, unknown> = {
     dryRun,
-    timestamp: new Date().toISOString(),
+    timestamp:       new Date().toISOString(),
+    envVarCheck,
+    realTradingFlow, // référence partagée — mutations visibles dans la réponse finale
   };
 
   // 1. Vérification env vars
   const privateKey = process.env.POLYGON_PRIVATE_KEY;
   if (!privateKey) {
+    realTradingFlow.step  = "FAILED_no_private_key";
+    realTradingFlow.error = "POLYGON_PRIVATE_KEY manquant dans les variables d'environnement";
     return NextResponse.json(
       { ...diag, error: "POLYGON_PRIVATE_KEY manquant" },
       { status: 500 }
@@ -364,63 +386,54 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
 
   const BET_USDC = 0.50;
 
-  // ── Step 0 : Diagnostic variable d'environnement ──────────────────────────
-  const envRaw       = process.env.REAL_TRADING_ENABLED;
-  const envForced    = "true"; // on force à "true" pour ce test
-  process.env.REAL_TRADING_ENABLED = envForced;
-  // Reset du cache allowance pour forcer une nouvelle vérification
+  // ── Step 0 : Force REAL_TRADING_ENABLED pour ce test ─────────────────────
+  const envRaw    = process.env.REAL_TRADING_ENABLED;
+  process.env.REAL_TRADING_ENABLED = "true";
   resetAllowanceCache();
 
-  diag.envDiag = {
-    REAL_TRADING_ENABLED_raw:    envRaw ?? "(not set)",
-    REAL_TRADING_ENABLED_forced: envForced,
-    isRealTradingEnabled_before: envRaw === "true",
-    isRealTradingEnabled_after:  isRealTradingEnabled(),
-  };
-
-  const realFlow: Record<string, unknown> = { step: "start" };
-  diag.realTradingFlow = realFlow;
+  realTradingFlow.attempted = true;
+  realTradingFlow.envForcedToTrue = true;
+  realTradingFlow.REAL_TRADING_ENABLED_before = envRaw ?? "(not set)";
+  realTradingFlow.REAL_TRADING_ENABLED_after  = isRealTradingEnabled();
 
   // ── Step 1 : Balance ───────────────────────────────────────────────────────
-  let balanceOk = false;
   try {
-    realFlow.step = "balance";
+    realTradingFlow.step = "balance_check";
     const balance     = await getAccountBalance();
     const minRequired = BET_USDC * 1.05;
-    balanceOk = balance >= minRequired;
-    realFlow.balanceUsdc    = balance;
-    realFlow.minRequired    = minRequired;
-    realFlow.balanceSufficient = balanceOk;
-    if (!balanceOk) {
-      realFlow.step   = "FAILED_balance";
-      realFlow.error  = `Balance insuffisante: ${balance.toFixed(4)} USDC < ${minRequired.toFixed(4)} USDC requis`;
+    realTradingFlow.balanceUsdc       = balance;
+    realTradingFlow.balanceMinRequired = minRequired;
+    realTradingFlow.balanceSufficient  = balance >= minRequired;
+    if (balance < minRequired) {
+      realTradingFlow.step  = "FAILED_balance";
+      realTradingFlow.error = `Balance insuffisante: ${balance.toFixed(4)} USDC < ${minRequired.toFixed(4)} USDC requis`;
       diag.status = "REAL_FAILED_BALANCE";
       return NextResponse.json(diag, { status: 422 });
     }
   } catch (err) {
-    realFlow.step  = "FAILED_balance";
-    realFlow.error = err instanceof Error ? err.message : String(err);
-    realFlow.stack = err instanceof Error ? err.stack?.slice(0, 400) : undefined;
+    realTradingFlow.step       = "FAILED_balance_error";
+    realTradingFlow.error      = err instanceof Error ? err.message : String(err);
+    realTradingFlow.errorStack = err instanceof Error ? err.stack?.slice(0, 600) : null;
     diag.status = "REAL_FAILED_BALANCE_ERROR";
     return NextResponse.json(diag, { status: 500 });
   }
 
   // ── Step 2 : Allowance CTF Exchange ───────────────────────────────────────
   try {
-    realFlow.step = "allowance";
+    realTradingFlow.step = "allowance_check";
     const { sufficient, allowance } = await checkCTFAllowance();
-    realFlow.allowanceUsdc      = (Number(allowance) / 1_000_000).toFixed(2);
-    realFlow.allowanceSufficient = sufficient;
+    realTradingFlow.allowanceUsdc       = (Number(allowance) / 1_000_000).toFixed(2);
+    realTradingFlow.allowanceSufficient = sufficient;
     if (!sufficient) {
-      realFlow.step  = "FAILED_allowance";
-      realFlow.error = `CTF Exchange allowance insuffisante (${(Number(allowance) / 1_000_000).toFixed(2)} USDC). Appeler approveCTF().`;
+      realTradingFlow.step  = "FAILED_allowance";
+      realTradingFlow.error = `CTF Exchange allowance insuffisante (${(Number(allowance) / 1_000_000).toFixed(2)} USDC). Appeler approveCTF().`;
       diag.status = "REAL_FAILED_ALLOWANCE";
       return NextResponse.json(diag, { status: 422 });
     }
   } catch (err) {
-    realFlow.step  = "FAILED_allowance";
-    realFlow.error = err instanceof Error ? err.message : String(err);
-    realFlow.stack = err instanceof Error ? err.stack?.slice(0, 400) : undefined;
+    realTradingFlow.step       = "FAILED_allowance_error";
+    realTradingFlow.error      = err instanceof Error ? err.message : String(err);
+    realTradingFlow.errorStack = err instanceof Error ? err.stack?.slice(0, 600) : null;
     diag.status = "REAL_FAILED_ALLOWANCE_ERROR";
     return NextResponse.json(diag, { status: 500 });
   }
@@ -428,7 +441,7 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
   // ── Step 3 : Signature + soumission ordre CLOB ────────────────────────────
   let orderId: string | null = null;
   try {
-    realFlow.step = "placeOrder";
+    realTradingFlow.step = "place_order";
     const placed = await placeOrder({
       tokenId:    yesToken.tokenId,
       side:       "BUY",
@@ -438,24 +451,21 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
       dryRun:     false,
     });
     orderId = placed.orderId;
-    realFlow.step       = "placeOrder_ok";
-    realFlow.orderId    = placed.orderId;
-    realFlow.orderStatus = placed.status;
-    realFlow.gasFeeUsdc  = placed.gasFeeUsdc;
+    realTradingFlow.step        = "place_order_ok";
+    realTradingFlow.orderId     = placed.orderId;
+    realTradingFlow.orderStatus = placed.status;
+    realTradingFlow.gasFeeUsdc  = placed.gasFeeUsdc;
   } catch (err) {
-    realFlow.step  = "FAILED_placeOrder";
-    realFlow.error = err instanceof Error ? err.message : String(err);
-    realFlow.stack = err instanceof Error ? err.stack?.slice(0, 800) : undefined;
+    realTradingFlow.step       = "FAILED_place_order";
+    realTradingFlow.error      = err instanceof Error ? err.message : String(err);
+    realTradingFlow.errorStack = err instanceof Error ? err.stack?.slice(0, 800) : null;
     diag.status = "REAL_FAILED_PLACE_ORDER";
     return NextResponse.json(diag, { status: 500 });
   }
 
-  // ── Step 4 : Persistance DB via executeBuy (paper_trade + position) ────────
-  // On appelle executeBuy maintenant qu'on sait que placeOrder fonctionne.
-  // executeBuy va re-placer un ordre → on utilise le résultat pour la DB.
-  // Note : on accepte 2 ordres (step 3 + step 4) car c'est un test.
+  // ── Step 4 : Persistance DB via executeBuy ─────────────────────────────────
   try {
-    realFlow.step = "executeBuy_db";
+    realTradingFlow.step = "execute_buy_db";
     const buyResult = await executeBuy({
       marketId:             market.conditionId,
       question:             market.question,
@@ -474,17 +484,18 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
       potentialPnl:         0,
     });
 
-    realFlow.step         = "executeBuy_ok";
-    realFlow.paperTradeId = buyResult.paperTradeId;
-    realFlow.positionId   = buyResult.positionId;
-    realFlow.isReal       = buyResult.isReal;
-    realFlow.clobOrderId  = buyResult.orderId ?? null;
+    realTradingFlow.step         = "execute_buy_ok";
+    realTradingFlow.paperTradeId = buyResult.paperTradeId;
+    realTradingFlow.positionId   = buyResult.positionId;
+    realTradingFlow.isReal       = buyResult.isReal;
+    realTradingFlow.clobOrderId  = buyResult.orderId ?? null;
 
     // ── Vérification DB ───────────────────────────────────────────────────
+    realTradingFlow.step = "db_verify";
     const positionRow = await getPositionByPaperTradeId(buyResult.paperTradeId).catch(() => null);
     if (positionRow) {
       const ok = positionRow.is_real === true && positionRow.clob_order_id !== null;
-      realFlow.dbVerification = {
+      realTradingFlow.dbVerification = {
         isRealInDb:      positionRow.is_real,
         clobOrderIdInDb: positionRow.clob_order_id,
         ok,
@@ -492,18 +503,23 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
           ? "✅ is_real + clob_order_id persistés"
           : `❌ is_real=${positionRow.is_real} clob_order_id=${positionRow.clob_order_id}`,
       };
+      realTradingFlow.step = ok ? "db_verify_ok" : "db_verify_FAILED";
+    } else {
+      realTradingFlow.step         = "db_verify_no_row";
+      realTradingFlow.dbVerification = { verdict: "❌ position introuvable en DB" };
     }
   } catch (err) {
-    realFlow.step       = "FAILED_executeBuy_db";
-    realFlow.dbError    = err instanceof Error ? err.message : String(err);
+    realTradingFlow.step       = "FAILED_execute_buy_db";
+    realTradingFlow.error      = err instanceof Error ? err.message : String(err);
+    realTradingFlow.errorStack = err instanceof Error ? err.stack?.slice(0, 600) : null;
     // On ne retourne pas d'erreur ici — le placeOrder (step 3) a réussi
   }
 
   diag.status = "REAL_TRADE_ATTEMPTED";
   diag.order  = {
-    orderId_step3:    orderId,
-    orderId_step4:    (realFlow.clobOrderId as string | null) ?? null,
-    submittedToClob:  true,
+    orderId_step3:   orderId,
+    orderId_step4:   (realTradingFlow.clobOrderId as string | null) ?? null,
+    submittedToClob: true,
   };
 
   return NextResponse.json(diag);

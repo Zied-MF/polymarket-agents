@@ -141,6 +141,11 @@ export async function executeBuy(input: BuyInput): Promise<ExecuteBuyResult> {
   let isReal = false;
 
   if (real) {
+    console.log(
+      `[trade-executor] DEBUG executeBuy: isReal=${real} ` +
+      `REAL_TRADING_ENABLED=${process.env.REAL_TRADING_ENABLED} ` +
+      `market=${input.marketId} outcome=${input.outcome} bet=${input.suggestedBet}`
+    );
     try {
       // ── Guard 1 : Allowance CTF Exchange ──────────────────────────────────
       // Vérifié une seule fois par process (cache module-level).

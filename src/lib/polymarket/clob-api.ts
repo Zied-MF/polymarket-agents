@@ -15,7 +15,6 @@
  *   POLYGON_RPC_URL      — RPC Polygon (Alchemy recommandé)
  */
 
-import { createHmac }                                           from "crypto";
 import { privateKeyToAccount }                                   from "viem/accounts";
 import { createPublicClient, createWalletClient, http }          from "viem";
 import { polygon }                                               from "viem/chains";

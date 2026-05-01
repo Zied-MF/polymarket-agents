@@ -409,6 +409,16 @@ export async function cancelOrder(orderId: string): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
+// getOpenOrderIds — retourne les IDs des ordres ouverts (avant cancelAll)
+// ---------------------------------------------------------------------------
+
+export async function getOpenOrderIds(): Promise<string[]> {
+  const client = await getClobClient();
+  const orders = await client.getOpenOrders({}, true) as Array<{ id: string }>;
+  return (orders ?? []).map((o) => o.id).filter(Boolean);
+}
+
+// ---------------------------------------------------------------------------
 // cancelAllOrders — annule tous les ordres ouverts du compte
 // ---------------------------------------------------------------------------
 
@@ -416,7 +426,6 @@ export async function cancelAllOrders(): Promise<{ cancelled: number }> {
   const client = await getClobClient();
   const res    = await client.cancelAll() as Record<string, unknown>;
   console.log(`[clob] ✅ cancelAll:`, res);
-  // La réponse inclut { not_cancelled: [...], ... } — on estime le count
   const notCancelled = Array.isArray(res.not_cancelled) ? res.not_cancelled.length : 0;
   const cancelled    = typeof res.count === "number" ? res.count : 0;
   return { cancelled: cancelled - notCancelled };

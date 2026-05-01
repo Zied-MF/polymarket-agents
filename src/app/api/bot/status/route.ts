@@ -24,6 +24,11 @@ export async function GET() {
   const positions      = posRes.data      ?? [];
   const realPositions  = realPosRes.data  ?? [];
 
+  // Cancelled trades marker : won=false AND potential_pnl=0
+  // Ces trades ont été annulés sans exécution — exclus de tous les compteurs.
+  const isCancelled = (t: { won: boolean | null; potential_pnl: number }) =>
+    t.won === false && Number(t.potential_pnl) === 0;
+
   function computeStats(
     today: { won: boolean | null; potential_pnl: number }[],
     all:   { won: boolean | null; potential_pnl: number }[],
@@ -31,13 +36,17 @@ export async function GET() {
     currentBankroll: string,
     initialBankroll: number,
   ) {
-    const wins    = all.filter((t) => t.won).length;
-    const winRate = all.length ? ((wins / all.length) * 100).toFixed(1) : "0.0";
-    const pnlToday = today.reduce((s, t) => s + (Number(t.potential_pnl) || 0), 0).toFixed(2);
-    const totalPnl = all.reduce((s, t) => s + (Number(t.potential_pnl) || 0), 0).toFixed(2);
+    // Exclure les trades annulés (jamais exécutés) de tous les calculs
+    const activeToday = today.filter((t) => !isCancelled(t));
+    const activeAll   = all.filter((t) => !isCancelled(t));
+
+    const wins    = activeAll.filter((t) => t.won).length;
+    const winRate = activeAll.length ? ((wins / activeAll.length) * 100).toFixed(1) : "0.0";
+    const pnlToday = activeToday.reduce((s, t) => s + (Number(t.potential_pnl) || 0), 0).toFixed(2);
+    const totalPnl = activeAll.reduce((s, t) => s + (Number(t.potential_pnl) || 0), 0).toFixed(2);
     const roi = ((parseFloat(currentBankroll) - initialBankroll) / initialBankroll * 100).toFixed(1);
     return {
-      tradesToday: today.length, totalTrades: all.length, wins, winRate,
+      tradesToday: activeToday.length, totalTrades: activeAll.length, wins, winRate,
       pnlToday, totalPnl, openPositions: openPos, currentBankroll, initialBankroll, roi,
     };
   }

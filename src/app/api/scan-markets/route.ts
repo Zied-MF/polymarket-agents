@@ -219,24 +219,25 @@ export async function GET(): Promise<NextResponse<ScanResult | { status: string;
     incrementDailyOpportunities(toSave.length).catch((err) =>
       console.error("[scan-markets] ✗ incrementDailyOpportunities :", err instanceof Error ? err.message : err)
     );
-  }
 
-  // 3. Notification Discord (fire-and-forget)
-  if (opps.length > 0) {
-    sendDiscordNotification(
-      opps.map((opp) => ({
-        city:                 opp.city ?? opp.ticker ?? opp.token ?? "",
-        outcome:              opp.outcome,
-        marketPrice:          opp.marketPrice,
-        estimatedProbability: opp.estimatedProbability,
-        edge:                 opp.edge,
-        multiplier:           opp.marketPrice > 0 ? 1 / opp.marketPrice : 0,
-        suggestedBet:         opp.suggestedBet,
-      })),
-      new Date()
-    ).catch((err) =>
-      console.error("[scan-markets] ✗ Discord :", err instanceof Error ? err.message : err)
-    );
+    // 3. Notification Discord — uniquement les nouvelles opportunités (toSave)
+    //    Les opportunités déjà en DB (dedup) ne re-notifient PAS Discord.
+    if (toSave.length > 0) {
+      sendDiscordNotification(
+        toSave.map((opp) => ({
+          city:                 opp.city ?? opp.ticker ?? opp.token ?? "",
+          outcome:              opp.outcome,
+          marketPrice:          opp.marketPrice,
+          estimatedProbability: opp.estimatedProbability,
+          edge:                 opp.edge,
+          multiplier:           opp.marketPrice > 0 ? 1 / opp.marketPrice : 0,
+          suggestedBet:         opp.suggestedBet,
+        })),
+        new Date()
+      ).catch((err) =>
+        console.error("[scan-markets] ✗ Discord :", err instanceof Error ? err.message : err)
+      );
+    }
   }
 
   // 4. Update bot last-scan timestamp + detailed activity logs (best-effort)

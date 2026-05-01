@@ -150,10 +150,6 @@ export async function executeBuy(input: BuyInput): Promise<ExecuteBuyResult> {
       // de relay. Notre check on-chain vérifie la mauvaise adresse/architecture.
       // On laisse Polymarket rejeter l'ordre si l'allowance est vraiment absente.
       console.log("[trade-executor] ℹ️ Allowance check skipped — relying on Polymarket validation");
-      sendDiscordAlert(
-        `ℹ️ **Allowance check skipped** — relying on Polymarket validation\n` +
-        `Marché: ${input.question.slice(0, 80)} (negRisk=${clobMarket.negRisk})`
-      ).catch(() => {});
 
       // ── Guard 2 : Balance USDC suffisante ─────────────────────────────────
       // getAccountBalance() retourne null si tous les RPCs échouent.
@@ -167,11 +163,6 @@ export async function executeBuy(input: BuyInput): Promise<ExecuteBuyResult> {
           `[trade-executor] ⚠ Balance check skipped (all RPCs failed) — ` +
           `proceeding, Polymarket will reject if insufficient`
         );
-        sendDiscordAlert(
-          `⚠️ **Balance check skipped** — tous les RPCs Polygon ont échoué\n` +
-          `L'ordre sera soumis quand même. Polymarket rejettera si balance insuffisante.\n` +
-          `Marché: ${input.question.slice(0, 80)}`
-        ).catch(() => {});
       } else if (balance < minBalance) {
         const msg =
           `Insufficient balance: ${balance.toFixed(2)}$ dispo, ` +
@@ -205,8 +196,9 @@ export async function executeBuy(input: BuyInput): Promise<ExecuteBuyResult> {
       isReal     = true;
 
       console.log(
-        `[trade-executor] ✅ REAL BUY placed: ${input.marketId}/${input.outcome} ` +
-        `orderId=${placed.orderId} bet=${input.suggestedBet}$ fee=${placed.gasFeeUsdc}$`
+        `[trade-executor] ✅ [REAL] BUY placed: orderId=${placed.orderId} ` +
+        `market=${input.marketId} outcome=${input.outcome} ` +
+        `bet=${input.suggestedBet}$ price=${input.marketPrice} fee=${placed.gasFeeUsdc}$`
       );
 
       // Notification Discord — trade réel exécuté avec succès (fire-and-forget)
@@ -226,7 +218,16 @@ export async function executeBuy(input: BuyInput): Promise<ExecuteBuyResult> {
       // Marquer is_real=true dans paper_trade (best-effort)
       await patchIsReal("paper_trades", paperTrade.id).catch(() => {});
     } catch (err) {
-      logRealError(`executeBuy(${input.marketId}/${input.outcome})`, err);
+      const errMsg = err instanceof Error ? err.message : String(err);
+      console.error(
+        `[trade-executor] ❌ [REAL] BUY FAILED: market=${input.marketId} ` +
+        `outcome=${input.outcome} bet=${input.suggestedBet}$ — ${errMsg}`
+      );
+      sendDiscordAlert(
+        `❌ **REAL TRADE FAILED** — ${input.question.slice(0, 80)}\n` +
+        `Outcome: \`${input.outcome}\` · Mise: \`${input.suggestedBet.toFixed(2)}$\`\n` +
+        `Erreur: \`${errMsg.slice(0, 200)}\``
+      ).catch(() => {});
       // Fallback : le paper trade a déjà été créé ci-dessus, on continue
     }
   }

@@ -19,7 +19,7 @@ import { weatherAdapter }                  from "@/lib/agents/adapters/weather-a
 // Finance Agent — shadow mode (analyse uniquement, pas de trades réels) — 2026-04-20
 // import { financeAdapter }               from "@/lib/agents/adapters/finance-adapter";
 // import { cryptoAdapter } from "@/lib/agents/adapters/crypto-adapter"; // DÉSACTIVÉ 2026-04-18
-import { sendDiscordNotification }         from "@/lib/utils/discord";
+import { sendDiscordNotification, sendDiscordAlert } from "@/lib/utils/discord";
 import {
   saveOpportunity,
   getRecentOpportunities,
@@ -27,9 +27,43 @@ import {
   acquireScanLock,
   releaseScanLock,
   getCurrentBankroll,
+  getClient as getSupabaseClient,
 }                                          from "@/lib/db/supabase";
 import { cleanOldLogs }                    from "@/lib/logger";
 import { executeBuy }                      from "@/lib/trade-executor";
+
+// ---------------------------------------------------------------------------
+// Guard : max positions par marché+outcome
+// ---------------------------------------------------------------------------
+
+/** Nombre maximum de positions ouvertes autorisées par market_id+outcome. */
+const MAX_POSITIONS_PER_MARKET =
+  parseInt(process.env.MAX_POSITIONS_PER_MARKET ?? "1", 10);
+
+/**
+ * Retourne le nombre de positions ouvertes (sold_at IS NULL) pour ce couple
+ * market_id + outcome. Retourne 0 en cas d'erreur (fail-open).
+ */
+async function countOpenPositions(marketId: string, outcome: string): Promise<number> {
+  try {
+    const db = getSupabaseClient();
+    const { count, error } = await db
+      .from("positions")
+      .select("id", { count: "exact", head: true })
+      .eq("market_id", marketId)
+      .eq("outcome",   outcome)
+      .is("sold_at",   null);
+
+    if (error) {
+      console.warn(`[scan-markets] countOpenPositions error: ${error.message}`);
+      return 0; // fail-open : on ne bloque pas si la requête échoue
+    }
+    return count ?? 0;
+  } catch (e) {
+    console.warn(`[scan-markets] countOpenPositions exception:`, e instanceof Error ? e.message : e);
+    return 0;
+  }
+}
 import type { Opportunity, SkippedMarket, AgentStats } from "@/lib/agents/orchestrator";
 import { getBotState, updateLastScan }     from "@/lib/bot/bot-state";
 import { logActivity }                     from "@/lib/logger";
@@ -180,7 +214,22 @@ export async function GET(): Promise<NextResponse<ScanResult | { status: string;
         errors.push({ marketId: opp.marketId, question: opp.question, error: msg });
       }
 
-      // 2b. paper_trade + position (+ ordre CLOB réel si REAL_TRADING_ENABLED)
+      // 2b. Guard : max positions ouvertes par marché+outcome
+      const openCount = await countOpenPositions(opp.marketId, opp.outcome);
+      if (openCount >= MAX_POSITIONS_PER_MARKET) {
+        const label = opp.city ?? opp.marketId;
+        console.log(
+          `[scan-markets] ⏭ Skip ${label}/${opp.outcome}: ` +
+          `${openCount} position(s) déjà ouverte(s) (max=${MAX_POSITIONS_PER_MARKET})`
+        );
+        sendDiscordAlert(
+          `⏭️ Skip **${label}** ${opp.outcome} — déjà ${openCount} position(s) ouverte(s) ` +
+          `(MAX_POSITIONS_PER_MARKET=${MAX_POSITIONS_PER_MARKET})`
+        ).catch(() => {});
+        continue;
+      }
+
+      // 2c. paper_trade + position (+ ordre CLOB réel si REAL_TRADING_ENABLED)
       try {
         const result = await executeBuy({
           marketId:             opp.marketId,

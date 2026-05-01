@@ -273,6 +273,23 @@ export const weatherAdapter: AgentConfig = {
       console.warn(`[weather-adapter] hasRecentTradeForCityDate échoué (non-bloquant):`, err instanceof Error ? err.message : err);
     }
 
+    // ── CLOB pre-check : vérifier que le marché est tradable avant d'aller plus loin ──
+    // Si m.id est un entier Gamma (ex: "2112645") au lieu d'un conditionId hex,
+    // getClobMarket retourne null et on skip sans déclencher d'erreur Discord.
+    {
+      const clobCheck = await getClobMarket(m.id).catch(() => null);
+      if (!clobCheck) {
+        const reason = `Market not found in CLOB (id=${m.id}) — may need conditionId`;
+        console.log(`[weather-adapter] ⏭ Skip ${m.city}: ${reason}`);
+        return { skipReason: reason };
+      }
+      if (!clobCheck.active) {
+        const reason = `Market inactive in CLOB (id=${m.id})`;
+        console.log(`[weather-adapter] ⏭ Skip ${m.city}: ${reason}`);
+        return { skipReason: reason };
+      }
+    }
+
     // ── scan-debug : marché qui passe tous les filtres de base ──────────────
     const noPrice       = 1 - yesPrice;
     const spreadEstimate = estimateSpread(m.liquidity);

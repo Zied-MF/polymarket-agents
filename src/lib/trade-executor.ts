@@ -40,6 +40,22 @@ import {
 }                                    from "@/lib/utils/discord";
 
 // ---------------------------------------------------------------------------
+// Sentinel error — skip without Discord
+// ---------------------------------------------------------------------------
+
+/**
+ * Thrown when a real order should be silently skipped (market not in CLOB,
+ * market inactive, etc.). The catch block checks for this type and omits
+ * the Discord error alert to avoid spam.
+ */
+class ClobSkipError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ClobSkipError";
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -141,8 +157,15 @@ export async function executeBuy(input: BuyInput): Promise<ExecuteBuyResult> {
     try {
       // 0. Récupérer les données du marché (nécessaire pour negRisk + token IDs)
       const clobMarket = await getClobMarket(input.marketId);
-      if (!clobMarket) throw new Error(`Marché introuvable dans CLOB: ${input.marketId}`);
-      if (!clobMarket.active) throw new Error(`Marché CLOB inactif: ${input.marketId}`);
+      if (!clobMarket) {
+        // Marché Gamma non tradable via CLOB — skip silencieux.
+        // Cause probable : m.id est un entier Gamma, pas un conditionId hex.
+        // On throw une ClobSkipError pour que le catch ne spam pas Discord.
+        throw new ClobSkipError(`Market not found in CLOB: ${input.marketId}`);
+      }
+      if (!clobMarket.active) {
+        throw new ClobSkipError(`Market inactive in CLOB: ${input.marketId}`);
+      }
 
       // ── Guard 1 : Allowance — déléguée à Polymarket ──────────────────────
       // L'utilisateur a tradé manuellement sans approve explicite (1 seul popup
@@ -219,16 +242,22 @@ export async function executeBuy(input: BuyInput): Promise<ExecuteBuyResult> {
       await patchIsReal("paper_trades", paperTrade.id).catch(() => {});
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
-      console.error(
-        `[trade-executor] ❌ [REAL] BUY FAILED: market=${input.marketId} ` +
-        `outcome=${input.outcome} bet=${input.suggestedBet}$ — ${errMsg}`
-      );
-      sendDiscordAlert(
-        `❌ **REAL TRADE FAILED** — ${input.question.slice(0, 80)}\n` +
-        `Outcome: \`${input.outcome}\` · Mise: \`${input.suggestedBet.toFixed(2)}$\`\n` +
-        `Erreur: \`${errMsg.slice(0, 200)}\``
-      ).catch(() => {});
-      // Fallback : le paper trade a déjà été créé ci-dessus, on continue
+      if (err instanceof ClobSkipError) {
+        // Marché non disponible dans CLOB — skip silencieux, pas de Discord.
+        console.log(`[trade-executor] ⏭ [REAL] Skip (no Discord): ${errMsg}`);
+      } else {
+        // Vraie erreur (réseau, signature, balance…) — alerte Discord.
+        console.error(
+          `[trade-executor] ❌ [REAL] BUY FAILED: market=${input.marketId} ` +
+          `outcome=${input.outcome} bet=${input.suggestedBet}$ — ${errMsg}`
+        );
+        sendDiscordAlert(
+          `❌ **REAL TRADE FAILED** — ${input.question.slice(0, 80)}\n` +
+          `Outcome: \`${input.outcome}\` · Mise: \`${input.suggestedBet.toFixed(2)}$\`\n` +
+          `Erreur: \`${errMsg.slice(0, 200)}\``
+        ).catch(() => {});
+      }
+      // Dans tous les cas, le paper trade a déjà été créé — on continue
     }
   }
 

@@ -69,6 +69,9 @@ const CITY_ALIASES: Record<string, string> = {
 /** Un market imbriqué dans un event Gamma. */
 interface GammaEventMarket {
   id: string;
+  /** Identifiant on-chain utilisé par le CLOB (hex, ex: "0xabc…").
+   *  Distinct de `id` (clé primaire Gamma, entier). */
+  conditionId?: string;
   question?: string;
   slug?: string;
   outcomes?: string | string[];
@@ -444,8 +447,13 @@ async function fetchRealMarkets(): Promise<WeatherMarket[]> {
         continue;
       }
 
+      // Prefer conditionId (hex, CLOB-compatible) over the integer Gamma DB id.
+      // If conditionId is absent the market will fail the CLOB pre-check in
+      // the weather-adapter and be skipped before any order is attempted.
+      const marketId = m.conditionId ?? m.id;
+
       const market: WeatherMarket = {
-        id:            m.id,
+        id:            marketId,
         question:      m.question ?? title,
         slug:          m.slug ?? event.slug ?? m.id,
         category:      "weather",

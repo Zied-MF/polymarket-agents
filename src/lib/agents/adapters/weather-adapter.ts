@@ -21,8 +21,6 @@ import { fetchForecastForStation, fetchEnsembleForecast }                       
 import { analyzeMarket, parseOutcomeForMarket }                                  from "@/lib/agents/weather-agent";
 import { getCurrentBankroll }                                                    from "@/lib/db/supabase";
 import { calculateBetSize, MAX_PCT_LIQUIDITY, MIN_BET_AMOUNT }                    from "@/lib/utils/sizing";
-import { getClobMarket }                                                          from "@/lib/polymarket/clob-api";
-import { isRealTradingEnabled }                                                   from "@/lib/trade-executor";
 import { getAirportStation, isUSCity }                                           from "@/lib/data/airport-stations";
 import { analyzeWithClaude, type MarketContext }                                 from "@/lib/agents/claude-analyst";
 import { fetchMultiModelForecast, calculateMultiModelProbability,
@@ -271,24 +269,6 @@ export const weatherAdapter: AgentConfig = {
       }
     } catch (err) {
       console.warn(`[weather-adapter] hasRecentTradeForCityDate échoué (non-bloquant):`, err instanceof Error ? err.message : err);
-    }
-
-    // ── CLOB pre-check : uniquement en mode REAL ────────────────────────────
-    // Les marchés météo utilisent un AMM sur Polymarket. En paper mode,
-    // on simule au prix Gamma — pas besoin que le marché soit dans le CLOB.
-    // En real mode, vérifier que le marché est actif avant d'appeler Claude.
-    if (isRealTradingEnabled()) {
-      const clobCheck = await getClobMarket(m.id).catch(() => null);
-      if (!clobCheck) {
-        const reason = `Market not found in CLOB (id=${m.id}) — may need conditionId`;
-        console.log(`[weather-adapter] ⏭ Skip ${m.city}: ${reason}`);
-        return { skipReason: reason };
-      }
-      if (!clobCheck.active) {
-        const reason = `Market inactive in CLOB (id=${m.id})`;
-        console.log(`[weather-adapter] ⏭ Skip ${m.city}: ${reason}`);
-        return { skipReason: reason };
-      }
     }
 
     // ── scan-debug : marché qui passe tous les filtres de base ──────────────

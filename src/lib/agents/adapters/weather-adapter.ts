@@ -20,8 +20,9 @@ import { fetchAllWeatherMarkets, type WeatherMarket }                           
 import { fetchForecastForStation, fetchEnsembleForecast }                        from "@/lib/data-sources/weather-sources";
 import { analyzeMarket, parseOutcomeForMarket }                                  from "@/lib/agents/weather-agent";
 import { getCurrentBankroll }                                                    from "@/lib/db/supabase";
-import { calculateBetSize, MAX_PCT_LIQUIDITY, MIN_BET_AMOUNT }                   from "@/lib/utils/sizing";
+import { calculateBetSize, MAX_PCT_LIQUIDITY, MAX_PCT_ORDERBOOK, MIN_BET_AMOUNT } from "@/lib/utils/sizing";
 import { sendDiscordAlert }                                                       from "@/lib/utils/discord";
+import { getClobMarket, getAvailableLiquidity }                                   from "@/lib/polymarket/clob-api";
 import { getAirportStation, isUSCity }                                           from "@/lib/data/airport-stations";
 import { analyzeWithClaude, type MarketContext }                                 from "@/lib/agents/claude-analyst";
 import { fetchMultiModelForecast, calculateMultiModelProbability,
@@ -467,32 +468,82 @@ export const weatherAdapter: AgentConfig = {
     }
 
     // Kelly sizing dynamique (mode-based) — Claude size 1-10 → % du bankroll
-    // Puis cap sur MAX_PCT_LIQUIDITY de la liquidité disponible pour éviter le slippage.
     // Bankroll dynamique : initial 10$ + P&L net cumulé (compound).
     const bankroll    = await getCurrentBankroll();
     const claudeSize  = claudeAnalysis.size ?? 5;
     const sizePercent = (claudeSize / 10) * mode.maxBetPercent;
     const kellyBet    = bankroll * sizePercent;
-    const maxByLiq    = m.liquidity * MAX_PCT_LIQUIDITY;
-    const adjustedBet = calculateBetSize(kellyBet, m.liquidity, bankroll, mode.maxBetPercent);
 
-    // Liquidity too low — skip market
+    // ── Étape 1 : cap Gamma (market.liquidity × 5%) ─────────────────────────
+    const maxByGammaLiq = m.liquidity * MAX_PCT_LIQUIDITY;
+    let   adjustedBet   = calculateBetSize(kellyBet, m.liquidity, bankroll, mode.maxBetPercent);
+
+    // Liquidity Gamma trop basse pour le minimum Polymarket — skip
     if (adjustedBet === 0) {
-      const reason = `Liquidity $${m.liquidity} too low (${(MAX_PCT_LIQUIDITY * 100).toFixed(0)}% = $${maxByLiq.toFixed(2)} < min $${MIN_BET_AMOUNT})`;
+      const reason = `Liquidity $${m.liquidity} too low (${(MAX_PCT_LIQUIDITY * 100).toFixed(0)}% = $${maxByGammaLiq.toFixed(2)} < min $${MIN_BET_AMOUNT})`;
       console.log(`[weather-adapter] ⏭️ Skip ${m.city}: ${reason}`);
       sendDiscordAlert(
         `⏭️ Skip **${m.city}** : liquidity $${m.liquidity} trop basse\n` +
-        `Max bet ${(MAX_PCT_LIQUIDITY * 100).toFixed(0)}% = $${maxByLiq.toFixed(2)} < minimum $${MIN_BET_AMOUNT}`
+        `Max bet ${(MAX_PCT_LIQUIDITY * 100).toFixed(0)}% = $${maxByGammaLiq.toFixed(2)} < minimum $${MIN_BET_AMOUNT}`
       ).catch(() => {});
       return { skipReason: reason };
     }
 
-    // Bet was capped by liquidity — log the reduction
-    const liquidityCapped = adjustedBet < kellyBet && adjustedBet < bankroll * mode.maxBetPercent;
-    if (liquidityCapped) {
+    // ── Étape 2 : cap orderbook réel (asks dans 5% slippage × 20%) ──────────
+    const targetOutcome = claudeAnalysis.outcome ?? best.outcome;
+    let   orderbookLiquidity: number | null = null;
+    let   orderbookCapped = false;
+
+    try {
+      const clobMarket = await getClobMarket(m.id);
+      const token      = clobMarket?.tokens.find(
+        (t) => t.outcome.toLowerCase() === targetOutcome.toLowerCase()
+      );
+      if (token) {
+        orderbookLiquidity = await getAvailableLiquidity(token.tokenId, best.marketPrice);
+        const maxByOrderbook = orderbookLiquidity * MAX_PCT_ORDERBOOK;
+
+        if (maxByOrderbook < MIN_BET_AMOUNT) {
+          // Orderbook trop peu profond — skip
+          const reason =
+            `Orderbook liquidity $${orderbookLiquidity.toFixed(2)} too shallow ` +
+            `(${(MAX_PCT_ORDERBOOK * 100).toFixed(0)}% = $${maxByOrderbook.toFixed(2)} < min $${MIN_BET_AMOUNT})`;
+          console.log(`[weather-adapter] ⏭️ Skip ${m.city}: ${reason}`);
+          sendDiscordAlert(
+            `⏭️ Skip **${m.city}** : orderbook $${orderbookLiquidity.toFixed(2)} trop peu profond\n` +
+            `${(MAX_PCT_ORDERBOOK * 100).toFixed(0)}% = $${maxByOrderbook.toFixed(2)} < minimum $${MIN_BET_AMOUNT}`
+          ).catch(() => {});
+          return { skipReason: reason };
+        }
+
+        if (adjustedBet > maxByOrderbook) {
+          // Réduire au cap orderbook
+          const before = adjustedBet;
+          adjustedBet  = Math.round(maxByOrderbook * 100) / 100;
+          orderbookCapped = true;
+          console.log(
+            `[weather-adapter] ⚠️ Bet réduit par orderbook: $${before.toFixed(2)} → $${adjustedBet.toFixed(2)} ` +
+            `(${(MAX_PCT_ORDERBOOK * 100).toFixed(0)}% de $${orderbookLiquidity.toFixed(2)} immédiat)`
+          );
+          sendDiscordAlert(
+            `⚠️ Bet réduit **${m.city}** : $${before.toFixed(2)} → $${adjustedBet.toFixed(2)} ` +
+            `(orderbook cap ${(MAX_PCT_ORDERBOOK * 100).toFixed(0)}% sur $${orderbookLiquidity.toFixed(2)} immédiat)`
+          ).catch(() => {});
+        }
+      }
+    } catch (err) {
+      // Fallback gracieux — on garde le bet Gamma si l'orderbook est inaccessible
+      console.warn(
+        `[weather-adapter] ⚠️ Orderbook fetch failed for ${m.city} — fallback to Gamma liquidity: ` +
+        (err instanceof Error ? err.message : String(err))
+      );
+    }
+
+    // Log si bet réduit uniquement par Gamma (pas orderbook)
+    if (!orderbookCapped && adjustedBet < kellyBet && adjustedBet < bankroll * mode.maxBetPercent) {
       console.log(
-        `[weather-adapter] ⚠️ Bet réduit par liquidité: $${kellyBet.toFixed(2)} → $${adjustedBet.toFixed(2)} ` +
-        `(${(MAX_PCT_LIQUIDITY * 100).toFixed(0)}% de $${m.liquidity} liquidité)`
+        `[weather-adapter] ⚠️ Bet réduit par liquidité Gamma: $${kellyBet.toFixed(2)} → $${adjustedBet.toFixed(2)} ` +
+        `(${(MAX_PCT_LIQUIDITY * 100).toFixed(0)}% de $${m.liquidity})`
       );
       sendDiscordAlert(
         `⚠️ Bet réduit **${m.city}** : $${kellyBet.toFixed(2)} → $${adjustedBet.toFixed(2)} ` +
@@ -502,7 +553,10 @@ export const weatherAdapter: AgentConfig = {
 
     console.log(
       `[weather-adapter] 💰 Sizing: bankroll=${bankroll.toFixed(2)}$ Claude=${claudeSize}/10 Kelly=${kellyBet.toFixed(2)}$ ` +
-      `Liquidity=$${m.liquidity} (${(MAX_PCT_LIQUIDITY * 100).toFixed(0)}%=$${maxByLiq.toFixed(2)}) ` +
+      `Gamma=$${m.liquidity} (${(MAX_PCT_LIQUIDITY * 100).toFixed(0)}%=$${maxByGammaLiq.toFixed(2)}) ` +
+      (orderbookLiquidity !== null
+        ? `Orderbook=$${orderbookLiquidity.toFixed(2)} (${(MAX_PCT_ORDERBOOK * 100).toFixed(0)}%=$${(orderbookLiquidity * MAX_PCT_ORDERBOOK).toFixed(2)}) `
+        : `Orderbook=N/A `) +
       `→ Final=${adjustedBet.toFixed(2)}$ (mode: ${mode.name})`
     );
 
@@ -522,7 +576,7 @@ export const weatherAdapter: AgentConfig = {
       dominated: {
         marketId:             m.id,
         question:             m.question,
-        outcome:              claudeAnalysis.outcome ?? best.outcome,
+        outcome:              targetOutcome,
         marketPrice:          round(best.marketPrice, 4),
         estimatedProbability: Math.min(0.99, Math.max(0.01, finalProb)),
         edge:                 round(finalEdge, 4),

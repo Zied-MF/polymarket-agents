@@ -406,6 +406,35 @@ export async function getOrderBook(tokenId: string): Promise<OrderBook> {
 }
 
 // ---------------------------------------------------------------------------
+// getAvailableLiquidity — liquidité réelle depuis le carnet d'ordres
+// ---------------------------------------------------------------------------
+
+/**
+ * Calcule la liquidité USDC disponible à l'achat (asks) dans une tolérance
+ * de slippage par rapport au prix courant du marché.
+ *
+ * @param tokenId     Token Polymarket (YES ou NO)
+ * @param currentPrice Prix courant [0,1] — ex: 0.45
+ * @param slippagePct  Tolérance de slippage — filtre asks ≤ currentPrice × (1 + slippagePct)
+ *                    Défaut: 5% → ne lit que les asks proches du mid-price
+ * @returns Montant USDC total disponible (price × size pour chaque niveau filtré)
+ */
+export async function getAvailableLiquidity(
+  tokenId:    string,
+  currentPrice: number,
+  slippagePct:  number = 0.05
+): Promise<number> {
+  const book       = await getOrderBook(tokenId);
+  const priceLimit = currentPrice * (1 + slippagePct);
+
+  const availableUsdc = book.asks
+    .filter((a) => a.price <= priceLimit)
+    .reduce((sum, a) => sum + a.price * a.size, 0);
+
+  return Math.round(availableUsdc * 100) / 100;
+}
+
+// ---------------------------------------------------------------------------
 // Proxy resolution (verbose)
 // ---------------------------------------------------------------------------
 

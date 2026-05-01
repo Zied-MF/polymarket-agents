@@ -8,9 +8,17 @@
  * l'appelant est responsable de skipper le marché dans ce cas.
  */
 
-/** Fraction maximale de la liquidité du marché par bet. Configurable via env var. */
+/** Fraction maximale de la liquidité Gamma (totale) par bet. Configurable via env var. */
 export const MAX_PCT_LIQUIDITY =
   parseFloat(process.env.MAX_PCT_LIQUIDITY ?? "0.05");
+
+/**
+ * Fraction maximale de la liquidité immédiate du carnet d'ordres (asks filtrés
+ * dans la tolérance de slippage). Plus précis que MAX_PCT_LIQUIDITY mais
+ * nécessite un appel orderbook. Configurable via MAX_PCT_ORDERBOOK env var.
+ */
+export const MAX_PCT_ORDERBOOK =
+  parseFloat(process.env.MAX_PCT_ORDERBOOK ?? "0.20");
 
 /** Minimum Polymarket par ordre (imposé par le protocole). */
 export const MIN_BET_AMOUNT = 1.05;

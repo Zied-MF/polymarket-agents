@@ -20,14 +20,19 @@ function ageLabel(dateStr: string): string {
   return `${Math.floor(min / 1440)}d`;
 }
 
-export function PositionsTable() {
+interface PositionsTableProps {
+  mode?: "real" | "paper";
+}
+
+export function PositionsTable({ mode }: PositionsTableProps) {
   const [positions, setPositions] = useState<PositionRow[]>([]);
   const [loading,   setLoading]   = useState(true);
 
   useEffect(() => {
+    const url = mode ? `/api/positions?mode=${mode}` : "/api/positions";
     const load = async () => {
       try {
-        const res  = await fetch("/api/positions");
+        const res  = await fetch(url);
         const data = await res.json();
         setPositions(data.positions ?? []);
       } catch { /* silent */ }
@@ -36,7 +41,7 @@ export function PositionsTable() {
     load();
     const id = setInterval(load, 10_000);
     return () => clearInterval(id);
-  }, []);
+  }, [mode]);
 
   if (loading) return <p className="text-gray-500 text-sm py-4">Loading…</p>;
 

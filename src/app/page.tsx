@@ -229,7 +229,7 @@ export default function Dashboard() {
                 </span>
               )}
             </h2>
-            <PositionsTable />
+            <PositionsTable mode={viewMode} />
           </div>
 
           <div className="bg-gray-900 rounded-xl border border-gray-800 p-4">

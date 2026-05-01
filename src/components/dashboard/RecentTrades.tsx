@@ -73,6 +73,8 @@ export function RecentTrades({ mode }: RecentTradesProps) {
               <span className="text-green-400 text-sm">
                 ✅ +{Number(trade.potential_pnl).toFixed(2)}$
               </span>
+            ) : Number(trade.potential_pnl) === 0 ? (
+              <span className="text-gray-500 text-sm">🚫 Cancelled</span>
             ) : (
               <span className="text-red-400 text-sm">
                 ❌ {Number(trade.potential_pnl).toFixed(2)}$

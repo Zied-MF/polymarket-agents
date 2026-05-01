@@ -299,38 +299,59 @@ export async function getClobMarket(conditionId: string): Promise<ClobMarket | n
 }
 
 // ---------------------------------------------------------------------------
-// placeOrder — utilise ClobClient.createAndPostOrder()
+// placeOrder — market order FOK (Fill Or Kill)
+//
+// Utilise createAndPostMarketOrder(FOK) au lieu de createAndPostOrder(GTC).
+// Raison : les ordres GTC restent ouverts indéfiniment, l'AMM Polymarket
+// n'a pas de contrepartie permanente pour les limites passives. L'UI
+// Polymarket utilise des market orders (FOK) → exécution instantanée.
+//
+// Prix worst-case (slippage protection) :
+//   BUY  → worstPrice = price × 1.05  (on accepte jusqu'à +5% de glissement)
+//   SELL → worstPrice = price × 0.95  (on accepte jusqu'à −5% de glissement)
+//
+// UserMarketOrderV2.amount :
+//   BUY  → montant en USDC
+//   SELL → nombre de shares (amountUsdc / price)
 // ---------------------------------------------------------------------------
 
 export async function placeOrder(params: PlaceOrderParams): Promise<PlacedOrder> {
-  // Taille en shares : amountUsdc / price
-  // Ex: acheter $0.50 @ 0.05 = 10 shares
-  const size = params.amountUsdc / params.price;
-  const side = params.side === "BUY" ? ClobSide.BUY : ClobSide.SELL;
+  const side  = params.side === "BUY" ? ClobSide.BUY : ClobSide.SELL;
+  // Pour un SELL market order, l'API attend des shares (pas de l'USDC)
+  const amount = params.side === "BUY"
+    ? params.amountUsdc
+    : params.amountUsdc / params.price;  // shares = USDC / price
+
+  // Prix worst-case : limite de slippage pour le FOK
+  const worstPrice = params.side === "BUY"
+    ? Math.round(params.price * 1.05 * 1000) / 1000   // +5%
+    : Math.round(params.price * 0.95 * 1000) / 1000;  // −5%
 
   console.log(
-    `[clob] ${params.dryRun ? "DRY-RUN " : ""}placeOrder: ` +
-    `${params.side} ${params.amountUsdc}$ @ ${params.price} = ${size.toFixed(4)} shares ` +
+    `[clob] ${params.dryRun ? "DRY-RUN " : ""}placeOrder FOK: ` +
+    `${params.side} amount=${amount.toFixed(4)} ` +
+    `(${params.side === "BUY" ? "USDC" : "shares"}) ` +
+    `worstPrice=${worstPrice} midPrice=${params.price} ` +
     `(tokenId=${params.tokenId.slice(0, 10)}...)`
   );
 
-  // negRisk: true → order version v2 (NegRiskCTFExchange)
-  // negRisk: false/undefined → order version v1 (CTFExchange)
   const orderOptions = { negRisk: params.negRisk };
+  const marketOrderInput = {
+    tokenID: params.tokenId,
+    amount,
+    side,
+    price: worstPrice,
+  };
 
   if (params.dryRun) {
-    // Dry-run : construit et signe l'ordre sans le soumettre
     const client = await getClobClient();
-    const signed = await client.createOrder(
-      { tokenID: params.tokenId, price: params.price, size, side },
-      orderOptions
-    );
+    const signed = await client.createMarketOrder(marketOrderInput, orderOptions);
     return {
       orderId:    "dry-run",
       status:     "dry_run",
       tokenId:    params.tokenId,
       side:       params.side,
-      price:      params.price,
+      price:      worstPrice,
       amountUsdc: params.amountUsdc,
       gasFeeUsdc: POLYGON_GAS_FEE,
       dryRun:     true,
@@ -339,33 +360,38 @@ export async function placeOrder(params: PlaceOrderParams): Promise<PlacedOrder>
   }
 
   const client = await getClobClient();
-  const orderInput = { tokenID: params.tokenId, price: params.price, size, side };
-  console.log("[clob] createAndPostOrder input:", JSON.stringify({ ...orderInput, ...orderOptions }));
+  console.log("[clob] createAndPostMarketOrder FOK input:", JSON.stringify({ ...marketOrderInput, ...orderOptions }));
 
-  const result = await client.createAndPostOrder(
-    orderInput,
-    orderOptions,  // ← negRisk flag — détermine la version d'ordre (v1 vs v2)
-    ClobOrderType.GTC
+  const result = await client.createAndPostMarketOrder(
+    marketOrderInput,
+    orderOptions,
+    ClobOrderType.FOK
   ) as Record<string, unknown>;
 
-  // throwOnError=true → les erreurs HTTP lèvent une exception avec le message Polymarket.
-  // Vérification défensive au cas où throwOnError ne couvrirait pas tous les cas.
   if (result && "error" in result) {
     const errMsg = typeof result.error === "string" ? result.error : JSON.stringify(result);
     console.error("[clob] ❌ Polymarket error body:", JSON.stringify(result));
     throw new Error(`[clob] Polymarket rejected order (HTTP ${result.status ?? "?"}): ${errMsg}`);
   }
 
-  // Le résultat peut être { orderID, status } ou { id, status }
   const orderId = (result.orderID ?? result.id ?? "unknown") as string;
-  console.log(`[clob] ✅ Ordre placé: ${orderId} (${result.status})`);
+  const status  = (result as Record<string, string>).status ?? "placed";
+  console.log(`[clob] ✅ Ordre FOK placé: ${orderId} (status=${status})`);
+
+  // FOK : si status = "cancelled" → l'ordre n'a pas pu être rempli (slippage dépassé)
+  if (status === "cancelled" || status === "canceled") {
+    throw new Error(
+      `[clob] FOK order cancelled — market moved beyond slippage limit ` +
+      `(worstPrice=${worstPrice}, mid=${params.price}). Retry next scan.`
+    );
+  }
 
   return {
     orderId,
-    status:     (result as Record<string, string>).status ?? "placed",
+    status,
     tokenId:    params.tokenId,
     side:       params.side,
-    price:      params.price,
+    price:      worstPrice,
     amountUsdc: params.amountUsdc,
     gasFeeUsdc: POLYGON_GAS_FEE,
     dryRun:     false,
@@ -380,6 +406,20 @@ export async function cancelOrder(orderId: string): Promise<void> {
   const client = await getClobClient();
   const res    = await client.cancelOrder({ orderID: orderId });
   console.log(`[clob] ✅ Ordre ${orderId} annulé:`, res);
+}
+
+// ---------------------------------------------------------------------------
+// cancelAllOrders — annule tous les ordres ouverts du compte
+// ---------------------------------------------------------------------------
+
+export async function cancelAllOrders(): Promise<{ cancelled: number }> {
+  const client = await getClobClient();
+  const res    = await client.cancelAll() as Record<string, unknown>;
+  console.log(`[clob] ✅ cancelAll:`, res);
+  // La réponse inclut { not_cancelled: [...], ... } — on estime le count
+  const notCancelled = Array.isArray(res.not_cancelled) ? res.not_cancelled.length : 0;
+  const cancelled    = typeof res.count === "number" ? res.count : 0;
+  return { cancelled: cancelled - notCancelled };
 }
 
 // ---------------------------------------------------------------------------

@@ -12,23 +12,42 @@ interface Stats {
   roi?:             string;
 }
 
+interface BankrollCardSubtitle {
+  roi:             number;
+  initialBankroll: number;
+}
+
 interface LiveStatsProps {
   stats:      Stats | null;
   viewMode?:  "real" | "paper";
 }
 
+function BankrollSubtitle({ roi, initialBankroll }: BankrollCardSubtitle) {
+  const sign      = roi >= 0 ? "+" : "";
+  const color     = roi >= 0 ? "text-green-400" : "text-red-400";
+  return (
+    <div className="text-xs mt-1 space-y-0.5">
+      <span className={`font-semibold ${color}`}>ROI: {sign}{roi.toFixed(1)}%</span>
+      <span className="text-gray-500 ml-1">(init: ${initialBankroll.toFixed(2)})</span>
+    </div>
+  );
+}
+
 export function LiveStats({ stats, viewMode = "paper" }: LiveStatsProps) {
-  const isReal = viewMode === "real";
+  const isReal          = viewMode === "real";
+  const initialBankroll = stats?.initialBankroll ?? (isReal ? 61.59 : 10);
+  const currentBankroll = stats?.currentBankroll ? parseFloat(stats.currentBankroll) : null;
+  const roi             = stats?.roi ? parseFloat(stats.roi) : null;
 
   const cards = [
     {
-      label:    isReal ? "Real Bankroll" : "Paper Bankroll",
-      value:    stats?.currentBankroll ? `${stats.currentBankroll}$` : "—",
-      icon:     isReal ? "💎" : "💵",
-      color:    stats?.currentBankroll && parseFloat(stats.currentBankroll) > (stats.initialBankroll ?? 10)
-                  ? "text-green-400"
-                  : "text-gray-400",
-      subtitle: stats?.roi ? `ROI: ${parseFloat(stats.roi) >= 0 ? "+" : ""}${stats.roi}%` : undefined,
+      label:      isReal ? "Real Bankroll" : "Paper Bankroll",
+      value:      stats?.currentBankroll ? `$${stats.currentBankroll}` : "—",
+      icon:       isReal ? "💎" : "💵",
+      color:      currentBankroll !== null && currentBankroll > initialBankroll
+                    ? "text-green-400"
+                    : "text-red-400",
+      roiSubtitle: roi !== null ? { roi, initialBankroll } : null,
     },
     {
       label: "Win Rate",
@@ -81,8 +100,8 @@ export function LiveStats({ stats, viewMode = "paper" }: LiveStatsProps) {
             <span className="text-xs text-gray-400">{card.label}</span>
           </div>
           <div className={`text-2xl font-bold ${card.color}`}>{card.value}</div>
-          {"subtitle" in card && card.subtitle && (
-            <div className="text-xs text-gray-500 mt-1">{card.subtitle}</div>
+          {"roiSubtitle" in card && card.roiSubtitle && (
+            <BankrollSubtitle {...card.roiSubtitle} />
           )}
         </div>
       ))}

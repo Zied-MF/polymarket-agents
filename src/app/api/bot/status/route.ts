@@ -41,18 +41,22 @@ export async function GET() {
     };
   }
 
-  const INITIAL_BANKROLL = 10;
+  // Initial bankrolls — configurable via env vars so they update when topped up.
+  // PAPER_BANKROLL_INITIAL : starting capital for paper simulation (default $10)
+  // REAL_BANKROLL_INITIAL  : actual USDC deposited on Polymarket (default $61.59)
+  const PAPER_BANKROLL_INITIAL = parseFloat(process.env.PAPER_BANKROLL_INITIAL ?? "10");
+  const REAL_BANKROLL_INITIAL  = parseFloat(process.env.REAL_BANKROLL_INITIAL  ?? "61.59");
 
   // Paper stats (is_real = false or null)
   const paperToday = allTodayTrades.filter((t) => !t.is_real);
   const paperAll   = allTrades.filter((t) => !t.is_real);
-  const paperStats = computeStats(paperToday, paperAll, positions.length, bankroll.toFixed(2), INITIAL_BANKROLL);
+  const paperStats = computeStats(paperToday, paperAll, positions.length, bankroll.toFixed(2), PAPER_BANKROLL_INITIAL);
 
   // Real stats (is_real = true)
   const realToday    = allTodayTrades.filter((t) => t.is_real);
   const realAll      = allTrades.filter((t) => t.is_real);
   const realBankroll = balancePUsd != null ? balancePUsd.toFixed(2) : "0.00";
-  const realStats    = computeStats(realToday, realAll, realPositions.length, realBankroll, INITIAL_BANKROLL);
+  const realStats    = computeStats(realToday, realAll, realPositions.length, realBankroll, REAL_BANKROLL_INITIAL);
 
   // Legacy combined stats (for backwards compat)
   const stats = paperStats;

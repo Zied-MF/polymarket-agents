@@ -1,13 +1,24 @@
 import { NextResponse } from "next/server";
 import { getClient }    from "@/lib/db/supabase";
 
-export async function GET() {
+export async function GET(req: Request) {
+  const { searchParams } = new URL(req.url);
+  const mode = searchParams.get("mode"); // "real" | "paper" | null (all)
+
   const db = getClient();
-  const { data, error } = await db
+  let query = db
     .from("paper_trades")
-    .select("id, question, city, outcome, market_price, suggested_bet, won, potential_pnl, created_at")
+    .select("id, question, city, outcome, market_price, suggested_bet, won, potential_pnl, is_real, created_at")
     .order("created_at", { ascending: false })
     .limit(20);
+
+  if (mode === "real") {
+    query = query.eq("is_real", true);
+  } else if (mode === "paper") {
+    query = query.or("is_real.is.null,is_real.eq.false");
+  }
+
+  const { data, error } = await query;
 
   if (error) {
     return NextResponse.json({ error: error.message }, { status: 500 });

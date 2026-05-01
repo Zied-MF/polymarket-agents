@@ -21,12 +21,15 @@ interface BotState {
 }
 
 interface Stats {
-  tradesToday:   number;
-  totalTrades:   number;
-  winRate:       string;
-  pnlToday:      string;
-  totalPnl:      string;
-  openPositions: number;
+  tradesToday:      number;
+  totalTrades:      number;
+  winRate:          string;
+  pnlToday:         string;
+  totalPnl:         string;
+  openPositions:    number;
+  currentBankroll?: string;
+  initialBankroll?: number;
+  roi?:             string;
 }
 
 interface TradingInfo {
@@ -40,12 +43,15 @@ interface TradingInfo {
 // ---------------------------------------------------------------------------
 
 export default function Dashboard() {
-  const [botState, setBotState] = useState<BotState | null>(null);
-  const [stats,    setStats]    = useState<Stats | null>(null);
-  const [trading,  setTrading]  = useState<TradingInfo | null>(null);
-  const [loading,  setLoading]  = useState(true);
-  const [error,    setError]    = useState<string | null>(null);
-  const [scanning, setScanning] = useState(false);
+  const [botState,   setBotState]   = useState<BotState | null>(null);
+  const [stats,      setStats]      = useState<Stats | null>(null);
+  const [paperStats, setPaperStats] = useState<Stats | null>(null);
+  const [realStats,  setRealStats]  = useState<Stats | null>(null);
+  const [trading,    setTrading]    = useState<TradingInfo | null>(null);
+  const [loading,    setLoading]    = useState(true);
+  const [error,      setError]      = useState<string | null>(null);
+  const [scanning,   setScanning]   = useState(false);
+  const [viewMode,   setViewMode]   = useState<"real" | "paper">("real");
 
   // ── Fetch status ────────────────────────────────────────────────────────
 
@@ -56,6 +62,8 @@ export default function Dashboard() {
       const data = await res.json();
       setBotState(data.state);
       setStats(data.stats);
+      setPaperStats(data.paperStats ?? null);
+      setRealStats(data.realStats ?? null);
       setTrading(data.trading ?? null);
       setError(null);
     } catch (e) {
@@ -153,8 +161,32 @@ export default function Dashboard() {
 
       <main className="max-w-7xl mx-auto px-4 py-6 space-y-6">
 
+        {/* ── View mode toggle ── */}
+        <div className="flex items-center gap-2">
+          <button
+            onClick={() => setViewMode("real")}
+            className={`px-4 py-1.5 rounded-lg text-sm font-semibold transition border ${
+              viewMode === "real"
+                ? "bg-green-900 text-green-300 border-green-700"
+                : "bg-gray-800 text-gray-400 border-gray-700 hover:border-gray-500"
+            }`}
+          >
+            Real Trading
+          </button>
+          <button
+            onClick={() => setViewMode("paper")}
+            className={`px-4 py-1.5 rounded-lg text-sm font-semibold transition border ${
+              viewMode === "paper"
+                ? "bg-blue-900 text-blue-300 border-blue-700"
+                : "bg-gray-800 text-gray-400 border-gray-700 hover:border-gray-500"
+            }`}
+          >
+            Paper Trading
+          </button>
+        </div>
+
         {/* ── KPI cards ── */}
-        <LiveStats stats={stats} />
+        <LiveStats stats={viewMode === "real" ? realStats : paperStats} viewMode={viewMode} />
 
         {/* ── Trading mode selector ── */}
         <TradingModeSelector
@@ -191,9 +223,9 @@ export default function Dashboard() {
           <div className="bg-gray-900 rounded-xl border border-gray-800 p-4">
             <h2 className="text-base font-semibold mb-4 flex items-center gap-2">
               📊 Open Positions
-              {stats && (
+              {(viewMode === "real" ? realStats : paperStats) && (
                 <span className="text-xs bg-blue-500/20 text-blue-400 px-2 py-0.5 rounded-full">
-                  {stats.openPositions}
+                  {(viewMode === "real" ? realStats : paperStats)!.openPositions}
                 </span>
               )}
             </h2>
@@ -202,7 +234,7 @@ export default function Dashboard() {
 
           <div className="bg-gray-900 rounded-xl border border-gray-800 p-4">
             <h2 className="text-base font-semibold mb-4">📈 Recent Trades</h2>
-            <RecentTrades />
+            <RecentTrades mode={viewMode} />
           </div>
         </div>
 

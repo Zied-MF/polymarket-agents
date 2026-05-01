@@ -11,17 +11,24 @@ interface TradeRow {
   suggested_bet: number;
   won:           boolean | null;
   potential_pnl: number;
+  is_real:       boolean | null;
   created_at:    string;
 }
 
-export function RecentTrades() {
+interface RecentTradesProps {
+  mode?: "real" | "paper";
+}
+
+export function RecentTrades({ mode }: RecentTradesProps) {
   const [trades,  setTrades]  = useState<TradeRow[]>([]);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
+    setLoading(true);
+    const url = mode ? `/api/trades/recent?mode=${mode}` : "/api/trades/recent";
     const load = async () => {
       try {
-        const res  = await fetch("/api/trades/recent");
+        const res  = await fetch(url);
         const data = await res.json();
         setTrades(data.trades ?? []);
       } catch { /* silent */ }
@@ -30,7 +37,7 @@ export function RecentTrades() {
     load();
     const id = setInterval(load, 10_000);
     return () => clearInterval(id);
-  }, []);
+  }, [mode]);
 
   if (loading) return <p className="text-gray-500 text-sm py-4">Loading…</p>;
 
@@ -46,7 +53,14 @@ export function RecentTrades() {
           className="flex items-center justify-between p-3 bg-gray-800/50 rounded-lg gap-3"
         >
           <div className="flex-1 min-w-0">
-            <p className="text-sm truncate">{trade.question}</p>
+            <div className="flex items-center gap-1.5">
+              {trade.is_real && (
+                <span className="text-[10px] font-semibold bg-green-900 text-green-300 border border-green-700 px-1.5 py-0.5 rounded shrink-0">
+                  REAL
+                </span>
+              )}
+              <p className="text-sm truncate">{trade.question}</p>
+            </div>
             <p className="text-xs text-gray-400">
               {trade.outcome} @ {(trade.market_price * 100).toFixed(0)}¢
               {" · "}{trade.suggested_bet.toFixed(2)}$

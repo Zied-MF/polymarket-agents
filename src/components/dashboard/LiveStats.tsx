@@ -13,15 +13,18 @@ interface Stats {
 }
 
 interface LiveStatsProps {
-  stats: Stats | null;
+  stats:      Stats | null;
+  viewMode?:  "real" | "paper";
 }
 
-export function LiveStats({ stats }: LiveStatsProps) {
+export function LiveStats({ stats, viewMode = "paper" }: LiveStatsProps) {
+  const isReal = viewMode === "real";
+
   const cards = [
     {
-      label:    "Bankroll",
+      label:    isReal ? "Real Bankroll" : "Paper Bankroll",
       value:    stats?.currentBankroll ? `${stats.currentBankroll}$` : "—",
-      icon:     "💵",
+      icon:     isReal ? "💎" : "💵",
       color:    stats?.currentBankroll && parseFloat(stats.currentBankroll) > (stats.initialBankroll ?? 10)
                   ? "text-green-400"
                   : "text-gray-400",

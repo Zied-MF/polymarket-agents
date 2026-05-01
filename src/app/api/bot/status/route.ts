@@ -9,46 +9,53 @@ export async function GET() {
 
   const today = new Date().toISOString().slice(0, 10);
 
-  const [todayRes, allRes, posRes, bankroll, balancePUsd] = await Promise.all([
-    db.from("paper_trades").select("won, potential_pnl").gte("created_at", today),
-    db.from("paper_trades").select("won, potential_pnl").not("won", "is", null),
-    db.from("positions").select("id").is("sold_at", null),
+  const [todayAllRes, allResRaw, posRes, bankroll, balancePUsd, realPosRes] = await Promise.all([
+    db.from("paper_trades").select("won, potential_pnl, is_real").gte("created_at", today),
+    db.from("paper_trades").select("won, potential_pnl, is_real").not("won", "is", null),
+    db.from("positions").select("id").is("sold_at", null).is("is_real", null),
     getCurrentBankroll(),
     getAccountBalance().catch(() => null),
+    db.from("positions").select("id").is("sold_at", null).eq("is_real", true),
   ]);
 
-  const todayTrades = todayRes.data ?? [];
-  const allTrades   = allRes.data   ?? [];
-  const positions   = posRes.data   ?? [];
+  const allTodayTrades = todayAllRes.data ?? [];
+  const allTrades      = allResRaw.data   ?? [];
+  const positions      = posRes.data      ?? [];
+  const realPositions  = realPosRes.data  ?? [];
 
-  const wins    = allTrades.filter((t) => t.won).length;
-  const winRate = allTrades.length
-    ? ((wins / allTrades.length) * 100).toFixed(1)
-    : "0.0";
-
-  const pnlToday = todayTrades
-    .reduce((s, t) => s + (Number(t.potential_pnl) || 0), 0)
-    .toFixed(2);
-
-  const totalPnl = allTrades
-    .reduce((s, t) => s + (Number(t.potential_pnl) || 0), 0)
-    .toFixed(2);
+  function computeStats(
+    today: { won: boolean | null; potential_pnl: number }[],
+    all:   { won: boolean | null; potential_pnl: number }[],
+    openPos: number,
+    currentBankroll: string,
+    initialBankroll: number,
+  ) {
+    const wins    = all.filter((t) => t.won).length;
+    const winRate = all.length ? ((wins / all.length) * 100).toFixed(1) : "0.0";
+    const pnlToday = today.reduce((s, t) => s + (Number(t.potential_pnl) || 0), 0).toFixed(2);
+    const totalPnl = all.reduce((s, t) => s + (Number(t.potential_pnl) || 0), 0).toFixed(2);
+    const roi = ((parseFloat(currentBankroll) - initialBankroll) / initialBankroll * 100).toFixed(1);
+    return {
+      tradesToday: today.length, totalTrades: all.length, wins, winRate,
+      pnlToday, totalPnl, openPositions: openPos, currentBankroll, initialBankroll, roi,
+    };
+  }
 
   const INITIAL_BANKROLL = 10;
-  const roi = ((bankroll - INITIAL_BANKROLL) / INITIAL_BANKROLL * 100).toFixed(1);
 
-  const stats = {
-    tradesToday:      todayTrades.length,
-    totalTrades:      allTrades.length,
-    wins,
-    winRate,
-    pnlToday,
-    totalPnl,
-    openPositions:    positions.length,
-    currentBankroll:  bankroll.toFixed(2),
-    initialBankroll:  INITIAL_BANKROLL,
-    roi,
-  };
+  // Paper stats (is_real = false or null)
+  const paperToday = allTodayTrades.filter((t) => !t.is_real);
+  const paperAll   = allTrades.filter((t) => !t.is_real);
+  const paperStats = computeStats(paperToday, paperAll, positions.length, bankroll.toFixed(2), INITIAL_BANKROLL);
+
+  // Real stats (is_real = true)
+  const realToday    = allTodayTrades.filter((t) => t.is_real);
+  const realAll      = allTrades.filter((t) => t.is_real);
+  const realBankroll = balancePUsd != null ? balancePUsd.toFixed(2) : "0.00";
+  const realStats    = computeStats(realToday, realAll, realPositions.length, realBankroll, INITIAL_BANKROLL);
+
+  // Legacy combined stats (for backwards compat)
+  const stats = paperStats;
 
   const trading = {
     realTradingEnabled: process.env.REAL_TRADING_ENABLED === "true",
@@ -56,5 +63,5 @@ export async function GET() {
     funderAddress:      process.env.POLYMARKET_FUNDER_ADDRESS ?? null,
   };
 
-  return NextResponse.json({ state, stats, trading });
+  return NextResponse.json({ state, stats, paperStats, realStats, trading });
 }

@@ -10,7 +10,8 @@ export async function GET() {
   const today = new Date().toISOString().slice(0, 10);
 
   const [todayAllRes, allResRaw, posRes, bankroll, balancePUsd, realPosRes] = await Promise.all([
-    db.from("paper_trades").select("won, potential_pnl, is_real").gte("created_at", today),
+    // pnlToday = P&L réalisé uniquement (won IS NOT NULL) — exclut les positions encore ouvertes
+    db.from("paper_trades").select("won, potential_pnl, is_real").gte("created_at", today).not("won", "is", null),
     db.from("paper_trades").select("won, potential_pnl, is_real").not("won", "is", null),
     db.from("positions").select("id").is("sold_at", null).is("is_real", null),
     getCurrentBankroll(),

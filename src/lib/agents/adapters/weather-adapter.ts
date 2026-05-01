@@ -23,6 +23,7 @@ import { getCurrentBankroll }                                                   
 import { calculateBetSize, MAX_PCT_LIQUIDITY, MAX_PCT_ORDERBOOK, MIN_BET_AMOUNT } from "@/lib/utils/sizing";
 import { sendDiscordAlert }                                                       from "@/lib/utils/discord";
 import { getClobMarket, getAvailableLiquidity }                                   from "@/lib/polymarket/clob-api";
+import { isRealTradingEnabled }                                                   from "@/lib/trade-executor";
 import { getAirportStation, isUSCity }                                           from "@/lib/data/airport-stations";
 import { analyzeWithClaude, type MarketContext }                                 from "@/lib/agents/claude-analyst";
 import { fetchMultiModelForecast, calculateMultiModelProbability,
@@ -273,10 +274,11 @@ export const weatherAdapter: AgentConfig = {
       console.warn(`[weather-adapter] hasRecentTradeForCityDate échoué (non-bloquant):`, err instanceof Error ? err.message : err);
     }
 
-    // ── CLOB pre-check : vérifier que le marché est tradable avant d'aller plus loin ──
-    // Si m.id est un entier Gamma (ex: "2112645") au lieu d'un conditionId hex,
-    // getClobMarket retourne null et on skip sans déclencher d'erreur Discord.
-    {
+    // ── CLOB pre-check : uniquement en mode REAL ────────────────────────────
+    // Les marchés météo utilisent un AMM sur Polymarket. En paper mode,
+    // on simule au prix Gamma — pas besoin que le marché soit dans le CLOB.
+    // En real mode, vérifier que le marché est actif avant d'appeler Claude.
+    if (isRealTradingEnabled()) {
       const clobCheck = await getClobMarket(m.id).catch(() => null);
       if (!clobCheck) {
         const reason = `Market not found in CLOB (id=${m.id}) — may need conditionId`;
@@ -507,53 +509,59 @@ export const weatherAdapter: AgentConfig = {
     }
 
     // ── Étape 2 : cap orderbook réel (asks dans 5% slippage × 20%) ──────────
+    // Uniquement en mode REAL. Les marchés météo Polymarket utilisent un AMM —
+    // le carnet CLOB est vide ($0.00 asks) même pour des marchés très liquides
+    // sur Gamma. En paper mode, on simule au prix Gamma : ce check bloquerait
+    // 100% des trades sans raison valable.
     const targetOutcome = claudeAnalysis.outcome ?? best.outcome;
     let   orderbookLiquidity: number | null = null;
     let   orderbookCapped = false;
 
-    try {
-      const clobMarket = await getClobMarket(m.id);
-      const token      = clobMarket?.tokens.find(
-        (t) => t.outcome.toLowerCase() === targetOutcome.toLowerCase()
-      );
-      if (token) {
-        orderbookLiquidity = await getAvailableLiquidity(token.tokenId, best.marketPrice);
-        const maxByOrderbook = orderbookLiquidity * MAX_PCT_ORDERBOOK;
+    if (isRealTradingEnabled()) {
+      try {
+        const clobMarket = await getClobMarket(m.id);
+        const token      = clobMarket?.tokens.find(
+          (t) => t.outcome.toLowerCase() === targetOutcome.toLowerCase()
+        );
+        if (token) {
+          orderbookLiquidity = await getAvailableLiquidity(token.tokenId, best.marketPrice);
+          const maxByOrderbook = orderbookLiquidity * MAX_PCT_ORDERBOOK;
 
-        if (maxByOrderbook < MIN_BET_AMOUNT) {
-          // Orderbook trop peu profond — skip
-          const reason =
-            `Orderbook liquidity $${orderbookLiquidity.toFixed(2)} too shallow ` +
-            `(${(MAX_PCT_ORDERBOOK * 100).toFixed(0)}% = $${maxByOrderbook.toFixed(2)} < min $${MIN_BET_AMOUNT})`;
-          console.log(`[weather-adapter] ⏭️ Skip ${m.city}: ${reason}`);
-          sendDiscordAlert(
-            `⏭️ Skip **${m.city}** : orderbook $${orderbookLiquidity.toFixed(2)} trop peu profond\n` +
-            `${(MAX_PCT_ORDERBOOK * 100).toFixed(0)}% = $${maxByOrderbook.toFixed(2)} < minimum $${MIN_BET_AMOUNT}`
-          ).catch(() => {});
-          return { skipReason: reason };
-        }
+          if (maxByOrderbook < MIN_BET_AMOUNT) {
+            // Orderbook trop peu profond — skip uniquement en real
+            const reason =
+              `Orderbook liquidity $${orderbookLiquidity.toFixed(2)} too shallow ` +
+              `(${(MAX_PCT_ORDERBOOK * 100).toFixed(0)}% = $${maxByOrderbook.toFixed(2)} < min $${MIN_BET_AMOUNT})`;
+            console.log(`[weather-adapter] ⏭️ Skip ${m.city}: ${reason}`);
+            sendDiscordAlert(
+              `⏭️ Skip **${m.city}** : orderbook $${orderbookLiquidity.toFixed(2)} trop peu profond\n` +
+              `${(MAX_PCT_ORDERBOOK * 100).toFixed(0)}% = $${maxByOrderbook.toFixed(2)} < minimum $${MIN_BET_AMOUNT}`
+            ).catch(() => {});
+            return { skipReason: reason };
+          }
 
-        if (adjustedBet > maxByOrderbook) {
-          // Réduire au cap orderbook
-          const before = adjustedBet;
-          adjustedBet  = Math.round(maxByOrderbook * 100) / 100;
-          orderbookCapped = true;
-          console.log(
-            `[weather-adapter] ⚠️ Bet réduit par orderbook: $${before.toFixed(2)} → $${adjustedBet.toFixed(2)} ` +
-            `(${(MAX_PCT_ORDERBOOK * 100).toFixed(0)}% de $${orderbookLiquidity.toFixed(2)} immédiat)`
-          );
-          sendDiscordAlert(
-            `⚠️ Bet réduit **${m.city}** : $${before.toFixed(2)} → $${adjustedBet.toFixed(2)} ` +
-            `(orderbook cap ${(MAX_PCT_ORDERBOOK * 100).toFixed(0)}% sur $${orderbookLiquidity.toFixed(2)} immédiat)`
-          ).catch(() => {});
+          if (adjustedBet > maxByOrderbook) {
+            // Réduire au cap orderbook
+            const before = adjustedBet;
+            adjustedBet  = Math.round(maxByOrderbook * 100) / 100;
+            orderbookCapped = true;
+            console.log(
+              `[weather-adapter] ⚠️ Bet réduit par orderbook: $${before.toFixed(2)} → $${adjustedBet.toFixed(2)} ` +
+              `(${(MAX_PCT_ORDERBOOK * 100).toFixed(0)}% de $${orderbookLiquidity.toFixed(2)} immédiat)`
+            );
+            sendDiscordAlert(
+              `⚠️ Bet réduit **${m.city}** : $${before.toFixed(2)} → $${adjustedBet.toFixed(2)} ` +
+              `(orderbook cap ${(MAX_PCT_ORDERBOOK * 100).toFixed(0)}% sur $${orderbookLiquidity.toFixed(2)} immédiat)`
+            ).catch(() => {});
+          }
         }
+      } catch (err) {
+        // Fallback gracieux — on garde le bet Gamma si l'orderbook est inaccessible
+        console.warn(
+          `[weather-adapter] ⚠️ Orderbook fetch failed for ${m.city} — fallback to Gamma liquidity: ` +
+          (err instanceof Error ? err.message : String(err))
+        );
       }
-    } catch (err) {
-      // Fallback gracieux — on garde le bet Gamma si l'orderbook est inaccessible
-      console.warn(
-        `[weather-adapter] ⚠️ Orderbook fetch failed for ${m.city} — fallback to Gamma liquidity: ` +
-        (err instanceof Error ? err.message : String(err))
-      );
     }
 
     // Log si bet réduit uniquement par Gamma (pas orderbook)

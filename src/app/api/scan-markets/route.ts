@@ -30,7 +30,9 @@ import {
   getClient as getSupabaseClient,
 }                                          from "@/lib/db/supabase";
 import { cleanOldLogs }                    from "@/lib/logger";
-import { executeBuy }                      from "@/lib/trade-executor";
+import { executeBuy, isRealTradingEnabled } from "@/lib/trade-executor";
+import { getAccountBalance }               from "@/lib/polymarket/clob-api";
+import { MIN_BET_AMOUNT }                  from "@/lib/utils/sizing";
 
 // ---------------------------------------------------------------------------
 // Guard : max positions par marché+outcome
@@ -39,6 +41,13 @@ import { executeBuy }                      from "@/lib/trade-executor";
 /** Nombre maximum de positions ouvertes autorisées par market_id+outcome. */
 const MAX_POSITIONS_PER_MARKET =
   parseInt(process.env.MAX_POSITIONS_PER_MARKET ?? "1", 10);
+
+/**
+ * Fraction maximale du bankroll effectif par trade individuel.
+ * Ex: 0.05 = 5% max. Configurable via MAX_PCT_BANKROLL_PER_TRADE env var.
+ */
+const MAX_PCT_BANKROLL_PER_TRADE =
+  parseFloat(process.env.MAX_PCT_BANKROLL_PER_TRADE ?? "0.05");
 
 /**
  * Retourne le nombre de positions ouvertes (sold_at IS NULL) pour ce couple
@@ -131,7 +140,22 @@ export async function GET(): Promise<NextResponse<ScanResult | { status: string;
   // Propager le mode DB vers le weather-adapter (écrase l'env var TRADING_MODE)
   setWeatherAdapterMode(scanMode);
   const bankroll = await getCurrentBankroll().catch(() => 10);
-  console.log(`[scan-markets] ▶ Démarrage scan — ${new Date().toISOString()} (mode: ${scanMode}, bankroll: ${bankroll.toFixed(2)}$)`);
+
+  // Bankroll effectif : pUSD on-chain si real trading, sinon bankroll paper DB.
+  // Utilisé pour le cap MAX_PCT_BANKROLL_PER_TRADE.
+  let effectiveBankroll = bankroll;
+  if (isRealTradingEnabled()) {
+    const pUsd = await getAccountBalance().catch(() => null);
+    if (pUsd !== null && pUsd > 0) effectiveBankroll = pUsd;
+  }
+  const maxBetByBankroll = effectiveBankroll * MAX_PCT_BANKROLL_PER_TRADE;
+
+  console.log(
+    `[scan-markets] ▶ Démarrage scan — ${new Date().toISOString()} ` +
+    `(mode: ${scanMode}, bankroll: ${bankroll.toFixed(2)}$, ` +
+    `effectiveBankroll: ${effectiveBankroll.toFixed(2)}$, ` +
+    `maxBetPerTrade: ${maxBetByBankroll.toFixed(2)}$)`
+  );
   await logActivity("scan", `Scan started (mode: ${scanMode}, bankroll: ${bankroll.toFixed(2)}$)`);
 
   try {
@@ -188,11 +212,8 @@ export async function GET(): Promise<NextResponse<ScanResult | { status: string;
 
     for (const opp of toSave) {
       // Champs dérivés non stockés dans Opportunity pour garder l'interface propre
-      const stationCode  = opp.ticker ?? opp.city ?? "";
-      const multiplier   = opp.marketPrice > 0 ? Math.round((1 / opp.marketPrice) * 100) / 100 : 0;
-      const potentialPnl = opp.marketPrice > 0
-        ? Math.round(opp.suggestedBet * (1 / opp.marketPrice - 1) * 100) / 100
-        : 0;
+      const stationCode = opp.ticker ?? opp.city ?? "";
+      const multiplier  = opp.marketPrice > 0 ? Math.round((1 / opp.marketPrice) * 100) / 100 : 0;
 
       // 2a. opportunities
       try {
@@ -214,10 +235,37 @@ export async function GET(): Promise<NextResponse<ScanResult | { status: string;
         errors.push({ marketId: opp.marketId, question: opp.question, error: msg });
       }
 
-      // 2b. Guard : max positions ouvertes par marché+outcome
+      // 2b. Cap bankroll par trade
+      const label = opp.city ?? opp.ticker ?? opp.marketId;
+      let finalBet = Math.min(opp.suggestedBet, maxBetByBankroll);
+      finalBet = Math.round(finalBet * 100) / 100;
+
+      if (finalBet < MIN_BET_AMOUNT) {
+        console.log(
+          `[scan-markets] ⏭ Skip ${label}/${opp.outcome}: ` +
+          `finalBet $${finalBet.toFixed(2)} < min $${MIN_BET_AMOUNT} ` +
+          `(proposed=$${opp.suggestedBet.toFixed(2)}, bankrollCap=$${maxBetByBankroll.toFixed(2)})`
+        );
+        sendDiscordAlert(
+          `⏭️ Skip **${label}** ${opp.outcome} — mise finale $${finalBet.toFixed(2)} < min $${MIN_BET_AMOUNT}\n` +
+          `(proposé=$${opp.suggestedBet.toFixed(2)}, cap bankroll ${(MAX_PCT_BANKROLL_PER_TRADE * 100).toFixed(0)}%=$${maxBetByBankroll.toFixed(2)})`
+        ).catch(() => {});
+        continue;
+      }
+
+      if (finalBet < opp.suggestedBet) {
+        console.log(
+          `[scan-markets] ⚠ Bet réduit par bankroll cap: $${opp.suggestedBet.toFixed(2)} → $${finalBet.toFixed(2)} ` +
+          `(${(MAX_PCT_BANKROLL_PER_TRADE * 100).toFixed(0)}% de $${effectiveBankroll.toFixed(2)})`
+        );
+      }
+
+      // Override suggestedBet with the capped value for downstream processing
+      const cappedOpp = { ...opp, suggestedBet: finalBet };
+
+      // 2d. Guard : max positions ouvertes par marché+outcome
       const openCount = await countOpenPositions(opp.marketId, opp.outcome);
       if (openCount >= MAX_POSITIONS_PER_MARKET) {
-        const label = opp.city ?? opp.marketId;
         console.log(
           `[scan-markets] ⏭ Skip ${label}/${opp.outcome}: ` +
           `${openCount} position(s) déjà ouverte(s) (max=${MAX_POSITIONS_PER_MARKET})`
@@ -229,27 +277,32 @@ export async function GET(): Promise<NextResponse<ScanResult | { status: string;
         continue;
       }
 
-      // 2c. paper_trade + position (+ ordre CLOB réel si REAL_TRADING_ENABLED)
+      // 2e. paper_trade + position (+ ordre CLOB réel si REAL_TRADING_ENABLED)
+      // potentialPnl recalculé sur le bet cappé
+      const cappedPotentialPnl = cappedOpp.marketPrice > 0
+        ? Math.round(cappedOpp.suggestedBet * (1 / cappedOpp.marketPrice - 1) * 100) / 100
+        : 0;
       try {
         const result = await executeBuy({
-          marketId:             opp.marketId,
-          question:             opp.question,
-          city:                 opp.city ?? null,
-          ticker:               opp.ticker ?? null,
-          agent:                opp.agent,
-          outcome:              opp.outcome,
-          marketPrice:          opp.marketPrice,
-          estimatedProbability: opp.estimatedProbability,
-          edge:                 opp.edge,
-          suggestedBet:         opp.suggestedBet,
-          confidence:           opp.confidence ?? null,
-          targetDate:           opp.targetDate,
-          targetDateTime:       opp.targetDateTime,
-          marketContext:        opp.marketContext ?? null,
-          potentialPnl,
+          marketId:             cappedOpp.marketId,
+          question:             cappedOpp.question,
+          city:                 cappedOpp.city ?? null,
+          ticker:               cappedOpp.ticker ?? null,
+          agent:                cappedOpp.agent,
+          outcome:              cappedOpp.outcome,
+          marketPrice:          cappedOpp.marketPrice,
+          estimatedProbability: cappedOpp.estimatedProbability,
+          edge:                 cappedOpp.edge,
+          suggestedBet:         cappedOpp.suggestedBet,
+          confidence:           cappedOpp.confidence ?? null,
+          targetDate:           cappedOpp.targetDate,
+          targetDateTime:       cappedOpp.targetDateTime,
+          marketContext:        cappedOpp.marketContext ?? null,
+          potentialPnl:         cappedPotentialPnl,
         });
         console.log(
-          `[scan-markets] 🃏 Trade enregistré : ${opp.marketId}/${opp.outcome} ` +
+          `[scan-markets] 🃏 Trade enregistré : ${cappedOpp.marketId}/${cappedOpp.outcome} ` +
+          `bet=$${cappedOpp.suggestedBet.toFixed(2)} ` +
           `(paperTradeId=${result.paperTradeId.slice(0, 8)}, positionId=${result.positionId.slice(0, 8)}, ` +
           `real=${result.isReal})`
         );

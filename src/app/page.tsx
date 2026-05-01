@@ -241,7 +241,7 @@ export default function Dashboard() {
         {/* ── Activity log ── */}
         <div className="bg-gray-900 rounded-xl border border-gray-800 p-4">
           <h2 className="text-base font-semibold mb-4">📝 Activity Log</h2>
-          <ActivityLog />
+          <ActivityLog mode={viewMode} />
         </div>
 
       </main>

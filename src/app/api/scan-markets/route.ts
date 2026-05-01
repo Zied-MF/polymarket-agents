@@ -178,13 +178,25 @@ export async function GET(): Promise<NextResponse<ScanResult | { status: string;
   }
   const maxBetByBankroll = effectiveBankroll * MAX_PCT_BANKROLL_PER_TRADE;
 
+  const isReal        = isRealTradingEnabled();
+  const modeLabel     = isReal ? "REAL" : "PAPER";
+  const logMeta       = {
+    is_real_mode:    isReal,
+    bankroll_paper:  bankroll,
+    bankroll_real:   isReal ? effectiveBankroll : null,
+  };
+
   console.log(
-    `[scan-markets] ▶ Démarrage scan — ${new Date().toISOString()} ` +
-    `(mode: ${scanMode}, bankroll: ${bankroll.toFixed(2)}$, ` +
-    `effectiveBankroll: ${effectiveBankroll.toFixed(2)}$, ` +
-    `maxBetPerTrade: ${maxBetByBankroll.toFixed(2)}$)`
+    `[scan-markets] ▶ [${modeLabel}] Démarrage scan — ${new Date().toISOString()} ` +
+    `(mode: ${scanMode}, bankroll_paper: ${bankroll.toFixed(2)}$` +
+    (isReal ? `, bankroll_real: ${effectiveBankroll.toFixed(2)}$` : "") +
+    `, maxBetPerTrade: ${maxBetByBankroll.toFixed(2)}$)`
   );
-  await logActivity("scan", `Scan started (mode: ${scanMode}, bankroll: ${bankroll.toFixed(2)}$)`);
+  await logActivity(
+    "scan",
+    `[${modeLabel}] Scan started (mode: ${scanMode}, bankroll: $${effectiveBankroll.toFixed(2)})`,
+    logMeta
+  );
 
   try {
   const errors: ScanResult["errors"] = [];
@@ -376,9 +388,9 @@ export async function GET(): Promise<NextResponse<ScanResult | { status: string;
   // One summary line per scan — no per-skip logs to avoid DB bloat
   if (savedCount > 0) {
     const labels = opps.map((o) => `${o.city ?? o.ticker ?? o.marketId} ${o.outcome}`).join(", ");
-    logActivity("trade", `${savedCount} trade(s): ${labels}`).catch(() => {});
+    logActivity("trade", `[${modeLabel}] ${savedCount} trade(s): ${labels}`, logMeta).catch(() => {});
   }
-  logActivity("info", `Scan complete: ${savedCount} saved, ${skipped.length} skipped`).catch(() => {});
+  logActivity("info", `[${modeLabel}] Scan complete: ${savedCount} saved, ${skipped.length} skipped`, logMeta).catch(() => {});
 
   const duration = `${Date.now() - startTime}ms`;
   console.log(

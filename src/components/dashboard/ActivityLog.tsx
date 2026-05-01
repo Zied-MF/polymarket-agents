@@ -27,14 +27,19 @@ const TYPE_ICON: Record<string, string> = {
   scan:  "🔍",
 };
 
-export function ActivityLog() {
+interface ActivityLogProps {
+  mode?: "real" | "paper";
+}
+
+export function ActivityLog({ mode }: ActivityLogProps) {
   const [logs,    setLogs]    = useState<LogEntry[]>([]);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
+    const url  = mode ? `/api/logs/recent?mode=${mode}` : "/api/logs/recent";
     const load = async () => {
       try {
-        const res  = await fetch("/api/logs/recent");
+        const res  = await fetch(url);
         const data = await res.json();
         setLogs(data.logs ?? []);
       } catch { /* silent */ }
@@ -43,7 +48,7 @@ export function ActivityLog() {
     load();
     const id = setInterval(load, 5_000);
     return () => clearInterval(id);
-  }, []);
+  }, [mode]);
 
   if (loading) return <p className="text-gray-500 text-sm py-4">Loading…</p>;
 

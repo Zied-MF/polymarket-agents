@@ -1,6 +1,7 @@
 import { NextResponse }                    from "next/server";
 import { getBotState }                    from "@/lib/bot/bot-state";
 import { getClient, getCurrentBankroll }  from "@/lib/db/supabase";
+import { getAccountBalance }              from "@/lib/polymarket/clob-api";
 
 export async function GET() {
   const db    = getClient();
@@ -8,11 +9,12 @@ export async function GET() {
 
   const today = new Date().toISOString().slice(0, 10);
 
-  const [todayRes, allRes, posRes, bankroll] = await Promise.all([
+  const [todayRes, allRes, posRes, bankroll, balancePUsd] = await Promise.all([
     db.from("paper_trades").select("won, potential_pnl").gte("created_at", today),
     db.from("paper_trades").select("won, potential_pnl").not("won", "is", null),
     db.from("positions").select("id").is("sold_at", null),
     getCurrentBankroll(),
+    getAccountBalance().catch(() => null),
   ]);
 
   const todayTrades = todayRes.data ?? [];
@@ -48,5 +50,11 @@ export async function GET() {
     roi,
   };
 
-  return NextResponse.json({ state, stats });
+  const trading = {
+    realTradingEnabled: process.env.REAL_TRADING_ENABLED === "true",
+    balancePUsd:        balancePUsd ?? null,
+    funderAddress:      process.env.POLYMARKET_FUNDER_ADDRESS ?? null,
+  };
+
+  return NextResponse.json({ state, stats, trading });
 }

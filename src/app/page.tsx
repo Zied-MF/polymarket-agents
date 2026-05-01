@@ -29,6 +29,12 @@ interface Stats {
   openPositions: number;
 }
 
+interface TradingInfo {
+  realTradingEnabled: boolean;
+  balancePUsd:        number | null;
+  funderAddress:      string | null;
+}
+
 // ---------------------------------------------------------------------------
 // Dashboard
 // ---------------------------------------------------------------------------
@@ -36,6 +42,7 @@ interface Stats {
 export default function Dashboard() {
   const [botState, setBotState] = useState<BotState | null>(null);
   const [stats,    setStats]    = useState<Stats | null>(null);
+  const [trading,  setTrading]  = useState<TradingInfo | null>(null);
   const [loading,  setLoading]  = useState(true);
   const [error,    setError]    = useState<string | null>(null);
   const [scanning, setScanning] = useState(false);
@@ -49,6 +56,7 @@ export default function Dashboard() {
       const data = await res.json();
       setBotState(data.state);
       setStats(data.stats);
+      setTrading(data.trading ?? null);
       setError(null);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Failed to fetch status");
@@ -106,11 +114,27 @@ export default function Dashboard() {
             <span className="text-2xl">🌤️</span>
             <div>
               <h1 className="text-lg font-bold leading-none">WeatherBot</h1>
-              <span className="text-xs text-gray-500">Paper Trading · Polymarket</span>
+              <span className="text-xs text-gray-500">
+                {trading?.realTradingEnabled ? "Real Trading" : "Paper Trading"} · Polymarket
+              </span>
             </div>
+            {trading?.realTradingEnabled ? (
+              <span className="text-xs font-semibold bg-green-900 text-green-300 border border-green-700 px-2 py-1 rounded">
+                REAL
+              </span>
+            ) : (
+              <span className="text-xs text-gray-500 bg-gray-800 px-2 py-1 rounded">
+                PAPER
+              </span>
+            )}
             <span className="hidden sm:inline text-xs text-gray-600 bg-gray-800 px-2 py-1 rounded">
               {botState?.mode ?? "balanced"}
             </span>
+            {trading?.balancePUsd !== null && trading?.balancePUsd !== undefined && (
+              <span className="hidden md:inline text-xs text-yellow-400 bg-yellow-950 border border-yellow-800 px-2 py-1 rounded">
+                {trading.balancePUsd.toFixed(2)} pUSD
+              </span>
+            )}
           </div>
 
           {/* Error banner inline */}

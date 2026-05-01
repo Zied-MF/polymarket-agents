@@ -20,7 +20,6 @@ import {
   getClobMarket,
   placeOrder,
   getAccountBalance,
-  checkCTFAllowance,
   debugAllowances,
   detectTradingMode,
 }                                    from "@/lib/polymarket/clob-api";
@@ -467,86 +466,42 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
     return NextResponse.json(diag, { status: 500 });
   }
 
-  // ── Step 2 : Allowance CTF Exchange ───────────────────────────────────────
-  // allowanceDebug (step 3b above) already has full proxy + raw values.
-  // Surface key fields here for quick reading alongside the other flow steps.
-  try {
-    realTradingFlow.step = "allowance_check";
-
-    const ad = diag.allowanceDebug as Record<string, unknown> | null | undefined;
-    if (ad && !("error" in (ad as object))) {
-      realTradingFlow.allowanceOwnerChecked = (ad as { ownerChecked?: string }).ownerChecked ?? null;
-      realTradingFlow.allowanceOwnerType    = (ad as { ownerType?: string }).ownerType ?? null;
-      realTradingFlow.proxyResolved         =
-        (ad as { proxyResolution?: { proxyAddress?: string } }).proxyResolution?.proxyAddress ?? null;
-    }
-
-    const { sufficient, allowance } = await checkCTFAllowance();
-    realTradingFlow.allowanceUsdc       = (Number(allowance) / 1_000_000).toFixed(2);
-    realTradingFlow.allowanceSufficient = sufficient;
-    if (!sufficient) {
-      realTradingFlow.step  = "FAILED_allowance";
-      realTradingFlow.error = `CTF Exchange allowance insuffisante (${(Number(allowance) / 1_000_000).toFixed(2)} USDC). Appeler /api/approve-ctf?execute=true.`;
-      diag.status = "REAL_FAILED_ALLOWANCE";
-      return NextResponse.json(diag, { status: 422 });
-    }
-    realTradingFlow.step = "allowance_check_ok";
-  } catch (err) {
-    realTradingFlow.step       = "FAILED_allowance_error";
-    realTradingFlow.error      = err instanceof Error ? err.message : String(err);
-    realTradingFlow.errorStack = err instanceof Error ? err.stack?.slice(0, 600) : null;
-    diag.status = "REAL_FAILED_ALLOWANCE_ERROR";
-    return NextResponse.json(diag, { status: 500 });
-  }
-
-  // ── Step 3 : Signature + soumission ordre CLOB ────────────────────────────
-  const orderPayload = {
+  // ── Step 2 : Dry-run — vérifier la signature CLOB sans soumettre ──────────
+  // Permet de vérifier que le ClobClient V2 peut construire l'ordre sans
+  // placer de trade réel. Ne compte pas comme un ordre Polymarket.
+  realTradingFlow.orderPayload = {
     tokenId:    yesToken.tokenId,
-    side:       "BUY" as const,
+    side:       "BUY",
     amountUsdc: BET_USDC,
     price:      market.yesPrice,
     size:       BET_USDC / market.yesPrice,
     negRisk:    clobMarket.negRisk,
   };
-  realTradingFlow.orderPayload = orderPayload; // toujours visible même en cas d'erreur
-
-  let orderId: string | null = null;
   try {
-    realTradingFlow.step = "place_order";
-    const placed = await placeOrder({
-      ...orderPayload,
-      dryRun: false,
+    realTradingFlow.step = "dry_run_sign";
+    const dryPlaced = await placeOrder({
+      tokenId:    yesToken.tokenId,
+      side:       "BUY",
+      amountUsdc: BET_USDC,
+      price:      market.yesPrice,
+      negRisk:    clobMarket.negRisk,
+      dryRun:     true,
     });
-    orderId = placed.orderId;
-    realTradingFlow.step        = "place_order_ok";
-    realTradingFlow.orderId     = placed.orderId;
-    realTradingFlow.orderStatus = placed.status;
-    realTradingFlow.gasFeeUsdc  = placed.gasFeeUsdc;
-    const modeDetected = diag.tradingModeDetection as { selectedMode?: string } | undefined;
-    realTradingFlow.selectedTradingMode = modeDetected?.selectedMode ?? "unknown";
+    realTradingFlow.step          = "dry_run_sign_ok";
+    realTradingFlow.dryRunOrderHash = dryPlaced.orderHash ?? "signed";
   } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    realTradingFlow.step            = "FAILED_place_order";
-    realTradingFlow.error           = msg;
-    realTradingFlow.errorStack      = err instanceof Error ? err.stack?.slice(0, 800) : null;
-    // ApiError from @polymarket/clob-client has .data with the full response
-    const apiErr = err as Record<string, unknown>;
-    if (apiErr.data) realTradingFlow.polymarketErrorBody = apiErr.data;
-    if (msg.includes("403") || msg.includes("Forbidden")) {
-      realTradingFlow.hint = `HTTP 403 — geo-block? vercelRegion=${diag.vercelRegion} blocked=${(diag.geoBlockCheck as Record<string,unknown>)?.blocked}`;
-    } else if (msg.includes("400") || msg.includes("Bad Request") || msg.includes("invalid")) {
-      realTradingFlow.hint =
-        `HTTP 400 — format de l'ordre invalide. ` +
-        `price=${orderPayload.price} size=${orderPayload.size.toFixed(4)} negRisk=${orderPayload.negRisk}. ` +
-        `Vérifier: tick size, price min/max, size minimum.`;
-    }
-    diag.status = "REAL_FAILED_PLACE_ORDER";
+    realTradingFlow.step       = "FAILED_dry_run_sign";
+    realTradingFlow.error      = err instanceof Error ? err.message : String(err);
+    realTradingFlow.errorStack = err instanceof Error ? err.stack?.slice(0, 600) : null;
+    diag.status = "REAL_FAILED_SIGN";
     return NextResponse.json(diag, { status: 500 });
   }
 
-  // ── Step 4 : Persistance DB via executeBuy ─────────────────────────────────
+  // ── Step 3 : Trade réel via executeBuy — ordre CLOB + DB en une seule passe
+  // executeBuy() place l'ordre ET persiste paper_trade + position + is_real + clob_order_id.
+  // Un seul ordre réel est soumis (pas de double-soumission comme avant).
   try {
-    realTradingFlow.step = "execute_buy_db";
+    realTradingFlow.step = "execute_buy";
     const buyResult = await executeBuy({
       marketId:             market.conditionId,
       question:             market.question,
@@ -569,7 +524,7 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
     realTradingFlow.paperTradeId = buyResult.paperTradeId;
     realTradingFlow.positionId   = buyResult.positionId;
     realTradingFlow.isReal       = buyResult.isReal;
-    realTradingFlow.clobOrderId  = buyResult.orderId ?? null;
+    realTradingFlow.orderId      = buyResult.orderId ?? null;
 
     // ── Vérification DB ───────────────────────────────────────────────────
     realTradingFlow.step = "db_verify";
@@ -590,18 +545,21 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
       realTradingFlow.dbVerification = { verdict: "❌ position introuvable en DB" };
     }
   } catch (err) {
-    realTradingFlow.step       = "FAILED_execute_buy_db";
-    realTradingFlow.error      = err instanceof Error ? err.message : String(err);
-    realTradingFlow.errorStack = err instanceof Error ? err.stack?.slice(0, 600) : null;
-    // On ne retourne pas d'erreur ici — le placeOrder (step 3) a réussi
+    const msg = err instanceof Error ? err.message : String(err);
+    realTradingFlow.step       = "FAILED_execute_buy";
+    realTradingFlow.error      = msg;
+    realTradingFlow.errorStack = err instanceof Error ? err.stack?.slice(0, 800) : null;
+    const apiErr = err as Record<string, unknown>;
+    if (apiErr.data) realTradingFlow.polymarketErrorBody = apiErr.data;
+    if (msg.includes("403") || msg.includes("Forbidden")) {
+      realTradingFlow.hint = `HTTP 403 — geo-block? vercelRegion=${diag.vercelRegion} blocked=${(diag.geoBlockCheck as Record<string,unknown>)?.blocked}`;
+    } else if (msg.includes("400") || msg.includes("invalid") || msg.includes("min size")) {
+      realTradingFlow.hint = `HTTP 400 — format invalide ou min size. payload=${JSON.stringify(realTradingFlow.orderPayload)}`;
+    }
+    diag.status = "REAL_FAILED";
+    return NextResponse.json(diag, { status: 500 });
   }
 
   diag.status = "REAL_TRADE_ATTEMPTED";
-  diag.order  = {
-    orderId_step3:   orderId,
-    orderId_step4:   (realTradingFlow.clobOrderId as string | null) ?? null,
-    submittedToClob: true,
-  };
-
   return NextResponse.json(diag);
 }

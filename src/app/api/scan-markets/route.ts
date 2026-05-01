@@ -50,6 +50,22 @@ const MAX_PCT_BANKROLL_PER_TRADE =
   parseFloat(process.env.MAX_PCT_BANKROLL_PER_TRADE ?? "0.05");
 
 /**
+ * Plafond absolu par trade en USDC, indépendant du bankroll.
+ * Filet de sécurité ultime si le bankroll réel est inconnu.
+ * Default: $5. Configurable via MAX_BET_ABSOLUTE_USDC env var.
+ */
+const MAX_BET_ABSOLUTE_USDC =
+  parseFloat(process.env.MAX_BET_ABSOLUTE_USDC ?? "5");
+
+/**
+ * Bankroll initial conservateur utilisé comme fallback lorsque le solde
+ * pUSD on-chain n'est pas disponible (RPC KO). Evite d'utiliser le bankroll
+ * paper composé (très gonflé) qui rendrait le cap bancroll inopérant.
+ */
+const INITIAL_BANKROLL_FALLBACK =
+  parseFloat(process.env.INITIAL_BANKROLL ?? "10");
+
+/**
  * Retourne le nombre de positions ouvertes (sold_at IS NULL) pour ce couple
  * market_id + outcome. Retourne 0 en cas d'erreur (fail-open).
  */
@@ -143,10 +159,22 @@ export async function GET(): Promise<NextResponse<ScanResult | { status: string;
 
   // Bankroll effectif : pUSD on-chain si real trading, sinon bankroll paper DB.
   // Utilisé pour le cap MAX_PCT_BANKROLL_PER_TRADE.
-  let effectiveBankroll = bankroll;
+  //
+  // Fallback conservateur : si pUSD RPC échoue en mode real, on utilise
+  // INITIAL_BANKROLL_FALLBACK ($10) et non le bankroll paper composé (gonflé
+  // à ~$171 par les gains simulés), ce qui rendrait le cap inopérant.
+  let effectiveBankroll: number;
   if (isRealTradingEnabled()) {
     const pUsd = await getAccountBalance().catch(() => null);
-    if (pUsd !== null && pUsd > 0) effectiveBankroll = pUsd;
+    effectiveBankroll = (pUsd !== null && pUsd > 0) ? pUsd : INITIAL_BANKROLL_FALLBACK;
+    if (pUsd === null) {
+      console.warn(
+        `[scan-markets] ⚠ pUSD RPC failed — using conservative fallback $${INITIAL_BANKROLL_FALLBACK} ` +
+        `instead of inflated paper bankroll $${bankroll.toFixed(2)}`
+      );
+    }
+  } else {
+    effectiveBankroll = bankroll; // paper mode : bankroll composé normal
   }
   const maxBetByBankroll = effectiveBankroll * MAX_PCT_BANKROLL_PER_TRADE;
 
@@ -235,20 +263,20 @@ export async function GET(): Promise<NextResponse<ScanResult | { status: string;
         errors.push({ marketId: opp.marketId, question: opp.question, error: msg });
       }
 
-      // 2b. Cap bankroll par trade
+      // 2b. Cap bankroll par trade + plafond absolu (filet de sécurité)
       const label = opp.city ?? opp.ticker ?? opp.marketId;
-      let finalBet = Math.min(opp.suggestedBet, maxBetByBankroll);
+      let finalBet = Math.min(opp.suggestedBet, maxBetByBankroll, MAX_BET_ABSOLUTE_USDC);
       finalBet = Math.round(finalBet * 100) / 100;
 
       if (finalBet < MIN_BET_AMOUNT) {
         console.log(
           `[scan-markets] ⏭ Skip ${label}/${opp.outcome}: ` +
           `finalBet $${finalBet.toFixed(2)} < min $${MIN_BET_AMOUNT} ` +
-          `(proposed=$${opp.suggestedBet.toFixed(2)}, bankrollCap=$${maxBetByBankroll.toFixed(2)})`
+          `(proposed=$${opp.suggestedBet.toFixed(2)}, bankrollCap=$${maxBetByBankroll.toFixed(2)}, absCap=$${MAX_BET_ABSOLUTE_USDC})`
         );
         sendDiscordAlert(
           `⏭️ Skip **${label}** ${opp.outcome} — mise finale $${finalBet.toFixed(2)} < min $${MIN_BET_AMOUNT}\n` +
-          `(proposé=$${opp.suggestedBet.toFixed(2)}, cap bankroll ${(MAX_PCT_BANKROLL_PER_TRADE * 100).toFixed(0)}%=$${maxBetByBankroll.toFixed(2)})`
+          `(proposé=$${opp.suggestedBet.toFixed(2)}, cap bankroll ${(MAX_PCT_BANKROLL_PER_TRADE * 100).toFixed(0)}%=$${maxBetByBankroll.toFixed(2)}, absCap=$${MAX_BET_ABSOLUTE_USDC})`
         ).catch(() => {});
         continue;
       }

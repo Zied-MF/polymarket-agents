@@ -19,7 +19,7 @@ import { weatherAdapter }                  from "@/lib/agents/adapters/weather-a
 // Finance Agent — shadow mode (analyse uniquement, pas de trades réels) — 2026-04-20
 // import { financeAdapter }               from "@/lib/agents/adapters/finance-adapter";
 // import { cryptoAdapter } from "@/lib/agents/adapters/crypto-adapter"; // DÉSACTIVÉ 2026-04-18
-import { sendDiscordNotification, sendDiscordAlert } from "@/lib/utils/discord";
+import { sendDiscordNotification } from "@/lib/utils/discord";
 import {
   saveOpportunity,
   getRecentOpportunities,
@@ -286,10 +286,6 @@ export async function GET(): Promise<NextResponse<ScanResult | { status: string;
           `finalBet $${finalBet.toFixed(2)} < min $${MIN_BET_AMOUNT} ` +
           `(proposed=$${opp.suggestedBet.toFixed(2)}, bankrollCap=$${maxBetByBankroll.toFixed(2)}, absCap=$${MAX_BET_ABSOLUTE_USDC})`
         );
-        sendDiscordAlert(
-          `⏭️ Skip **${label}** ${opp.outcome} — mise finale $${finalBet.toFixed(2)} < min $${MIN_BET_AMOUNT}\n` +
-          `(proposé=$${opp.suggestedBet.toFixed(2)}, cap bankroll ${(MAX_PCT_BANKROLL_PER_TRADE * 100).toFixed(0)}%=$${maxBetByBankroll.toFixed(2)}, absCap=$${MAX_BET_ABSOLUTE_USDC})`
-        ).catch(() => {});
         continue;
       }
 
@@ -310,10 +306,6 @@ export async function GET(): Promise<NextResponse<ScanResult | { status: string;
           `[scan-markets] ⏭ Skip ${label}/${opp.outcome}: ` +
           `${openCount} position(s) déjà ouverte(s) (max=${MAX_POSITIONS_PER_MARKET})`
         );
-        sendDiscordAlert(
-          `⏭️ Skip **${label}** ${opp.outcome} — déjà ${openCount} position(s) ouverte(s) ` +
-          `(MAX_POSITIONS_PER_MARKET=${MAX_POSITIONS_PER_MARKET})`
-        ).catch(() => {});
         continue;
       }
 

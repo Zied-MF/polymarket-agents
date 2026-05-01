@@ -21,7 +21,6 @@ import { fetchForecastForStation, fetchEnsembleForecast }                       
 import { analyzeMarket, parseOutcomeForMarket }                                  from "@/lib/agents/weather-agent";
 import { getCurrentBankroll }                                                    from "@/lib/db/supabase";
 import { calculateBetSize, MAX_PCT_LIQUIDITY, MIN_BET_AMOUNT }                    from "@/lib/utils/sizing";
-import { sendDiscordAlert }                                                       from "@/lib/utils/discord";
 import { getClobMarket }                                                          from "@/lib/polymarket/clob-api";
 import { isRealTradingEnabled }                                                   from "@/lib/trade-executor";
 import { getAirportStation, isUSCity }                                           from "@/lib/data/airport-stations";
@@ -501,10 +500,6 @@ export const weatherAdapter: AgentConfig = {
     if (adjustedBet === 0) {
       const reason = `Liquidity $${m.liquidity} too low (${(MAX_PCT_LIQUIDITY * 100).toFixed(0)}% = $${maxByGammaLiq.toFixed(2)} < min $${MIN_BET_AMOUNT})`;
       console.log(`[weather-adapter] ⏭️ Skip ${m.city}: ${reason}`);
-      sendDiscordAlert(
-        `⏭️ Skip **${m.city}** : liquidity $${m.liquidity} trop basse\n` +
-        `Max bet ${(MAX_PCT_LIQUIDITY * 100).toFixed(0)}% = $${maxByGammaLiq.toFixed(2)} < minimum $${MIN_BET_AMOUNT}`
-      ).catch(() => {});
       return { skipReason: reason };
     }
 
@@ -523,10 +518,6 @@ export const weatherAdapter: AgentConfig = {
         `[weather-adapter] ⚠️ Bet réduit par liquidité Gamma: $${kellyBet.toFixed(2)} → $${adjustedBet.toFixed(2)} ` +
         `(${(MAX_PCT_LIQUIDITY * 100).toFixed(0)}% de $${m.liquidity})`
       );
-      sendDiscordAlert(
-        `⚠️ Bet réduit **${m.city}** : $${kellyBet.toFixed(2)} → $${adjustedBet.toFixed(2)} ` +
-        `(liquidity cap ${(MAX_PCT_LIQUIDITY * 100).toFixed(0)}% sur $${m.liquidity})`
-      ).catch(() => {});
     }
 
     console.log(

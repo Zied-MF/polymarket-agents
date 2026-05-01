@@ -305,9 +305,17 @@ export async function executeBuy(input: BuyInput): Promise<ExecuteBuyResult> {
 /**
  * Vend une position (real ou paper) selon position.isReal.
  *
- * Le chemin REAL annule l'ordre CLOB ouvert et calcule le P&L réel.
- * Le chemin PAPER utilise la simulation existante.
- * En cas d'échec real, fallback sur paper avec log Discord.
+ * Chemin REAL :
+ *   1. Tente cancelOrder() — couvre le cas où le BUY n'a pas encore été rempli.
+ *      (Non bloquant : échoue silencieusement si l'ordre est déjà FILLED.)
+ *   2. Place un ordre SELL limit GTC pour les tokens acquis lors du BUY.
+ *      (Couvre le cas normal : AMM remplit le BUY instantanément, tokens dans wallet.)
+ *      Calcul : shares = suggestedBet / entryPrice → amountUsdc = shares × sellPrice
+ *   3. Calcule le P&L (prix Gamma + gas fees).
+ *   4. Met à jour la DB.
+ *   En cas d'échec critique : fallback paper + alerte Discord.
+ *
+ * Chemin PAPER : simulation existante inchangée.
  */
 export async function executeSell(
   position:   Position,
@@ -317,33 +325,90 @@ export async function executeSell(
 
   if (position.isReal) {
     try {
-      // 1. Annuler l'ordre CLOB si encore ouvert.
-      // Guard explicite : si clob_order_id est null sur une position is_real,
-      // c'est un bug de persistance — on alerte plutôt que de silencer.
+      const GAS_FEE = 0.01; // estimation 2 tx Polygon (buy + sell)
+
+      // ── Étape 1 : tenter d'annuler l'ordre BUY si encore ouvert ────────────
+      // Cas : l'ordre limit n'a pas encore été matché (rare avec l'AMM Polymarket).
+      // Échoue silencieusement si déjà FILLED — on continue vers le SELL.
       if (position.clobOrderId) {
         await cancelOrder(position.clobOrderId).catch((err) => {
-          console.warn(`[trade-executor] cancelOrder non-bloquant: ${err instanceof Error ? err.message : err}`);
+          console.log(
+            `[trade-executor] cancelOrder non-bloquant (ordre probablement déjà rempli): ` +
+            `${err instanceof Error ? err.message : err}`
+          );
         });
       } else {
-        console.error(
-          `[trade-executor] ⚠ REAL position ${position.id} n'a pas de clob_order_id — ` +
-          `cancelOrder ignoré (bug de persistance lors du buy ?)`
+        console.warn(
+          `[trade-executor] ⚠ REAL position ${position.id} sans clob_order_id — ` +
+          `cancelOrder ignoré`
         );
+      }
+
+      // ── Étape 2 : placer un ordre SELL pour les tokens acquis ───────────────
+      // L'AMM Polymarket remplit les BUY instantanément → tokens dans le wallet.
+      // On les vend au prix courant (sellPrice) via un nouveau limit GTC.
+      //
+      // Calcul du montant :
+      //   shares acquis lors du BUY = suggestedBet / entryPrice
+      //   USDC à recevoir au SELL   = shares × sellPrice
+      let sellOrderId: string | undefined;
+
+      try {
+        const clobMarket = await getClobMarket(position.marketId);
+        const token      = clobMarket?.tokens.find(
+          (t) => t.outcome.toLowerCase() === position.outcome.toLowerCase()
+        );
+
+        if (!clobMarket || !token) {
+          console.warn(
+            `[trade-executor] ⚠ Marché/token introuvable dans CLOB pour SELL ` +
+            `(market=${position.marketId} outcome=${position.outcome}) — SELL on-chain ignoré`
+          );
+        } else {
+          const sharesHeld    = position.suggestedBet / position.entryPrice;
+          const sellAmountUsdc = Math.round(sharesHeld * sellPrice * 100) / 100;
+
+          if (sellAmountUsdc >= 0.01) { // seuil minimal pour éviter un ordre dust
+            const placed = await placeOrder({
+              tokenId:    token.tokenId,
+              side:       "SELL",
+              amountUsdc: sellAmountUsdc,
+              price:      sellPrice,
+              negRisk:    clobMarket.negRisk,
+              dryRun:     false,
+            });
+            sellOrderId = placed.orderId;
+            console.log(
+              `[trade-executor] ✅ REAL SELL order placed: orderId=${placed.orderId} ` +
+              `shares=${sharesHeld.toFixed(4)} @ ${sellPrice} = $${sellAmountUsdc.toFixed(2)}`
+            );
+          } else {
+            console.warn(
+              `[trade-executor] ⚠ SELL amount $${sellAmountUsdc.toFixed(4)} < $0.01 — ordre ignoré (dust)`
+            );
+          }
+        }
+      } catch (sellErr) {
+        // SELL on-chain échoué — on continue, le P&L DB reste valide.
+        // Cause probable : tokens déjà vendus ou marché résolu.
+        const msg = sellErr instanceof Error ? sellErr.message : String(sellErr);
+        console.warn(`[trade-executor] ⚠ SELL on-chain échoué (non-bloquant): ${msg}`);
         sendDiscordAlert(
-          `⚠️ **clob_order_id manquant** — position \`${position.id}\` (real=true)\n` +
-          `L'ordre CLOB n'a pas pu être annulé. Vérifier manuellement sur Polymarket.`
+          `⚠️ **REAL SELL on-chain échoué** — position \`${position.id.slice(0, 8)}\`\n` +
+          `Marché: ${position.question.slice(0, 80)}\n` +
+          `Erreur: \`${msg.slice(0, 200)}\`\n` +
+          `_Position marquée vendue en DB. Vérifier manuellement sur Polymarket._`
         ).catch(() => {});
       }
 
-      // 2. Calculer le P&L réel (même formule que paper + gas fee)
-      const GAS_FEE = 0.01; // 2 transactions (buy + sell)
+      // ── Étape 3 : P&L réel ──────────────────────────────────────────────────
       const rawPnl  = Math.round(
         ((sellPrice - position.entryPrice) / position.entryPrice) * position.suggestedBet * 100
       ) / 100;
       const sellPnl = Math.round((rawPnl - GAS_FEE) * 100) / 100;
       const now     = new Date().toISOString();
 
-      // 3. Mettre à jour la position en DB (même effet que paperExecuteSell)
+      // ── Étape 4 : mise à jour DB ────────────────────────────────────────────
       const { getClient: getPosClient } = await import("@/lib/db/supabase");
       const posDb = getPosClient();
       const { error: posErr } = await posDb
@@ -363,7 +428,8 @@ export async function executeSell(
 
       console.log(
         `[trade-executor] ✅ REAL SELL: ${position.marketId}/${position.outcome} ` +
-        `entry=${position.entryPrice} sell=${sellPrice} pnl=${sellPnl}$ (gas=-${GAS_FEE}$)`
+        `entry=${position.entryPrice} sell=${sellPrice} pnl=${sellPnl}$ (gas=-${GAS_FEE}$)` +
+        (sellOrderId ? ` sellOrderId=${sellOrderId}` : " [no on-chain sell]")
       );
 
       return sellPnl;

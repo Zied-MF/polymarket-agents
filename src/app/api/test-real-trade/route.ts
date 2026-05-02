@@ -23,8 +23,8 @@ import {
   debugAllowances,
   detectTradingMode,
 }                                    from "@/lib/polymarket/clob-api";
-import { executeBuy, isRealTradingEnabled, resetAllowanceCache } from "@/lib/trade-executor";
-import { getPositionByPaperTradeId }                            from "@/lib/db/positions";
+import { savePaperTrade }            from "@/lib/db/supabase";
+import { openPosition, getPositionByPaperTradeId } from "@/lib/db/positions";
 
 // ---------------------------------------------------------------------------
 // Gamma — recherche d'un marché pour test d'exécution
@@ -418,24 +418,23 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
   }
 
   // ── LIVE ORDER ─────────────────────────────────────────────────────────────
-  // On N'utilise PAS executeBuy() ici car il swallow les erreurs en fallback
-  // paper. On appelle chaque étape manuellement pour voir exactement où ça casse.
+  // Appel DIRECT à placeOrder() (pas d'executeBuy() intermédiaire qui swallow
+  // les erreurs). Chaque étape est visible dans la réponse JSON.
 
   const BET_USDC = 1.05; // Polymarket min order = $1
 
-  // ── Step 0 : Force REAL_TRADING_ENABLED pour ce test ─────────────────────
-  const envRaw    = process.env.REAL_TRADING_ENABLED;
-  process.env.REAL_TRADING_ENABLED = "true";
-  resetAllowanceCache();
-
-  realTradingFlow.attempted = true;
-  realTradingFlow.envForcedToTrue = true;
-  realTradingFlow.REAL_TRADING_ENABLED_before = envRaw ?? "(not set)";
-  realTradingFlow.REAL_TRADING_ENABLED_after  = isRealTradingEnabled();
+  realTradingFlow.attempted    = true;
+  realTradingFlow.orderPayload = {
+    tokenId:    yesToken.tokenId,
+    side:       "BUY",
+    amountUsdc: BET_USDC,
+    price:      market.yesPrice,
+    size:       BET_USDC / market.yesPrice,
+    negRisk:    clobMarket.negRisk,
+    orderType:  "FAK",
+  };
 
   // ── Step 1 : Balance ───────────────────────────────────────────────────────
-  // null = tous les RPCs Polygon ont échoué → on avertit mais on continue
-  // (Polymarket rejettera l'ordre côté CLOB si balance insuffisante).
   try {
     realTradingFlow.step = "balance_check";
     const balance     = await getAccountBalance();
@@ -447,7 +446,7 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
       realTradingFlow.balanceNote       = "All Polygon RPCs failed — balance unknown, proceeding";
       realTradingFlow.balanceSufficient = null;
     } else {
-      realTradingFlow.balanceUsdc       = balance;
+      realTradingFlow.balanceUsdc        = balance;
       realTradingFlow.balanceMinRequired = minRequired;
       realTradingFlow.balanceSufficient  = balance >= minRequired;
       if (balance < minRequired) {
@@ -466,98 +465,118 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
     return NextResponse.json(diag, { status: 500 });
   }
 
-  // ── Step 2 : Dry-run — vérifier la signature CLOB sans soumettre ──────────
-  // Permet de vérifier que le ClobClient V2 peut construire l'ordre sans
-  // placer de trade réel. Ne compte pas comme un ordre Polymarket.
-  realTradingFlow.orderPayload = {
-    tokenId:    yesToken.tokenId,
-    side:       "BUY",
-    amountUsdc: BET_USDC,
-    price:      market.yesPrice,
-    size:       BET_USDC / market.yesPrice,
-    negRisk:    clobMarket.negRisk,
-  };
+  // ── Step 2 : placeOrder FAK — ordre live ──────────────────────────────────
+  // Appel DIRECT (pas de dry-run, pas d'executeBuy wrapper).
+  // Toute erreur est propagée directement dans la réponse JSON.
+  let placed: Awaited<ReturnType<typeof placeOrder>>;
   try {
-    realTradingFlow.step = "dry_run_sign";
-    const dryPlaced = await placeOrder({
+    realTradingFlow.step = "place_order";
+    placed = await placeOrder({
       tokenId:    yesToken.tokenId,
       side:       "BUY",
       amountUsdc: BET_USDC,
       price:      market.yesPrice,
       negRisk:    clobMarket.negRisk,
-      dryRun:     true,
+      dryRun:     false,
     });
-    realTradingFlow.step          = "dry_run_sign_ok";
-    realTradingFlow.dryRunOrderHash = dryPlaced.orderHash ?? "signed";
-  } catch (err) {
-    realTradingFlow.step       = "FAILED_dry_run_sign";
-    realTradingFlow.error      = err instanceof Error ? err.message : String(err);
-    realTradingFlow.errorStack = err instanceof Error ? err.stack?.slice(0, 600) : null;
-    diag.status = "REAL_FAILED_SIGN";
-    return NextResponse.json(diag, { status: 500 });
-  }
-
-  // ── Step 3 : Trade réel via executeBuy — ordre CLOB + DB en une seule passe
-  // executeBuy() place l'ordre ET persiste paper_trade + position + is_real + clob_order_id.
-  // Un seul ordre réel est soumis (pas de double-soumission comme avant).
-  try {
-    realTradingFlow.step = "execute_buy";
-    const buyResult = await executeBuy({
-      marketId:             market.conditionId,
-      question:             market.question,
-      city:                 null,
-      ticker:               null,
-      agent:                "weather",
-      outcome:              "Yes",
-      marketPrice:          market.yesPrice,
-      estimatedProbability: market.yesPrice,
-      edge:                 0,
-      suggestedBet:         BET_USDC,
-      confidence:           "test",
-      targetDate:           undefined,
-      targetDateTime:       undefined,
-      marketContext:        null,
-      potentialPnl:         0,
-    });
-
-    realTradingFlow.step         = "execute_buy_ok";
-    realTradingFlow.paperTradeId = buyResult.paperTradeId;
-    realTradingFlow.positionId   = buyResult.positionId;
-    realTradingFlow.isReal       = buyResult.isReal;
-    realTradingFlow.orderId      = buyResult.orderId ?? null;
-
-    // ── Vérification DB ───────────────────────────────────────────────────
-    realTradingFlow.step = "db_verify";
-    const positionRow = await getPositionByPaperTradeId(buyResult.paperTradeId).catch(() => null);
-    if (positionRow) {
-      const ok = positionRow.is_real === true && positionRow.clob_order_id !== null;
-      realTradingFlow.dbVerification = {
-        isRealInDb:      positionRow.is_real,
-        clobOrderIdInDb: positionRow.clob_order_id,
-        ok,
-        verdict: ok
-          ? "✅ is_real + clob_order_id persistés"
-          : `❌ is_real=${positionRow.is_real} clob_order_id=${positionRow.clob_order_id}`,
-      };
-      realTradingFlow.step = ok ? "db_verify_ok" : "db_verify_FAILED";
-    } else {
-      realTradingFlow.step         = "db_verify_no_row";
-      realTradingFlow.dbVerification = { verdict: "❌ position introuvable en DB" };
-    }
+    realTradingFlow.step    = "place_order_ok";
+    realTradingFlow.orderId = placed.orderId;
+    realTradingFlow.status  = placed.status;
+    realTradingFlow.isReal  = true;
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    realTradingFlow.step       = "FAILED_execute_buy";
+    realTradingFlow.step       = "FAILED_place_order";
     realTradingFlow.error      = msg;
     realTradingFlow.errorStack = err instanceof Error ? err.stack?.slice(0, 800) : null;
+    realTradingFlow.isReal     = false;
     const apiErr = err as Record<string, unknown>;
     if (apiErr.data) realTradingFlow.polymarketErrorBody = apiErr.data;
     if (msg.includes("403") || msg.includes("Forbidden")) {
       realTradingFlow.hint = `HTTP 403 — geo-block? vercelRegion=${diag.vercelRegion} blocked=${(diag.geoBlockCheck as Record<string,unknown>)?.blocked}`;
     } else if (msg.includes("400") || msg.includes("invalid") || msg.includes("min size")) {
       realTradingFlow.hint = `HTTP 400 — format invalide ou min size. payload=${JSON.stringify(realTradingFlow.orderPayload)}`;
+    } else if (msg.includes("FAK") || msg.includes("0-filled") || msg.includes("cancelled")) {
+      realTradingFlow.hint = "FAK order 0-filled — orderbook vide à ce prix. Essaie un autre marché ou augmente le slippage.";
     }
-    diag.status = "REAL_FAILED";
+    diag.status = "REAL_FAILED_PLACE_ORDER";
     return NextResponse.json(diag, { status: 500 });
+  }
+
+  // ── Step 3 : Persistance DB — paper_trade + position ──────────────────────
+  try {
+    realTradingFlow.step = "db_save";
+    const paperTrade = await savePaperTrade({
+      market_id:             market.conditionId,
+      question:              market.question,
+      city:                  null,
+      ticker:                null,
+      agent:                 "weather",
+      outcome:               "Yes",
+      market_price:          market.yesPrice,
+      estimated_probability: market.yesPrice,
+      edge:                  0,
+      suggested_bet:         BET_USDC,
+      confidence:            "test",
+      resolution_date:       null,
+      potential_pnl:         0,
+      market_context:        null,
+      expected_resolution:   null,
+    });
+    realTradingFlow.paperTradeId = paperTrade.id;
+
+    const position = await openPosition({
+      paperTradeId:     paperTrade.id,
+      marketId:         market.conditionId,
+      question:         market.question,
+      city:             null,
+      ticker:           null,
+      agent:            "weather",
+      outcome:          "Yes",
+      entryPrice:       market.yesPrice,
+      entryProbability: market.yesPrice,
+      suggestedBet:     BET_USDC,
+      resolutionDate:   null,
+    });
+    realTradingFlow.positionId = position.id;
+
+    // Patch is_real + clob_order_id sur les deux tables
+    const { createClient } = await import("@supabase/supabase-js");
+    const sb = createClient(
+      process.env.NEXT_PUBLIC_SUPABASE_URL!,
+      process.env.SUPABASE_SERVICE_ROLE_KEY!
+    );
+    await sb.from("paper_trades").update({ is_real: true }).eq("id", paperTrade.id);
+    await sb.from("positions").update({ is_real: true, clob_order_id: placed.orderId }).eq("id", position.id);
+
+    realTradingFlow.step = "db_save_ok";
+  } catch (err) {
+    // Ordre placé mais DB a échoué — on log mais ordre est réel
+    realTradingFlow.step      = "db_save_WARNING";
+    realTradingFlow.dbError   = err instanceof Error ? err.message : String(err);
+    realTradingFlow.dbWarning = "⚠️ Ordre placé on-chain mais erreur de persistance DB";
+  }
+
+  // ── Step 4 : DB verify ────────────────────────────────────────────────────
+  if (realTradingFlow.paperTradeId) {
+    try {
+      realTradingFlow.step = "db_verify";
+      const positionRow = await getPositionByPaperTradeId(realTradingFlow.paperTradeId as string).catch(() => null);
+      if (positionRow) {
+        const ok = positionRow.is_real === true && positionRow.clob_order_id !== null;
+        realTradingFlow.dbVerification = {
+          isRealInDb:      positionRow.is_real,
+          clobOrderIdInDb: positionRow.clob_order_id,
+          ok,
+          verdict: ok
+            ? "✅ is_real + clob_order_id persistés"
+            : `❌ is_real=${positionRow.is_real} clob_order_id=${positionRow.clob_order_id}`,
+        };
+        realTradingFlow.step = ok ? "db_verify_ok" : "db_verify_FAILED";
+      } else {
+        realTradingFlow.step           = "db_verify_no_row";
+        realTradingFlow.dbVerification = { verdict: "❌ position introuvable en DB" };
+      }
+    } catch { /* non-bloquant */ }
   }
 
   diag.status = "REAL_TRADE_ATTEMPTED";

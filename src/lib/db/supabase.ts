@@ -833,11 +833,15 @@ export async function hasRecentTradeForCityDate(
   city: string,
   date: string
 ): Promise<boolean> {
+  // Exclure les trades annulés (won=false AND potential_pnl=0) — jamais exécutés,
+  // ne doivent pas bloquer une nouvelle tentative sur la même ville/date.
+  // Les vraies pertes (won=false, potential_pnl < 0) bloquent toujours.
   const { data } = await getClient()
     .from("paper_trades")
     .select("id")
     .ilike("city", city)
     .eq("resolution_date", date)
+    .or("won.is.null,won.eq.true,and(won.eq.false,potential_pnl.neq.0)")
     .limit(1);
   return (data?.length ?? 0) > 0;
 }

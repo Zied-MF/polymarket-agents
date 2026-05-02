@@ -325,8 +325,23 @@ class Orchestrator {
       const data   = agent.fetchData ? await agent.fetchData(market) : undefined;
       const result = await agent.analyze(market, data);
 
-      if (result?.dominated && result.dominated.edge >= this.minEdge) {
-        return { opportunity: { ...result.dominated, agent: agent.type } };
+      if (result?.dominated) {
+        if (result.dominated.edge >= this.minEdge) {
+          return { opportunity: { ...result.dominated, agent: agent.type } };
+        }
+        // Drop silencieux visible dans les logs
+        console.log(
+          `[orchestrator] ⬇ DROP edge trop bas: "${(mkt.question ?? "").slice(0, 60)}" ` +
+          `edge=${(result.dominated.edge * 100).toFixed(1)}% < ${(this.minEdge * 100).toFixed(0)}%`
+        );
+        return {
+          skipped: {
+            marketId: mkt.id,
+            question: mkt.question ?? "",
+            reason:   `Edge ${(result.dominated.edge * 100).toFixed(1)}% < minEdge ${(this.minEdge * 100).toFixed(0)}%`,
+            agent:    agent.type,
+          },
+        };
       }
       if (result?.skipReason) {
         return {

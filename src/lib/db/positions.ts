@@ -101,6 +101,8 @@ export interface PositionRow {
   is_real: boolean | null;
   /** Order ID CLOB — permet d'annuler l'ordre lors d'un sell réel. */
   clob_order_id: string | null;
+  /** Peak P&L % observé depuis entrée — trailing stop Layer 5. */
+  peak_pnl_percent: number | null;
 }
 
 export type OpenPositionInput = {
@@ -142,6 +144,7 @@ function rowToPosition(row: PositionRow): Position {
     resolutionDate:      row.resolution_date ? new Date(row.resolution_date) : null,
     isReal:              row.is_real,
     clobOrderId:         row.clob_order_id,
+    peakPnlPercent:      row.peak_pnl_percent,
   };
 }
 
@@ -204,6 +207,7 @@ export async function updatePosition(
     currentProbability: number;
     status: Position["status"];
     sellReason: string;
+    peakPnlPercent: number;
   }>
 ): Promise<void> {
   const db = getClient();
@@ -212,6 +216,7 @@ export async function updatePosition(
   if (data.currentProbability !== undefined) patch.current_probability = data.currentProbability;
   if (data.status             !== undefined) patch.status              = data.status;
   if (data.sellReason         !== undefined) patch.sell_reason         = data.sellReason;
+  if (data.peakPnlPercent     !== undefined) patch.peak_pnl_percent    = data.peakPnlPercent;
 
   const { error } = await db.from("positions").update(patch).eq("id", id);
   if (error) throw new Error(`[positions][updatePosition] ${error.message}`);

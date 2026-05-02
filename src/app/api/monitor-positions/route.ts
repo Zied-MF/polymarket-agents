@@ -194,9 +194,16 @@ export async function GET(): Promise<NextResponse<MonitorResult>> {
     const priceChange = currentPrice !== null
       ? Math.abs(currentPrice - position.entryPrice) / position.entryPrice
       : 0;
+    const pnlPercent  = currentPrice !== null
+      ? (currentPrice - position.entryPrice) / position.entryPrice
+      : 0;
     const probChange  = currentPrice !== null
       ? position.entryProbability - currentPrice
       : 0;
+    // Update peakPnlPercent for trailing stop (Layer 5)
+    const newPeak = (position.peakPnlPercent != null && position.peakPnlPercent > pnlPercent)
+      ? position.peakPnlPercent
+      : pnlPercent;
 
     console.log(
       `${tag} age=${ageMin}min, priceChange=${(priceChange * 100).toFixed(2)}%, ` +
@@ -212,6 +219,7 @@ export async function GET(): Promise<NextResponse<MonitorResult>> {
           currentPrice,
           currentProbability: currentPrice,
           status: "hold",
+          ...(newPeak > (position.peakPnlPercent ?? -Infinity) ? { peakPnlPercent: newPeak } : {}),
         });
       } catch (err) {
         console.error(`${tag} ✗ updatePosition (no-change) :`, err instanceof Error ? err.message : err);
@@ -236,6 +244,7 @@ export async function GET(): Promise<NextResponse<MonitorResult>> {
       ...position,
       currentPrice:       currentPrice,
       currentProbability: currentPrice,
+      peakPnlPercent:     newPeak,   // propagé pour que Layer 5 trailing stop fonctionne
     };
 
     // 2c. Évaluer
@@ -308,6 +317,7 @@ export async function GET(): Promise<NextResponse<MonitorResult>> {
             currentPrice,
             currentProbability: currentPrice,
             status: "hold",
+            ...(newPeak > (position.peakPnlPercent ?? -Infinity) ? { peakPnlPercent: newPeak } : {}),
           });
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);

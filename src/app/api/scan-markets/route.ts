@@ -22,7 +22,6 @@ import { weatherAdapter }                  from "@/lib/agents/adapters/weather-a
 import { sendDiscordNotification } from "@/lib/utils/discord";
 import {
   saveOpportunity,
-  getRecentOpportunities,
   incrementDailyOpportunities,
   acquireScanLock,
   releaseScanLock,
@@ -227,27 +226,49 @@ export async function GET(): Promise<NextResponse<ScanResult | { status: string;
     );
   }
 
-  // 2. Persister dans Supabase — déduplication sur market_id + outcome (24h)
+  // 2. Persister dans Supabase — déduplication sur paper_trades (trades réellement placés)
+  // On utilise paper_trades (pas opportunities) pour éviter de bloquer les marchés dont
+  // le scan a détecté une opportunité mais dont le trade n'a jamais été créé.
+  // Les trades annulés (won=false AND potential_pnl=0) ne bloquent pas non plus.
   let savedCount = 0;
 
   if (opps.length > 0) {
     let existingKeys = new Set<string>();
     try {
-      const recent = await getRecentOpportunities(24);
-      existingKeys = new Set(recent.map((r) => `${r.market_id}:${r.outcome}`));
-      console.log(`[scan-markets] 🔍 ${existingKeys.size} opportunité(s) déjà en DB (24h)`);
+      const db    = getSupabaseClient();
+      const since = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+      const { data: recentTrades } = await db
+        .from("paper_trades")
+        .select("market_id, outcome")
+        .gte("created_at", since)
+        .or("won.is.null,won.eq.true,and(won.eq.false,potential_pnl.neq.0)");
+      existingKeys = new Set(
+        (recentTrades ?? []).map((r: { market_id: string; outcome: string }) => `${r.market_id}:${r.outcome}`)
+      );
+      console.log(`[scan-markets] 🔍 ${existingKeys.size} trade(s) réels en DB (24h, annulés exclus)`);
     } catch (err) {
       console.warn(
-        "[scan-markets] ⚠ Impossible de lire les opportunités récentes, déduplication ignorée :",
+        "[scan-markets] ⚠ Impossible de lire les trades récents, déduplication ignorée :",
         err instanceof Error ? err.message : err
       );
     }
 
-    const toSave     = opps.filter((o) => !existingKeys.has(`${o.marketId}:${o.outcome}`));
+    const toSave      = opps.filter((o) => !existingKeys.has(`${o.marketId}:${o.outcome}`));
     const alreadyKnown = opps.length - toSave.length;
 
+    // Log chaque opportunité et son sort (dedup ou passage)
+    for (const opp of opps) {
+      const label = opp.city ?? opp.ticker ?? opp.marketId;
+      const key   = `${opp.marketId}:${opp.outcome}`;
+      if (existingKeys.has(key)) {
+        console.log(`[scan-markets] ⏭ DEDUP-24H ${label}/${opp.outcome} — trade déjà en DB (market_id=${opp.marketId})`);
+      } else {
+        console.log(`[scan-markets] ✅ PASS-DEDUP ${label}/${opp.outcome} edge=${(opp.edge * 100).toFixed(1)}%`);
+      }
+    }
+
     if (alreadyKnown > 0) {
-      console.log(`[scan-markets] ⏭ ${alreadyKnown} opportunité(s) ignorée(s) (déjà en DB)`);
+      console.log(`[scan-markets] ⏭ ${alreadyKnown} opportunité(s) ignorée(s) (trade déjà placé 24h)`);
     }
 
     for (const opp of toSave) {
@@ -282,12 +303,13 @@ export async function GET(): Promise<NextResponse<ScanResult | { status: string;
 
       if (finalBet < MIN_BET_AMOUNT) {
         console.log(
-          `[scan-markets] ⏭ Skip ${label}/${opp.outcome}: ` +
-          `finalBet $${finalBet.toFixed(2)} < min $${MIN_BET_AMOUNT} ` +
+          `[scan-markets] ⏭ SKIP-BET-TOO-SMALL ${label}/${opp.outcome}: ` +
+          `finalBet=$${finalBet.toFixed(2)} < min=$${MIN_BET_AMOUNT} ` +
           `(proposed=$${opp.suggestedBet.toFixed(2)}, bankrollCap=$${maxBetByBankroll.toFixed(2)}, absCap=$${MAX_BET_ABSOLUTE_USDC})`
         );
         continue;
       }
+      console.log(`[scan-markets] ✅ PASS-BET ${label}/${opp.outcome} finalBet=$${finalBet.toFixed(2)}`);
 
       if (finalBet < opp.suggestedBet) {
         console.log(
@@ -303,11 +325,12 @@ export async function GET(): Promise<NextResponse<ScanResult | { status: string;
       const openCount = await countOpenPositions(opp.marketId, opp.outcome);
       if (openCount >= MAX_POSITIONS_PER_MARKET) {
         console.log(
-          `[scan-markets] ⏭ Skip ${label}/${opp.outcome}: ` +
+          `[scan-markets] ⏭ SKIP-OPEN-POSITION ${label}/${opp.outcome}: ` +
           `${openCount} position(s) déjà ouverte(s) (max=${MAX_POSITIONS_PER_MARKET})`
         );
         continue;
       }
+      console.log(`[scan-markets] ✅ PASS-OPEN-POSITION ${label}/${opp.outcome} openCount=${openCount}`);
 
       // 2e. paper_trade + position (+ ordre CLOB réel si REAL_TRADING_ENABLED)
       // potentialPnl recalculé sur le bet cappé

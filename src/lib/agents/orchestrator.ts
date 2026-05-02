@@ -31,6 +31,12 @@ export interface Opportunity {
   estimatedProbability: number;
   edge:                 number;
   suggestedBet:         number;
+  /**
+   * Bet basé sur le bankroll paper (composé, non-réel).
+   * Présent uniquement en real trading mode, pour créer un trade de comparaison.
+   * Absent en paper mode (suggestedBet et paperSuggestedBet seraient identiques).
+   */
+  paperSuggestedBet?:   number;
   confidence:           "high" | "medium" | "low" | undefined;
   agent:                AgentType;
   /** Nom de la ville (météo). */

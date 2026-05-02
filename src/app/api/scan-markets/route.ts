@@ -30,6 +30,8 @@ import {
 }                                          from "@/lib/db/supabase";
 import { cleanOldLogs }                    from "@/lib/logger";
 import { executeBuy, isRealTradingEnabled } from "@/lib/trade-executor";
+import { savePaperTrade }                   from "@/lib/db/supabase";
+import { openPosition }                    from "@/lib/db/positions";
 import { getAccountBalance }               from "@/lib/polymarket/clob-api";
 import { MIN_BET_AMOUNT }                  from "@/lib/utils/sizing";
 
@@ -390,6 +392,63 @@ export async function GET(): Promise<NextResponse<ScanResult | { status: string;
           suggestedBet:         cappedOpp.suggestedBet,  // bet réel après cap bankroll
         });
         savedCount++;
+
+        // ── Trade paper parallèle (comparaison stratégie) ─────────────────
+        // En real mode uniquement : crée un paper_trade séparé sizé sur le
+        // bankroll paper composé, pour comparer la stratégie en parallèle.
+        // Jamais de CLOB order — uniquement tracking DB.
+        if (isRealTradingEnabled() && cappedOpp.paperSuggestedBet && cappedOpp.paperSuggestedBet >= MIN_BET_AMOUNT) {
+          const paperBet = Math.min(
+            cappedOpp.paperSuggestedBet,
+            bankroll * MAX_PCT_BANKROLL_PER_TRADE,  // bankroll = paper bankroll DB
+            MAX_BET_ABSOLUTE_USDC,
+          );
+          if (paperBet >= MIN_BET_AMOUNT) {
+            const paperPnl = cappedOpp.marketPrice > 0
+              ? Math.round(paperBet * (1 / cappedOpp.marketPrice - 1) * 100) / 100
+              : 0;
+            try {
+              const paperTrade = await savePaperTrade({
+                market_id:             cappedOpp.marketId,
+                question:              cappedOpp.question,
+                city:                  cappedOpp.city ?? null,
+                ticker:                cappedOpp.ticker ?? null,
+                agent:                 cappedOpp.agent,
+                outcome:               cappedOpp.outcome,
+                market_price:          cappedOpp.marketPrice,
+                estimated_probability: cappedOpp.estimatedProbability,
+                edge:                  cappedOpp.edge,
+                suggested_bet:         Math.round(paperBet * 100) / 100,
+                confidence:            cappedOpp.confidence ?? null,
+                resolution_date:       cappedOpp.targetDate ?? null,
+                potential_pnl:         paperPnl,
+                market_context:        { ...(cappedOpp.marketContext ?? {}), parallel_paper: true },
+                expected_resolution:   cappedOpp.targetDateTime ?? null,
+                // is_real=false (défaut) — jamais de CLOB order
+              });
+              await openPosition({
+                paperTradeId:     paperTrade.id,
+                marketId:         cappedOpp.marketId,
+                question:         cappedOpp.question,
+                city:             cappedOpp.city ?? null,
+                ticker:           cappedOpp.ticker ?? null,
+                agent:            cappedOpp.agent,
+                outcome:          cappedOpp.outcome,
+                entryPrice:       cappedOpp.marketPrice,
+                entryProbability: cappedOpp.estimatedProbability,
+                suggestedBet:     Math.round(paperBet * 100) / 100,
+                resolutionDate:   cappedOpp.targetDate ?? null,
+              });
+              console.log(
+                `[scan-markets] 📋 Parallel paper trade: ${cappedOpp.city ?? cappedOpp.marketId}/${cappedOpp.outcome} ` +
+                `bet=$${paperBet.toFixed(2)} (paper-bankroll sizing vs real $${cappedOpp.suggestedBet.toFixed(2)})`
+              );
+            } catch (paperErr) {
+              // Non-bloquant — le trade réel a déjà été placé
+              console.warn(`[scan-markets] ⚠ Parallel paper trade failed (non-blocking): ${paperErr instanceof Error ? paperErr.message : paperErr}`);
+            }
+          }
+        }
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         console.error(`[scan-markets] ✗ executeBuy (${opp.marketId}/${opp.outcome}) :`, msg);

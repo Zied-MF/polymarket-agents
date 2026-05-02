@@ -443,10 +443,10 @@ export const weatherAdapter: AgentConfig = {
     // Kelly sizing dynamique (mode-based) — Claude size 1-10 → % du bankroll
     // En real mode : utilise le solde pUSD on-chain (_realBankroll, injecté par
     // scan-markets) pour éviter d'utiliser le bankroll paper gonflé (~$230) qui
-    // produirait des bets trop grands (ex: $13.28) avant le cap scan-markets.
-    // En paper mode : bankroll composé DB normal.
+    // produirait des bets trop grands. En paper mode : bankroll composé DB normal.
     const paperBankroll = await getCurrentBankroll();
     const bankroll      = _realBankroll ?? paperBankroll;
+    const inRealMode    = _realBankroll !== null;
     const claudeSize    = claudeAnalysis.size ?? 5;
     const sizePercent   = (claudeSize / 10) * mode.maxBetPercent;
     const kellyBet      = bankroll * sizePercent;
@@ -462,13 +462,19 @@ export const weatherAdapter: AgentConfig = {
       return { skipReason: reason };
     }
 
-    // NOTE: Pas de cap orderbook (Level 2 supprimé).
-    // placeOrder() utilise des ordres GTC (limit), pas des market orders.
-    // getAvailableLiquidity() mesure la profondeur pour exécution immédiate —
-    // métrique incorrecte pour des limit orders. Les marchés météo Polymarket
-    // utilisent un AMM : le carnet CLOB retourne toujours $0.00 asks, même
-    // pour des marchés très liquides côté Gamma.
-    // → Le sizing reste basé sur la liquidité Gamma (Level 1, calculateBetSize).
+    // ── Bet paper (comparaison) — calculé sur le bankroll paper DB ──────────
+    // Seulement en real mode : permet de créer un trade de comparaison paper
+    // avec la même stratégie mais sizé sur le bankroll composé, pour valider
+    // la stratégie en parallèle du real trading.
+    let paperSuggestedBet: number | undefined;
+    if (inRealMode && paperBankroll > bankroll) {
+      const paperKellyBet  = paperBankroll * sizePercent;
+      const paperAdjusted  = calculateBetSize(paperKellyBet, m.liquidity, paperBankroll, mode.maxBetPercent);
+      if (paperAdjusted >= MIN_BET_AMOUNT) {
+        paperSuggestedBet = Math.round(paperAdjusted * 100) / 100;
+      }
+    }
+
     const targetOutcome = claudeAnalysis.outcome ?? best.outcome;
 
     // Log si bet réduit par Gamma
@@ -480,10 +486,11 @@ export const weatherAdapter: AgentConfig = {
     }
 
     console.log(
-      `[weather-adapter] 💰 Sizing: bankroll=$${bankroll.toFixed(2)}${_realBankroll !== null ? "(real)" : "(paper)"} ` +
+      `[weather-adapter] 💰 Sizing: bankroll=$${bankroll.toFixed(2)}${inRealMode ? "(real)" : "(paper)"} ` +
       `Claude=${claudeSize}/10 Kelly=$${kellyBet.toFixed(2)} ` +
       `Gamma=$${m.liquidity} (${(MAX_PCT_LIQUIDITY * 100).toFixed(0)}%=$${maxByGammaLiq.toFixed(2)}) ` +
-      `→ Proposed=$${adjustedBet.toFixed(2)} (mode: ${mode.name})`
+      `→ Real=$${adjustedBet.toFixed(2)}${paperSuggestedBet ? ` Paper=$${paperSuggestedBet.toFixed(2)}(paper-bankroll=$${paperBankroll.toFixed(2)})` : ""} ` +
+      `(mode: ${mode.name})`
     );
 
     // Confiance : VERY_HIGH → high, HIGH → high, MEDIUM → medium, LOW → low
@@ -507,6 +514,7 @@ export const weatherAdapter: AgentConfig = {
         estimatedProbability: Math.min(0.99, Math.max(0.01, finalProb)),
         edge:                 round(finalEdge, 4),
         suggestedBet:         Math.round(adjustedBet * 100) / 100,
+        paperSuggestedBet,
         confidence:           confidenceOverride,
         agent:                "weather",
         city:                 m.city,

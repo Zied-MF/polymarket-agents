@@ -299,21 +299,27 @@ export async function getClobMarket(conditionId: string): Promise<ClobMarket | n
 }
 
 // ---------------------------------------------------------------------------
-// placeOrder — market order FOK (Fill Or Kill)
+// placeOrder — market order FAK (Fill And Kill = partial fills accepted)
 //
-// Utilise createAndPostMarketOrder(FOK) au lieu de createAndPostOrder(GTC).
-// Raison : les ordres GTC restent ouverts indéfiniment, l'AMM Polymarket
-// n'a pas de contrepartie permanente pour les limites passives. L'UI
-// Polymarket utilise des market orders (FOK) → exécution instantanée.
+// Utilise createAndPostMarketOrder(FAK) pour reproduire le comportement de
+// l'UI Polymarket : exécution immédiate avec smart routing, slippage 10%.
+// FAK = Fill And Kill : rempli autant que possible instantanément, le reste
+// est annulé. Les partial fills sont acceptés (contrairement à FOK qui
+// annulait tout si le fill était incomplet, causant 100% d'échecs sur les
+// marchés météo à orderbook fin).
 //
 // Prix worst-case (slippage protection) :
-//   BUY  → worstPrice = price × 1.05  (on accepte jusqu'à +5% de glissement)
-//   SELL → worstPrice = price × 0.95  (on accepte jusqu'à −5% de glissement)
+//   BUY  → worstPrice = price × 1.10  (on accepte jusqu'à +10% de glissement)
+//   SELL → worstPrice = price × 0.90  (on accepte jusqu'à −10% de glissement)
+//   Capé à [0.01, 0.99] pour ne jamais dépasser les limites Polymarket.
 //
 // UserMarketOrderV2.amount :
 //   BUY  → montant en USDC
 //   SELL → nombre de shares (amountUsdc / price)
 // ---------------------------------------------------------------------------
+
+const SLIPPAGE_BUY  = 0.10;  // +10% worst-case pour BUY
+const SLIPPAGE_SELL = 0.10;  // −10% worst-case pour SELL
 
 export async function placeOrder(params: PlaceOrderParams): Promise<PlacedOrder> {
   const side  = params.side === "BUY" ? ClobSide.BUY : ClobSide.SELL;
@@ -322,16 +328,16 @@ export async function placeOrder(params: PlaceOrderParams): Promise<PlacedOrder>
     ? params.amountUsdc
     : params.amountUsdc / params.price;  // shares = USDC / price
 
-  // Prix worst-case : limite de slippage pour le FOK
+  // Prix worst-case avec slippage 10%, capé entre 0.01 et 0.99
   const worstPrice = params.side === "BUY"
-    ? Math.round(params.price * 1.05 * 1000) / 1000   // +5%
-    : Math.round(params.price * 0.95 * 1000) / 1000;  // −5%
+    ? Math.min(Math.round(params.price * (1 + SLIPPAGE_BUY)  * 1000) / 1000, 0.99)
+    : Math.max(Math.round(params.price * (1 - SLIPPAGE_SELL) * 1000) / 1000, 0.01);
 
   console.log(
-    `[clob] ${params.dryRun ? "DRY-RUN " : ""}placeOrder FOK: ` +
+    `[clob] ${params.dryRun ? "DRY-RUN " : ""}placeOrder FAK: ` +
     `${params.side} amount=${amount.toFixed(4)} ` +
     `(${params.side === "BUY" ? "USDC" : "shares"}) ` +
-    `worstPrice=${worstPrice} midPrice=${params.price} ` +
+    `worstPrice=${worstPrice} midPrice=${params.price} slippage=10% ` +
     `(tokenId=${params.tokenId.slice(0, 10)}...)`
   );
 
@@ -360,12 +366,12 @@ export async function placeOrder(params: PlaceOrderParams): Promise<PlacedOrder>
   }
 
   const client = await getClobClient();
-  console.log("[clob] createAndPostMarketOrder FOK input:", JSON.stringify({ ...marketOrderInput, ...orderOptions }));
+  console.log("[clob] createAndPostMarketOrder FAK input:", JSON.stringify({ ...marketOrderInput, ...orderOptions }));
 
   const result = await client.createAndPostMarketOrder(
     marketOrderInput,
     orderOptions,
-    ClobOrderType.FOK
+    ClobOrderType.FAK
   ) as Record<string, unknown>;
 
   if (result && "error" in result) {
@@ -376,14 +382,27 @@ export async function placeOrder(params: PlaceOrderParams): Promise<PlacedOrder>
 
   const orderId = (result.orderID ?? result.id ?? "unknown") as string;
   const status  = (result as Record<string, string>).status ?? "placed";
-  console.log(`[clob] ✅ Ordre FOK placé: ${orderId} (status=${status})`);
+  const matched = (result.matchingResults as Record<string, unknown> | undefined);
+  const filled  = typeof matched?.fillsCount === "number" ? matched.fillsCount : null;
 
-  // FOK : si status = "cancelled" → l'ordre n'a pas pu être rempli (slippage dépassé)
+  // FAK : log le résultat (filled/partial/zero) sans throw
   if (status === "cancelled" || status === "canceled") {
+    // FAK fully unfilled (0 shares matched) — log et continue (trade non exécuté)
+    console.warn(
+      `[clob] ⚠ FAK order 0-filled — orderbook vide à ce prix ` +
+      `(worstPrice=${worstPrice}, mid=${params.price}). ` +
+      `orderId=${orderId}`
+    );
     throw new Error(
-      `[clob] FOK order cancelled — market moved beyond slippage limit ` +
+      `[clob] FAK order 0-filled — orderbook vide à ce prix ` +
       `(worstPrice=${worstPrice}, mid=${params.price}). Retry next scan.`
     );
+  }
+
+  if (filled !== null && filled > 0) {
+    console.log(`[clob] ✅ FAK: ${filled} fill(s) — orderId=${orderId} status=${status}`);
+  } else {
+    console.log(`[clob] ✅ FAK placé: orderId=${orderId} status=${status}`);
   }
 
   return {

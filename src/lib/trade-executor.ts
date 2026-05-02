@@ -402,40 +402,54 @@ export async function executeSell(
             `(market=${position.marketId} outcome=${position.outcome}) — SELL on-chain ignoré`
           );
         } else {
-          const sharesHeld    = position.suggestedBet / position.entryPrice;
+          // Shares détenues : calculées depuis le BUY original.
+          // On passe sharesCount directement à placeOrder pour éviter la
+          // reconversion amountUsdc/bestBid (inexacte si Gamma ≠ CLOB bestBid).
+          const sharesHeld     = position.suggestedBet / position.entryPrice;
           const sellAmountUsdc = Math.round(sharesHeld * sellPrice * 100) / 100;
 
-          if (sellAmountUsdc >= 0.01) { // seuil minimal pour éviter un ordre dust
+          console.log(
+            `[trade-executor] SELL: ${position.outcome} token=${token.tokenId.slice(0, 12)}… ` +
+            `shares=${sharesHeld.toFixed(4)} entryPrice=${position.entryPrice} ` +
+            `sellPrice(Gamma)=${sellPrice} ≈ $${sellAmountUsdc.toFixed(2)}`
+          );
+
+          if (sharesHeld < 0.001) {
+            console.warn(`[trade-executor] ⚠ sharesHeld=${sharesHeld.toFixed(6)} < 0.001 — ordre ignoré (dust)`);
+          } else {
             const placed = await placeOrder({
-              tokenId:    token.tokenId,
-              side:       "SELL",
-              amountUsdc: sellAmountUsdc,
-              price:      sellPrice,
-              negRisk:    clobMarket.negRisk,
-              dryRun:     false,
+              tokenId:     token.tokenId,
+              side:        "SELL",
+              amountUsdc:  sellAmountUsdc,   // pour le log P&L
+              sharesCount: sharesHeld,        // ← shares exactes, pas de reconversion
+              price:       token.price,      // prix CLOB du token (référence pour dry-run)
+              negRisk:     clobMarket.negRisk,
+              dryRun:      false,
             });
             sellOrderId = placed.orderId;
             console.log(
-              `[trade-executor] ✅ REAL SELL order placed: orderId=${placed.orderId} ` +
-              `shares=${sharesHeld.toFixed(4)} @ ${sellPrice} = $${sellAmountUsdc.toFixed(2)}`
-            );
-          } else {
-            console.warn(
-              `[trade-executor] ⚠ SELL amount $${sellAmountUsdc.toFixed(4)} < $0.01 — ordre ignoré (dust)`
+              `[trade-executor] ✅ REAL SELL placed: orderId=${placed.orderId} ` +
+              `shares=${sharesHeld.toFixed(4)} worstPrice=${placed.price} ` +
+              `status=${placed.status}`
             );
           }
         }
       } catch (sellErr) {
         // SELL on-chain échoué — on continue, le P&L DB reste valide.
-        // Cause probable : tokens déjà vendus ou marché résolu.
         const msg = sellErr instanceof Error ? sellErr.message : String(sellErr);
-        console.warn(`[trade-executor] ⚠ SELL on-chain échoué (non-bloquant): ${msg}`);
-        sendDiscordAlert(
-          `⚠️ **REAL SELL on-chain échoué** — position \`${position.id.slice(0, 8)}\`\n` +
-          `Marché: ${position.question.slice(0, 80)}\n` +
-          `Erreur: \`${msg.slice(0, 200)}\`\n` +
-          `_Position marquée vendue en DB. Vérifier manuellement sur Polymarket._`
-        ).catch(() => {});
+        if (sellErr instanceof OrderbookEmptyError) {
+          // Orderbook vide : pas de buyers — skip silencieux, position marquée vendue en DB.
+          console.warn(`[trade-executor] ⚠ SELL orderbook vide: ${msg}`);
+        } else {
+          // Autre erreur — alerte Discord.
+          console.warn(`[trade-executor] ⚠ SELL on-chain échoué (non-bloquant): ${msg}`);
+          sendDiscordAlert(
+            `⚠️ **REAL SELL on-chain échoué** — position \`${position.id.slice(0, 8)}\`\n` +
+            `Marché: ${position.question.slice(0, 80)}\n` +
+            `Erreur: \`${msg.slice(0, 200)}\`\n` +
+            `_Position marquée vendue en DB. Vérifier manuellement sur Polymarket._`
+          ).catch(() => {});
+        }
       }
 
       // ── Étape 3 : P&L réel ──────────────────────────────────────────────────

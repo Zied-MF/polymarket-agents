@@ -104,6 +104,12 @@ export interface PlaceOrderParams {
   tokenId:    string;
   side:       "BUY" | "SELL";
   amountUsdc: number;
+  /**
+   * Pour un SELL on-chain, passer directement le nombre de shares à vendre.
+   * Quand défini, `placeOrder` utilise cette valeur au lieu de calculer
+   * `amountUsdc / bestBid`, évitant l'erreur si Gamma price ≠ CLOB bestBid.
+   */
+  sharesCount?: number;
   price:      number;
   negRisk:    boolean;
   dryRun?:    boolean;
@@ -390,9 +396,11 @@ export async function placeOrder(params: PlaceOrderParams): Promise<PlacedOrder>
   }
 
   // Pour un SELL market order, l'API attend des shares (pas de l'USDC)
+  // Si sharesCount est fourni (précalculé par l'appelant), on l'utilise directement
+  // pour éviter l'arrondi `amountUsdc / bestBid` quand Gamma price ≠ CLOB bestBid.
   const amount = params.side === "BUY"
     ? params.amountUsdc
-    : params.amountUsdc / midPrice;  // shares = USDC / best-bid
+    : (params.sharesCount ?? params.amountUsdc / midPrice);
 
   console.log(
     `[clob] ${params.dryRun ? "DRY-RUN " : ""}placeOrder FAK: ` +

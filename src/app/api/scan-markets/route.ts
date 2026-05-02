@@ -231,6 +231,7 @@ export async function GET(): Promise<NextResponse<ScanResult | { status: string;
   // le scan a détecté une opportunité mais dont le trade n'a jamais été créé.
   // Les trades annulés (won=false AND potential_pnl=0) ne bloquent pas non plus.
   let savedCount = 0;
+  let realCount  = 0;
 
   if (opps.length > 0) {
     let existingKeys = new Set<string>();
@@ -355,13 +356,23 @@ export async function GET(): Promise<NextResponse<ScanResult | { status: string;
           marketContext:        cappedOpp.marketContext ?? null,
           potentialPnl:         cappedPotentialPnl,
         });
-        const tradeType = result.isReal ? "✅ REAL on-chain" : "📝 PAPER only (no CLOB order)";
-        console.log(
-          `[scan-markets] 🃏 ${tradeType} : ${cappedOpp.marketId}/${cappedOpp.outcome} ` +
-          `bet=$${cappedOpp.suggestedBet.toFixed(2)} ` +
-          `(paperTradeId=${result.paperTradeId.slice(0, 8)}, positionId=${result.positionId.slice(0, 8)}` +
-          `${result.orderId ? `, orderId=${result.orderId.slice(0, 12)}` : ""})`
-        );
+
+        if (result.isReal) {
+          realCount++;
+          console.log(
+            `[scan-markets] ✅ REAL on-chain : ${cappedOpp.question.slice(0, 60)} / ${cappedOpp.outcome} ` +
+            `bet=$${cappedOpp.suggestedBet.toFixed(2)} orderId=${result.orderId?.slice(0, 16)}`
+          );
+        } else {
+          // isReal=false en real mode = real order failed, fallback paper
+          const reason = result.realError ? ` — ${result.realError.slice(0, 120)}` : "";
+          console.log(
+            `[scan-markets] 📝 PAPER only (real order failed${reason}) : ` +
+            `${cappedOpp.question.slice(0, 60)} / ${cappedOpp.outcome} ` +
+            `bet=$${cappedOpp.suggestedBet.toFixed(2)} ` +
+            `(paperTradeId=${result.paperTradeId.slice(0, 8)})`
+          );
+        }
 
         savedCount++;
       } catch (err) {
@@ -371,7 +382,7 @@ export async function GET(): Promise<NextResponse<ScanResult | { status: string;
       }
     }
 
-    console.log(`[scan-markets] 💾 ${savedCount}/${toSave.length} sauvegardé(s)`);
+    console.log(`[scan-markets] 💾 ${savedCount} trade(s) créé(s) (${realCount} on-chain, ${savedCount - realCount} paper)`);
 
     // Stats journalières (best-effort)
     incrementDailyOpportunities(toSave.length).catch((err) =>
@@ -404,11 +415,12 @@ export async function GET(): Promise<NextResponse<ScanResult | { status: string;
   // One summary line per scan — no per-skip logs to avoid DB bloat
   if (savedCount > 0) {
     const labels = opps.map((o) => `${o.city ?? o.ticker ?? o.marketId} ${o.outcome}`).join(", ");
-    // Note: modeLabel = "REAL" means the bot runs in real-trading mode, NOT that orders were placed on-chain.
-    // Each individual trade logs "REAL on-chain" vs "PAPER only" based on result.isReal.
-    logActivity("trade", `[${modeLabel}-MODE] ${savedCount} trade(s): ${labels}`, logMeta).catch(() => {});
+    const onChainSuffix = modeLabel === "REAL"
+      ? ` (${realCount} on-chain, ${savedCount - realCount} paper-only)`
+      : "";
+    logActivity("trade", `[${modeLabel}-MODE] ${savedCount} trade(s)${onChainSuffix}: ${labels}`, logMeta).catch(() => {});
   }
-  logActivity("info", `[${modeLabel}] Scan complete: ${savedCount} saved, ${skipped.length} skipped`, logMeta).catch(() => {});
+  logActivity("info", `[${modeLabel}] Scan complete: ${savedCount} saved (${realCount} on-chain), ${skipped.length} skipped`, logMeta).catch(() => {});
 
   const duration = `${Date.now() - startTime}ms`;
   console.log(

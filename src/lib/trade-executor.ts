@@ -88,6 +88,7 @@ export interface ExecuteBuyResult {
   isReal:       boolean;
   orderId?:     string;   // CLOB order ID si real trade
   gasFeeUsdc?:  number;
+  realError?:   string;   // Message d'erreur si real trade a échoué (isReal=false en real mode)
 }
 
 /** Input minimal pour executeBuy — correspond aux champs d'une Opportunity. */
@@ -146,7 +147,8 @@ export async function executeBuy(input: BuyInput): Promise<ExecuteBuyResult> {
   // ----- Chemin REAL -----
   let orderId:    string | undefined;
   let gasFeeUsdc: number | undefined;
-  let isReal = false;
+  let isReal     = false;
+  let realError: string | undefined;
 
   if (real) {
     // ── Diagnostic : est-ce un conditionId (0x…) ou un integer Gamma ID ? ──
@@ -211,8 +213,8 @@ export async function executeBuy(input: BuyInput): Promise<ExecuteBuyResult> {
       if (!token) throw new Error(`Token introuvable pour outcome "${input.outcome}"`);
       console.log(`[EXEC-BUY] Token trouvé: ${token.outcome} tokenId=${token.tokenId.slice(0, 16)}…`);
 
-      // 1. Placer l'ordre FOK
-      console.log(`[EXEC-BUY] Calling placeOrder FOK BUY $${input.suggestedBet} @ ${input.marketPrice}…`);
+      // 1. Placer l'ordre FAK
+      console.log(`[EXEC-BUY] Calling placeOrder FAK BUY $${input.suggestedBet} @ ${input.marketPrice}…`);
       const placed: PlacedOrder = await placeOrder({
         tokenId:    token.tokenId,
         side:       "BUY",
@@ -250,18 +252,19 @@ export async function executeBuy(input: BuyInput): Promise<ExecuteBuyResult> {
       await patchIsReal("paper_trades", paperTrade.id).catch(() => {});
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
+      realError = errMsg;
       if (err instanceof ClobSkipError) {
         // Marché non disponible dans CLOB — skip silencieux, pas de Discord.
         console.log(`[EXEC-BUY] ⏭ CLOB SKIP (no Discord): ${errMsg}`);
         console.log(`[EXEC-BUY] ℹ Paper trade créé (is_real=false) — aucun ordre on-chain`);
       } else {
-        // Vraie erreur (réseau, signature, balance…) — alerte Discord.
+        // Vraie erreur (réseau, signature, FAK 0-filled, balance…) — alerte Discord.
         console.error(
           `[EXEC-BUY] ❌ REAL BUY FAILED: market=${input.marketId} ` +
           `outcome=${input.outcome} bet=$${input.suggestedBet} — ${errMsg}`
         );
         if (err instanceof Error && err.stack) {
-          console.error(`[EXEC-BUY] Stack: ${err.stack.slice(0, 500)}`);
+          console.error(`[EXEC-BUY] Stack:\n${err.stack}`);
         }
         sendDiscordAlert(
           `❌ **REAL TRADE FAILED** — ${input.question.slice(0, 80)}\n` +
@@ -269,7 +272,7 @@ export async function executeBuy(input: BuyInput): Promise<ExecuteBuyResult> {
           `Erreur: \`${errMsg.slice(0, 200)}\``
         ).catch(() => {});
       }
-      // Dans tous les cas, le paper trade a déjà été créé — on continue
+      // Le paper trade a été créé — isReal reste false, realError propagé au caller
     }
   }
 
@@ -307,6 +310,7 @@ export async function executeBuy(input: BuyInput): Promise<ExecuteBuyResult> {
     isReal,
     orderId,
     gasFeeUsdc,
+    realError,
   };
 }
 

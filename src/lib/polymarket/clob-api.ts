@@ -121,6 +121,17 @@ export interface PlacedOrder {
   orderHash?: string;
 }
 
+/**
+ * Thrown when the orderbook has no asks (BUY) or no bids (SELL).
+ * Caught by trade-executor to produce a silent skip (no Discord alert).
+ */
+export class OrderbookEmptyError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "OrderbookEmptyError";
+  }
+}
+
 export interface OrderBookLevel { price: number; size: number; }
 export interface OrderBook {
   tokenId: string;
@@ -318,36 +329,80 @@ export async function getClobMarket(conditionId: string): Promise<ClobMarket | n
 //   SELL → nombre de shares (amountUsdc / price)
 // ---------------------------------------------------------------------------
 
-const SLIPPAGE_BUY  = 0.10;  // +10% worst-case pour BUY
-const SLIPPAGE_SELL = 0.10;  // −10% worst-case pour SELL
+const SLIPPAGE = 0.10;  // ±10% slippage tolerance from best ask/bid
 
 export async function placeOrder(params: PlaceOrderParams): Promise<PlacedOrder> {
-  const side  = params.side === "BUY" ? ClobSide.BUY : ClobSide.SELL;
+  const side = params.side === "BUY" ? ClobSide.BUY : ClobSide.SELL;
+
+  // ── Prix worst-case ────────────────────────────────────────────────────────
+  // DRY-RUN : utilise le mid-price + slippage estimé (pas d'appel orderbook).
+  // LIVE : fetch l'orderbook pour obtenir le vrai prix d'exécution.
+  //
+  // Problème avec mid-price :
+  //   yesPrice = 2.4¢ (midpoint théorique) → worstPrice = 2.64¢
+  //   mais les asks réels commencent à 4¢, 5¢, 10¢
+  //   → FAK submitted à 2.64¢, aucun match possible → 0-filled systématique
+  //
+  // Fix : utiliser bestAsk (le vrai prix vendeur) comme référence.
+  //   BUY  → worstPrice = bestAsk × 1.10  (on accepte jusqu'à +10% au-dessus)
+  //   SELL → worstPrice = bestBid × 0.90  (on accepte jusqu'à −10% en-dessous)
+
+  let worstPrice: number;
+  let midPrice = params.price;  // gardé pour le log
+
+  if (params.dryRun) {
+    // Dry-run : estimation sans réseau
+    worstPrice = params.side === "BUY"
+      ? Math.min(Math.round(params.price * (1 + SLIPPAGE) * 10000) / 10000, 0.99)
+      : Math.max(Math.round(params.price * (1 - SLIPPAGE) * 10000) / 10000, 0.01);
+  } else {
+    // Live : prix depuis l'orderbook réel
+    const book = await getOrderBook(params.tokenId);
+
+    if (params.side === "BUY") {
+      if (book.bestAsk === null) {
+        throw new OrderbookEmptyError(
+          `Orderbook has no asks — no sellers for tokenId=${params.tokenId.slice(0, 12)}. ` +
+          `mid=${params.price}`
+        );
+      }
+      worstPrice = Math.min(Math.round(book.bestAsk * (1 + SLIPPAGE) * 10000) / 10000, 0.99);
+      console.log(
+        `[clob] Orderbook BUY: mid=${params.price} bestAsk=${book.bestAsk} ` +
+        `worstPrice=${worstPrice} (+${(SLIPPAGE * 100).toFixed(0)}% slippage) ` +
+        `spread=${book.spread?.toFixed(4) ?? "?"} asks=${book.asks.length}`
+      );
+    } else {
+      if (book.bestBid === null) {
+        throw new OrderbookEmptyError(
+          `Orderbook has no bids — no buyers for tokenId=${params.tokenId.slice(0, 12)}. ` +
+          `mid=${params.price}`
+        );
+      }
+      worstPrice = Math.max(Math.round(book.bestBid * (1 - SLIPPAGE) * 10000) / 10000, 0.01);
+      midPrice   = book.bestBid;
+      console.log(
+        `[clob] Orderbook SELL: mid=${params.price} bestBid=${book.bestBid} ` +
+        `worstPrice=${worstPrice} (-${(SLIPPAGE * 100).toFixed(0)}% slippage) ` +
+        `spread=${book.spread?.toFixed(4) ?? "?"} bids=${book.bids.length}`
+      );
+    }
+  }
+
   // Pour un SELL market order, l'API attend des shares (pas de l'USDC)
   const amount = params.side === "BUY"
     ? params.amountUsdc
-    : params.amountUsdc / params.price;  // shares = USDC / price
-
-  // Prix worst-case avec slippage 10%, capé entre 0.01 et 0.99
-  const worstPrice = params.side === "BUY"
-    ? Math.min(Math.round(params.price * (1 + SLIPPAGE_BUY)  * 1000) / 1000, 0.99)
-    : Math.max(Math.round(params.price * (1 - SLIPPAGE_SELL) * 1000) / 1000, 0.01);
+    : params.amountUsdc / midPrice;  // shares = USDC / best-bid
 
   console.log(
     `[clob] ${params.dryRun ? "DRY-RUN " : ""}placeOrder FAK: ` +
     `${params.side} amount=${amount.toFixed(4)} ` +
     `(${params.side === "BUY" ? "USDC" : "shares"}) ` +
-    `worstPrice=${worstPrice} midPrice=${params.price} slippage=10% ` +
-    `(tokenId=${params.tokenId.slice(0, 10)}...)`
+    `worstPrice=${worstPrice} (tokenId=${params.tokenId.slice(0, 10)}...)`
   );
 
-  const orderOptions = { negRisk: params.negRisk };
-  const marketOrderInput = {
-    tokenID: params.tokenId,
-    amount,
-    side,
-    price: worstPrice,
-  };
+  const orderOptions    = { negRisk: params.negRisk };
+  const marketOrderInput = { tokenID: params.tokenId, amount, side, price: worstPrice };
 
   if (params.dryRun) {
     const client = await getClobClient();
@@ -385,17 +440,15 @@ export async function placeOrder(params: PlaceOrderParams): Promise<PlacedOrder>
   const matched = (result.matchingResults as Record<string, unknown> | undefined);
   const filled  = typeof matched?.fillsCount === "number" ? matched.fillsCount : null;
 
-  // FAK : log le résultat (filled/partial/zero) sans throw
+  // FAK cancelled = 0-filled (bestAsk était trop haut même avec +10% slippage)
   if (status === "cancelled" || status === "canceled") {
-    // FAK fully unfilled (0 shares matched) — log et continue (trade non exécuté)
     console.warn(
-      `[clob] ⚠ FAK order 0-filled — orderbook vide à ce prix ` +
-      `(worstPrice=${worstPrice}, mid=${params.price}). ` +
-      `orderId=${orderId}`
+      `[clob] ⚠ FAK order 0-filled — worstPrice=${worstPrice} ` +
+      `mais l'orderbook a bougé. orderId=${orderId}`
     );
-    throw new Error(
-      `[clob] FAK order 0-filled — orderbook vide à ce prix ` +
-      `(worstPrice=${worstPrice}, mid=${params.price}). Retry next scan.`
+    throw new OrderbookEmptyError(
+      `FAK order 0-filled at worstPrice=${worstPrice}. ` +
+      `L'orderbook a bougé entre le fetch et l'envoi. Retry next scan.`
     );
   }
 

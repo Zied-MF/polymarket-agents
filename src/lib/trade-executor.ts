@@ -32,6 +32,7 @@ import {
   placeOrder,
   cancelOrder,
   getAccountBalance,
+  OrderbookEmptyError,
   type PlacedOrder,
 }                                    from "@/lib/polymarket/clob-api";
 import {
@@ -210,16 +211,33 @@ export async function executeBuy(input: BuyInput): Promise<ExecuteBuyResult> {
       const token = clobMarket.tokens.find(
         (t) => t.outcome.toLowerCase() === input.outcome.toLowerCase()
       );
-      if (!token) throw new Error(`Token introuvable pour outcome "${input.outcome}"`);
-      console.log(`[EXEC-BUY] Token trouvé: ${token.outcome} tokenId=${token.tokenId.slice(0, 16)}…`);
+      if (!token) {
+        const available = clobMarket.tokens.map((t) => t.outcome).join(", ");
+        throw new ClobSkipError(
+          `Token not found for outcome "${input.outcome}". Available: ${available}`
+        );
+      }
+      console.log(
+        `[EXEC-BUY] Token: ${token.outcome} tokenId=${token.tokenId.slice(0, 16)}… ` +
+        `clobPrice=${token.price} (input.marketPrice=${input.marketPrice})`
+      );
+
+      // Vérification de cohérence : l'outcome demandé correspond-il au token trouvé ?
+      if (token.outcome.toLowerCase() !== input.outcome.toLowerCase()) {
+        throw new ClobSkipError(
+          `Token mismatch: wanted "${input.outcome}" but found "${token.outcome}"`
+        );
+      }
 
       // 1. Placer l'ordre FAK
-      console.log(`[EXEC-BUY] Calling placeOrder FAK BUY $${input.suggestedBet} @ ${input.marketPrice}…`);
+      // Utiliser token.price (prix CLOB du token exact) comme référence, pas
+      // input.marketPrice (qui peut être le prix YES même quand outcome=No).
+      console.log(`[EXEC-BUY] Calling placeOrder FAK BUY $${input.suggestedBet} @ token.price=${token.price}…`);
       const placed: PlacedOrder = await placeOrder({
         tokenId:    token.tokenId,
         side:       "BUY",
         amountUsdc: input.suggestedBet,
-        price:      input.marketPrice,
+        price:      token.price,   // ← prix du bon token (NO price si outcome="No")
         negRisk:    clobMarket.negRisk,
         dryRun:     false,
       });
@@ -253,9 +271,10 @@ export async function executeBuy(input: BuyInput): Promise<ExecuteBuyResult> {
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
       realError = errMsg;
-      if (err instanceof ClobSkipError) {
-        // Marché non disponible dans CLOB — skip silencieux, pas de Discord.
-        console.log(`[EXEC-BUY] ⏭ CLOB SKIP (no Discord): ${errMsg}`);
+      if (err instanceof ClobSkipError || err instanceof OrderbookEmptyError) {
+        // Marché non disponible ou orderbook vide — skip silencieux, pas de Discord.
+        const tag = err instanceof OrderbookEmptyError ? "ORDERBOOK EMPTY" : "CLOB SKIP";
+        console.log(`[EXEC-BUY] ⏭ ${tag} (no Discord): ${errMsg}`);
       } else {
         // Vraie erreur (réseau, signature, FAK 0-filled, balance…) — alerte Discord.
         console.error(

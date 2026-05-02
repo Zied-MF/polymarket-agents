@@ -56,6 +56,25 @@ export function setWeatherAdapterMode(mode: ReturnType<typeof getCurrentMode>): 
   console.log(`[weather-adapter] Mode set: ${mode}`);
 }
 
+/**
+ * Bankroll réel on-chain (pUSD) injecté par scan-markets avant chaque scan
+ * en real trading mode. Remplace le bankroll paper (composé, gonflé) pour le
+ * Kelly sizing. null = fallback sur bankroll paper DB.
+ */
+let _realBankroll: number | null = null;
+
+/**
+ * Injecte le solde pUSD on-chain avant le scan.
+ * Appelé depuis scan-markets juste après getAccountBalance().
+ * En paper mode, passer null pour revenir au bankroll composé DB.
+ */
+export function setRealBankroll(balance: number | null): void {
+  _realBankroll = balance;
+  if (balance !== null) {
+    console.log(`[weather-adapter] Real bankroll set: $${balance.toFixed(2)}`);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -422,11 +441,15 @@ export const weatherAdapter: AgentConfig = {
     }
 
     // Kelly sizing dynamique (mode-based) — Claude size 1-10 → % du bankroll
-    // Bankroll dynamique : initial 10$ + P&L net cumulé (compound).
-    const bankroll    = await getCurrentBankroll();
-    const claudeSize  = claudeAnalysis.size ?? 5;
-    const sizePercent = (claudeSize / 10) * mode.maxBetPercent;
-    const kellyBet    = bankroll * sizePercent;
+    // En real mode : utilise le solde pUSD on-chain (_realBankroll, injecté par
+    // scan-markets) pour éviter d'utiliser le bankroll paper gonflé (~$230) qui
+    // produirait des bets trop grands (ex: $13.28) avant le cap scan-markets.
+    // En paper mode : bankroll composé DB normal.
+    const paperBankroll = await getCurrentBankroll();
+    const bankroll      = _realBankroll ?? paperBankroll;
+    const claudeSize    = claudeAnalysis.size ?? 5;
+    const sizePercent   = (claudeSize / 10) * mode.maxBetPercent;
+    const kellyBet      = bankroll * sizePercent;
 
     // ── Étape 1 : cap Gamma (market.liquidity × 5%) ─────────────────────────
     const maxByGammaLiq = m.liquidity * MAX_PCT_LIQUIDITY;
@@ -457,9 +480,10 @@ export const weatherAdapter: AgentConfig = {
     }
 
     console.log(
-      `[weather-adapter] 💰 Sizing: bankroll=${bankroll.toFixed(2)}$ Claude=${claudeSize}/10 Kelly=${kellyBet.toFixed(2)}$ ` +
+      `[weather-adapter] 💰 Sizing: bankroll=$${bankroll.toFixed(2)}${_realBankroll !== null ? "(real)" : "(paper)"} ` +
+      `Claude=${claudeSize}/10 Kelly=$${kellyBet.toFixed(2)} ` +
       `Gamma=$${m.liquidity} (${(MAX_PCT_LIQUIDITY * 100).toFixed(0)}%=$${maxByGammaLiq.toFixed(2)}) ` +
-      `→ Final=${adjustedBet.toFixed(2)}$ (mode: ${mode.name})`
+      `→ Proposed=$${adjustedBet.toFixed(2)} (mode: ${mode.name})`
     );
 
     // Confiance : VERY_HIGH → high, HIGH → high, MEDIUM → medium, LOW → low

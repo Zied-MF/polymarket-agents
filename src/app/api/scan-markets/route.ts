@@ -91,7 +91,7 @@ async function countOpenPositions(marketId: string, outcome: string): Promise<nu
 import type { Opportunity, SkippedMarket, AgentStats } from "@/lib/agents/orchestrator";
 import { getBotState, updateLastScan }     from "@/lib/bot/bot-state";
 import { logActivity }                     from "@/lib/logger";
-import { setWeatherAdapterMode }           from "@/lib/agents/adapters/weather-adapter";
+import { setWeatherAdapterMode, setRealBankroll } from "@/lib/agents/adapters/weather-adapter";
 
 // ---------------------------------------------------------------------------
 // Enregistrement des agents — idempotent (no-op si déjà enregistré)
@@ -172,8 +172,12 @@ export async function GET(): Promise<NextResponse<ScanResult | { status: string;
         `instead of inflated paper bankroll $${bankroll.toFixed(2)}`
       );
     }
+    // Injecter le solde réel dans weather-adapter pour que le Kelly sizing
+    // utilise les vrais fonds et non le bankroll paper gonflé.
+    setRealBankroll(effectiveBankroll);
   } else {
     effectiveBankroll = bankroll; // paper mode : bankroll composé normal
+    setRealBankroll(null);        // reset → weather-adapter utilise bankroll paper
   }
   const maxBetByBankroll = effectiveBankroll * MAX_PCT_BANKROLL_PER_TRADE;
 
@@ -271,6 +275,9 @@ export async function GET(): Promise<NextResponse<ScanResult | { status: string;
     if (alreadyKnown > 0) {
       console.log(`[scan-markets] ⏭ ${alreadyKnown} opportunité(s) ignorée(s) (trade déjà placé 24h)`);
     }
+
+    // Opps réellement sauvegardées (après caps), utilisées pour Discord notification.
+    const savedCappedOpps: Array<{ city: string; outcome: string; marketPrice: number; estimatedProbability: number; edge: number; suggestedBet: number }> = [];
 
     for (const opp of toSave) {
       // Champs dérivés non stockés dans Opportunity pour garder l'interface propre
@@ -374,6 +381,14 @@ export async function GET(): Promise<NextResponse<ScanResult | { status: string;
           );
         }
 
+        savedCappedOpps.push({
+          city:                 cappedOpp.city ?? cappedOpp.ticker ?? cappedOpp.marketId,
+          outcome:              cappedOpp.outcome,
+          marketPrice:          cappedOpp.marketPrice,
+          estimatedProbability: cappedOpp.estimatedProbability,
+          edge:                 cappedOpp.edge,
+          suggestedBet:         cappedOpp.suggestedBet,  // bet réel après cap bankroll
+        });
         savedCount++;
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
@@ -389,18 +404,17 @@ export async function GET(): Promise<NextResponse<ScanResult | { status: string;
       console.error("[scan-markets] ✗ incrementDailyOpportunities :", err instanceof Error ? err.message : err)
     );
 
-    // 3. Notification Discord — uniquement les nouvelles opportunités (toSave)
-    //    Les opportunités déjà en DB (dedup) ne re-notifient PAS Discord.
-    if (toSave.length > 0) {
+    // 3. Notification Discord — bet réel après cap bankroll (pas l'uncapped orchestrator bet)
+    if (savedCappedOpps.length > 0) {
       sendDiscordNotification(
-        toSave.map((opp) => ({
-          city:                 opp.city ?? opp.ticker ?? opp.token ?? "",
-          outcome:              opp.outcome,
-          marketPrice:          opp.marketPrice,
-          estimatedProbability: opp.estimatedProbability,
-          edge:                 opp.edge,
-          multiplier:           opp.marketPrice > 0 ? 1 / opp.marketPrice : 0,
-          suggestedBet:         opp.suggestedBet,
+        savedCappedOpps.map((o) => ({
+          city:                 o.city,
+          outcome:              o.outcome,
+          marketPrice:          o.marketPrice,
+          estimatedProbability: o.estimatedProbability,
+          edge:                 o.edge,
+          multiplier:           o.marketPrice > 0 ? 1 / o.marketPrice : 0,
+          suggestedBet:         o.suggestedBet,
         })),
         new Date()
       ).catch((err) =>

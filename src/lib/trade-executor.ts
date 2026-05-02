@@ -149,41 +149,47 @@ export async function executeBuy(input: BuyInput): Promise<ExecuteBuyResult> {
   let isReal = false;
 
   if (real) {
+    // ── Diagnostic : est-ce un conditionId (0x…) ou un integer Gamma ID ? ──
+    const isConditionId = input.marketId.startsWith("0x") && input.marketId.length > 20;
     console.log(
-      `[trade-executor] DEBUG executeBuy: isReal=${real} ` +
-      `REAL_TRADING_ENABLED=${process.env.REAL_TRADING_ENABLED} ` +
-      `market=${input.marketId} outcome=${input.outcome} bet=${input.suggestedBet}`
+      `[EXEC-BUY] ▶ REAL trade attempt` +
+      ` | market="${input.marketId}" (${isConditionId ? "✅ conditionId hex" : "⚠️ integer Gamma ID — CLOB lookup will fail"})` +
+      ` | outcome=${input.outcome} | bet=$${input.suggestedBet} | REAL_TRADING_ENABLED=${process.env.REAL_TRADING_ENABLED}`
     );
     try {
       // 0. Récupérer les données du marché (nécessaire pour negRisk + token IDs)
+      console.log(`[EXEC-BUY] getClobMarket("${input.marketId}")…`);
       const clobMarket = await getClobMarket(input.marketId);
       if (!clobMarket) {
-        // Marché Gamma non tradable via CLOB — skip silencieux.
-        // Cause probable : m.id est un entier Gamma, pas un conditionId hex.
-        // On throw une ClobSkipError pour que le catch ne spam pas Discord.
+        console.log(
+          `[EXEC-BUY] ❌ getClobMarket returned null — market not found in CLOB.\n` +
+          `  marketId="${input.marketId}" isConditionId=${isConditionId}\n` +
+          `  → Si integer Gamma ID : le champ conditionId est absent de la réponse Gamma\n` +
+          `  → Si conditionId hex : le marché n'est pas sur le CLOB Polymarket`
+        );
         throw new ClobSkipError(`Market not found in CLOB: ${input.marketId}`);
       }
       if (!clobMarket.active) {
+        console.log(`[EXEC-BUY] ❌ Market inactive in CLOB: ${input.marketId}`);
         throw new ClobSkipError(`Market inactive in CLOB: ${input.marketId}`);
       }
+      console.log(
+        `[EXEC-BUY] ✅ getClobMarket OK — negRisk=${clobMarket.negRisk}` +
+        ` tokens=${clobMarket.tokens.map((t) => `${t.outcome}:${t.tokenId.slice(0, 8)}`).join(", ")}`
+      );
 
       // ── Guard 1 : Allowance — déléguée à Polymarket ──────────────────────
-      // L'utilisateur a tradé manuellement sans approve explicite (1 seul popup
-      // "Sign message"). Polymarket gère les approves en interne via son système
-      // de relay. Notre check on-chain vérifie la mauvaise adresse/architecture.
-      // On laisse Polymarket rejeter l'ordre si l'allowance est vraiment absente.
-      console.log("[trade-executor] ℹ️ Allowance check skipped — relying on Polymarket validation");
+      console.log("[EXEC-BUY] Allowance check skipped — relying on Polymarket validation");
 
       // ── Guard 2 : Balance USDC suffisante ─────────────────────────────────
-      // getAccountBalance() retourne null si tous les RPCs échouent.
-      // Dans ce cas on avertit Discord et on continue — Polymarket rejettera
-      // l'ordre côté CLOB si la balance est réellement insuffisante.
+      console.log("[EXEC-BUY] Checking pUSD balance…");
       const balance    = await getAccountBalance();
       const minBalance = input.suggestedBet * 1.05;
+      console.log(`[EXEC-BUY] Balance: ${balance === null ? "null (RPC failed)" : `$${balance.toFixed(2)}`} | required: $${minBalance.toFixed(2)}`);
 
       if (balance === null) {
         console.warn(
-          `[trade-executor] ⚠ Balance check skipped (all RPCs failed) — ` +
+          `[EXEC-BUY] ⚠ Balance check skipped (all RPCs failed) — ` +
           `proceeding, Polymarket will reject if insufficient`
         );
       } else if (balance < minBalance) {
@@ -203,8 +209,10 @@ export async function executeBuy(input: BuyInput): Promise<ExecuteBuyResult> {
         (t) => t.outcome.toLowerCase() === input.outcome.toLowerCase()
       );
       if (!token) throw new Error(`Token introuvable pour outcome "${input.outcome}"`);
+      console.log(`[EXEC-BUY] Token trouvé: ${token.outcome} tokenId=${token.tokenId.slice(0, 16)}…`);
 
-      // 1. Placer l'ordre limit GTC
+      // 1. Placer l'ordre FOK
+      console.log(`[EXEC-BUY] Calling placeOrder FOK BUY $${input.suggestedBet} @ ${input.marketPrice}…`);
       const placed: PlacedOrder = await placeOrder({
         tokenId:    token.tokenId,
         side:       "BUY",
@@ -244,13 +252,17 @@ export async function executeBuy(input: BuyInput): Promise<ExecuteBuyResult> {
       const errMsg = err instanceof Error ? err.message : String(err);
       if (err instanceof ClobSkipError) {
         // Marché non disponible dans CLOB — skip silencieux, pas de Discord.
-        console.log(`[trade-executor] ⏭ [REAL] Skip (no Discord): ${errMsg}`);
+        console.log(`[EXEC-BUY] ⏭ CLOB SKIP (no Discord): ${errMsg}`);
+        console.log(`[EXEC-BUY] ℹ Paper trade créé (is_real=false) — aucun ordre on-chain`);
       } else {
         // Vraie erreur (réseau, signature, balance…) — alerte Discord.
         console.error(
-          `[trade-executor] ❌ [REAL] BUY FAILED: market=${input.marketId} ` +
-          `outcome=${input.outcome} bet=${input.suggestedBet}$ — ${errMsg}`
+          `[EXEC-BUY] ❌ REAL BUY FAILED: market=${input.marketId} ` +
+          `outcome=${input.outcome} bet=$${input.suggestedBet} — ${errMsg}`
         );
+        if (err instanceof Error && err.stack) {
+          console.error(`[EXEC-BUY] Stack: ${err.stack.slice(0, 500)}`);
+        }
         sendDiscordAlert(
           `❌ **REAL TRADE FAILED** — ${input.question.slice(0, 80)}\n` +
           `Outcome: \`${input.outcome}\` · Mise: \`${input.suggestedBet.toFixed(2)}$\`\n` +

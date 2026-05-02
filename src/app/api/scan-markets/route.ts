@@ -355,11 +355,12 @@ export async function GET(): Promise<NextResponse<ScanResult | { status: string;
           marketContext:        cappedOpp.marketContext ?? null,
           potentialPnl:         cappedPotentialPnl,
         });
+        const tradeType = result.isReal ? "✅ REAL on-chain" : "📝 PAPER only (no CLOB order)";
         console.log(
-          `[scan-markets] 🃏 Trade enregistré : ${cappedOpp.marketId}/${cappedOpp.outcome} ` +
+          `[scan-markets] 🃏 ${tradeType} : ${cappedOpp.marketId}/${cappedOpp.outcome} ` +
           `bet=$${cappedOpp.suggestedBet.toFixed(2)} ` +
-          `(paperTradeId=${result.paperTradeId.slice(0, 8)}, positionId=${result.positionId.slice(0, 8)}, ` +
-          `real=${result.isReal})`
+          `(paperTradeId=${result.paperTradeId.slice(0, 8)}, positionId=${result.positionId.slice(0, 8)}` +
+          `${result.orderId ? `, orderId=${result.orderId.slice(0, 12)}` : ""})`
         );
 
         savedCount++;
@@ -403,7 +404,9 @@ export async function GET(): Promise<NextResponse<ScanResult | { status: string;
   // One summary line per scan — no per-skip logs to avoid DB bloat
   if (savedCount > 0) {
     const labels = opps.map((o) => `${o.city ?? o.ticker ?? o.marketId} ${o.outcome}`).join(", ");
-    logActivity("trade", `[${modeLabel}] ${savedCount} trade(s): ${labels}`, logMeta).catch(() => {});
+    // Note: modeLabel = "REAL" means the bot runs in real-trading mode, NOT that orders were placed on-chain.
+    // Each individual trade logs "REAL on-chain" vs "PAPER only" based on result.isReal.
+    logActivity("trade", `[${modeLabel}-MODE] ${savedCount} trade(s): ${labels}`, logMeta).catch(() => {});
   }
   logActivity("info", `[${modeLabel}] Scan complete: ${savedCount} saved, ${skipped.length} skipped`, logMeta).catch(() => {});
 

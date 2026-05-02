@@ -256,7 +256,6 @@ export async function executeBuy(input: BuyInput): Promise<ExecuteBuyResult> {
       if (err instanceof ClobSkipError) {
         // Marché non disponible dans CLOB — skip silencieux, pas de Discord.
         console.log(`[EXEC-BUY] ⏭ CLOB SKIP (no Discord): ${errMsg}`);
-        console.log(`[EXEC-BUY] ℹ Paper trade créé (is_real=false) — aucun ordre on-chain`);
       } else {
         // Vraie erreur (réseau, signature, FAK 0-filled, balance…) — alerte Discord.
         console.error(
@@ -272,7 +271,10 @@ export async function executeBuy(input: BuyInput): Promise<ExecuteBuyResult> {
           `Erreur: \`${errMsg.slice(0, 200)}\``
         ).catch(() => {});
       }
-      // Le paper trade a été créé — isReal reste false, realError propagé au caller
+      // Annuler le paper_trade créé en amont : won=false, potential_pnl=0.
+      // Sans ça, anti-churn verrait won=null + potential_pnl>0 et bloquerait
+      // la ville/date pour les 24h suivantes, empêchant toute nouvelle tentative.
+      await cancelPaperTrade(paperTrade.id, errMsg).catch(() => {});
     }
   }
 
@@ -501,4 +503,28 @@ async function patchRealPosition(positionId: string, orderId: string): Promise<v
   }
 
   console.log(`[trade-executor] 📝 Position ${positionId.slice(0, 8)} — is_real=true, clob_order_id=${orderId}`);
+}
+
+/**
+ * Annule un paper_trade qui n'a jamais produit d'ordre réel.
+ *
+ * Marque won=false + potential_pnl=0 → le filtre anti-churn
+ * (.or("won.is.null,...,and(won.eq.false,potential_pnl.neq.0)"))
+ * l'exclura, permettant une nouvelle tentative sur la même ville/date.
+ *
+ * Appelé quand le real order échoue en real mode, pour que le paper_trade
+ * créé en amont ne bloque pas les scans suivants.
+ */
+async function cancelPaperTrade(id: string, reason: string): Promise<void> {
+  const { getClient } = await import("@/lib/db/supabase");
+  const db = getClient();
+  const { error } = await db
+    .from("paper_trades")
+    .update({ won: false, potential_pnl: 0 })
+    .eq("id", id);
+  if (error) {
+    console.warn(`[trade-executor] cancelPaperTrade(${id}): ${error.message}`);
+  } else {
+    console.log(`[EXEC-BUY] ℹ Paper trade ${id.slice(0, 8)} marqué annulé (won=false, pnl=0) — "${reason.slice(0, 80)}"`);
+  }
 }

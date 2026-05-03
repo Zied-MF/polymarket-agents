@@ -770,6 +770,46 @@ export async function getAccountBalance(): Promise<number | null> {
 }
 
 // ---------------------------------------------------------------------------
+// getTokenBalance — ERC-1155 solde on-chain pour un token Polymarket
+// ---------------------------------------------------------------------------
+
+/** Adresse du contrat Conditional Tokens (ERC-1155) sur Polygon. */
+const CTF_ERC1155_ADDRESS = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045" as `0x${string}`;
+
+const ERC1155_ABI = [
+  {
+    name: "balanceOf", type: "function", stateMutability: "view",
+    inputs:  [{ name: "account", type: "address" }, { name: "id", type: "uint256" }],
+    outputs: [{ type: "uint256" }],
+  },
+] as const;
+
+/**
+ * Lit le solde ERC-1155 d'un token Polymarket pour un holder donné.
+ *
+ * @param holder   Adresse du wallet qui détient les tokens (funder ou EOA)
+ * @param tokenId  Token ID décimal (tel que retourné par getClobMarket().tokens[i].tokenId)
+ * @returns        Nombre de shares (divisé par 10^6)
+ * @throws         Si tous les RPCs échouent
+ */
+export async function getTokenBalance(holder: string, tokenId: string): Promise<number> {
+  const id = BigInt(tokenId);
+  for (const rpc of POLYGON_RPC_FALLBACKS()) {
+    try {
+      const client = createPublicClient({ chain: polygon, transport: http(rpc) });
+      const raw    = await client.readContract({
+        address:      CTF_ERC1155_ADDRESS,
+        abi:          ERC1155_ABI,
+        functionName: "balanceOf",
+        args:         [holder as `0x${string}`, id],
+      }) as bigint;
+      return Number(raw) / USDC_DECIMALS; // shares ont 10^6 décimales comme USDC
+    } catch { /* essayer le prochain RPC */ }
+  }
+  throw new Error(`[clob] getTokenBalance: tous les RPCs ont échoué pour tokenId=${tokenId.slice(0, 12)}…`);
+}
+
+// ---------------------------------------------------------------------------
 // checkCTFAllowance / checkAllAllowances
 // ---------------------------------------------------------------------------
 

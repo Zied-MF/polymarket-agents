@@ -22,6 +22,7 @@ import {
 }                                    from "@/lib/db/supabase";
 import {
   openPosition,
+  updatePosition,
   executeSell as paperExecuteSell,
   markPaperTradeSold,
   type OpenPositionInput,
@@ -32,6 +33,7 @@ import {
   placeOrder,
   cancelOrder,
   getAccountBalance,
+  getTokenBalance,
   OrderbookEmptyError,
   type PlacedOrder,
 }                                    from "@/lib/polymarket/clob-api";
@@ -151,6 +153,10 @@ export async function executeBuy(input: BuyInput): Promise<ExecuteBuyResult> {
   let isReal     = false;
   let realError: string | undefined;
 
+  // Variables pour stocker les vrais fill amounts (lus depuis ERC-1155 après le BUY)
+  let actualSharesFilled: number | undefined;
+  let actualEntryPrice:   number | undefined;
+
   if (real) {
     // ── Diagnostic : est-ce un conditionId (0x…) ou un integer Gamma ID ? ──
     const isConditionId = input.marketId.startsWith("0x") && input.marketId.length > 20;
@@ -246,6 +252,25 @@ export async function executeBuy(input: BuyInput): Promise<ExecuteBuyResult> {
       gasFeeUsdc = placed.gasFeeUsdc;
       isReal     = true;
 
+      // Lire le solde ERC-1155 réel après le fill pour stocker shares_filled
+      // et entry_price exact (= USDC dépensé / shares reçues)
+      const funderAddr = process.env.POLYMARKET_FUNDER_ADDRESS;
+      if (funderAddr) {
+        try {
+          const realShares = await getTokenBalance(funderAddr, token.tokenId);
+          if (realShares > 0) {
+            actualSharesFilled = realShares;
+            actualEntryPrice   = Math.round(input.suggestedBet / realShares * 10000) / 10000;
+            console.log(
+              `[EXEC-BUY] ✅ ERC-1155 balance: ${realShares.toFixed(4)} shares ` +
+              `→ actualEntryPrice=${actualEntryPrice} (vs midPrice=${input.marketPrice})`
+            );
+          }
+        } catch (balErr) {
+          console.warn(`[EXEC-BUY] ⚠ getTokenBalance post-buy échoué (non-bloquant): ${balErr instanceof Error ? balErr.message : balErr}`);
+        }
+      }
+
       console.log(
         `[trade-executor] ✅ [REAL] BUY placed: orderId=${placed.orderId} ` +
         `market=${input.marketId} outcome=${input.outcome} ` +
@@ -315,14 +340,20 @@ export async function executeBuy(input: BuyInput): Promise<ExecuteBuyResult> {
   const position = await openPosition(positionInput);
 
   // Marquer is_real + clob_order_id sur la position si real trade réussi.
-  // Ces deux champs DOIVENT être persistés ensemble : clob_order_id est
-  // indispensable pour que cancelOrder() fonctionne lors du sell réel.
   if (isReal && orderId) {
     await patchRealPosition(position.id, orderId).catch((err) => {
-      // Erreur critique : sans clob_order_id, le sell réel ne pourra pas
-      // annuler l'ordre. On log en erreur (pas warn) et on alerte Discord.
       logRealError(`patchRealPosition(${position.id})`, err);
     });
+  }
+
+  // Mettre à jour shares_filled et entry_price réels si lus depuis ERC-1155
+  if (isReal && actualSharesFilled !== undefined && actualSharesFilled > 0) {
+    await updatePosition(position.id, {
+      sharesFilled: actualSharesFilled,
+      ...(actualEntryPrice !== undefined ? { entryPrice: actualEntryPrice } : {}),
+    }).catch((err) =>
+      console.warn(`[EXEC-BUY] ⚠ updatePosition shares_filled: ${err instanceof Error ? err.message : err}`)
+    );
   }
 
   return {
@@ -361,105 +392,121 @@ export async function executeSell(
 ): Promise<number> {
 
   if (position.isReal) {
+    const GAS_FEE = 0.01;
+
+    // ── Étape 1 : tenter d'annuler l'ordre BUY si encore ouvert (non-bloquant) ─
+    if (position.clobOrderId) {
+      await cancelOrder(position.clobOrderId).catch((err) =>
+        console.log(`[trade-executor] cancelOrder non-bloquant: ${err instanceof Error ? err.message : err}`)
+      );
+    }
+
+    // ── Étape 2 : lire le solde ERC-1155 RÉEL sur la blockchain ───────────────
+    // Évite de tenter de vendre plus de shares qu'on en possède (erreur "balance
+    // insuffisante" systématique quand entry_price DB ≠ prix de fill réel).
+    const funder = process.env.POLYMARKET_FUNDER_ADDRESS;
+    if (!funder) {
+      logRealError("executeSell", new Error("POLYMARKET_FUNDER_ADDRESS non défini"));
+      return paperExecuteSell(position.id, sellPrice, position.entryPrice, position.suggestedBet, reason);
+    }
+
+    let realShares: number | null = null;
+    let sellOrderId: string | undefined;
+    let sellSucceeded = false;
+
     try {
-      const GAS_FEE = 0.01; // estimation 2 tx Polygon (buy + sell)
+      const clobMarket = await getClobMarket(position.marketId);
+      const token      = clobMarket?.tokens.find(
+        (t) => t.outcome.toLowerCase() === position.outcome.toLowerCase()
+      );
 
-      // ── Étape 1 : tenter d'annuler l'ordre BUY si encore ouvert ────────────
-      // Cas : l'ordre limit n'a pas encore été matché (rare avec l'AMM Polymarket).
-      // Échoue silencieusement si déjà FILLED — on continue vers le SELL.
-      if (position.clobOrderId) {
-        await cancelOrder(position.clobOrderId).catch((err) => {
-          console.log(
-            `[trade-executor] cancelOrder non-bloquant (ordre probablement déjà rempli): ` +
-            `${err instanceof Error ? err.message : err}`
-          );
-        });
-      } else {
+      if (!clobMarket || !token) {
         console.warn(
-          `[trade-executor] ⚠ REAL position ${position.id} sans clob_order_id — ` +
-          `cancelOrder ignoré`
+          `[trade-executor] ⚠ Marché/token introuvable dans CLOB pour SELL ` +
+          `(market=${position.marketId} outcome=${position.outcome})`
         );
-      }
+      } else {
+        // Lire le solde réel on-chain
+        try {
+          realShares = await getTokenBalance(funder, token.tokenId);
+        } catch (balErr) {
+          console.warn(`[trade-executor] ⚠ getTokenBalance échoué: ${balErr instanceof Error ? balErr.message : balErr}`);
+        }
 
-      // ── Étape 2 : placer un ordre SELL pour les tokens acquis ───────────────
-      // L'AMM Polymarket remplit les BUY instantanément → tokens dans le wallet.
-      // On les vend au prix courant (sellPrice) via un nouveau limit GTC.
-      //
-      // Calcul du montant :
-      //   shares acquis lors du BUY = suggestedBet / entryPrice
-      //   USDC à recevoir au SELL   = shares × sellPrice
-      let sellOrderId: string | undefined;
-
-      try {
-        const clobMarket = await getClobMarket(position.marketId);
-        const token      = clobMarket?.tokens.find(
-          (t) => t.outcome.toLowerCase() === position.outcome.toLowerCase()
+        const sharesDB = position.sharesFilled ?? (position.suggestedBet / position.entryPrice);
+        console.log(
+          `[trade-executor] SELL pre-flight: outcome=${position.outcome} ` +
+          `realShares=${realShares?.toFixed(4) ?? "unknown"} ` +
+          `sharesDB=${sharesDB.toFixed(4)} ` +
+          `tokenId=${token.tokenId.slice(0, 12)}…`
         );
 
-        if (!clobMarket || !token) {
+        // Shares à vendre : balance réelle (si connue) ou fallback DB
+        const sharesToSell = realShares !== null ? realShares : sharesDB;
+
+        if (sharesToSell < 0.001) {
+          // 0 shares on-chain — soit marché fermé, soit déjà vendu manuellement
           console.warn(
-            `[trade-executor] ⚠ Marché/token introuvable dans CLOB pour SELL ` +
-            `(market=${position.marketId} outcome=${position.outcome}) — SELL on-chain ignoré`
+            `[trade-executor] ⚠ 0 shares on-chain pour position ${position.id.slice(0, 8)} ` +
+            `— skip SELL on-chain (marché fermé ou vendu manuellement)`
           );
+          sendDiscordAlert(
+            `⚠️ **REAL SELL skipped** — 0 shares on-chain\n` +
+            `Position: \`${position.id.slice(0, 8)}\` ${position.question.slice(0, 60)}\n` +
+            `realShares=${realShares?.toFixed(4) ?? "unknown"} — marché fermé ou déjà vendu`
+          ).catch(() => {});
+          sellSucceeded = true; // marquer comme vendu (position vide de toute façon)
         } else {
-          // Shares détenues : calculées depuis le BUY original.
-          // On passe sharesCount directement à placeOrder pour éviter la
-          // reconversion amountUsdc/bestBid (inexacte si Gamma ≠ CLOB bestBid).
-          const sharesHeld     = position.suggestedBet / position.entryPrice;
-          const sellAmountUsdc = Math.round(sharesHeld * sellPrice * 100) / 100;
-
+          const sellAmountUsdc = Math.round(sharesToSell * sellPrice * 100) / 100;
           console.log(
-            `[trade-executor] SELL: ${position.outcome} token=${token.tokenId.slice(0, 12)}… ` +
-            `shares=${sharesHeld.toFixed(4)} entryPrice=${position.entryPrice} ` +
-            `sellPrice(Gamma)=${sellPrice} ≈ $${sellAmountUsdc.toFixed(2)}`
+            `[trade-executor] SELL: ${sharesToSell.toFixed(4)} shares @ ${sellPrice} ≈ $${sellAmountUsdc.toFixed(2)}`
           );
 
-          if (sharesHeld < 0.001) {
-            console.warn(`[trade-executor] ⚠ sharesHeld=${sharesHeld.toFixed(6)} < 0.001 — ordre ignoré (dust)`);
-          } else {
+          try {
             const placed = await placeOrder({
               tokenId:     token.tokenId,
               side:        "SELL",
-              amountUsdc:  sellAmountUsdc,   // pour le log P&L
-              sharesCount: sharesHeld,        // ← shares exactes, pas de reconversion
-              price:       token.price,      // prix CLOB du token (référence pour dry-run)
+              amountUsdc:  sellAmountUsdc,
+              sharesCount: sharesToSell,
+              price:       token.price,
               negRisk:     clobMarket.negRisk,
               dryRun:      false,
             });
-            sellOrderId = placed.orderId;
+            sellOrderId    = placed.orderId;
+            sellSucceeded  = true;
             console.log(
               `[trade-executor] ✅ REAL SELL placed: orderId=${placed.orderId} ` +
-              `shares=${sharesHeld.toFixed(4)} worstPrice=${placed.price} ` +
-              `status=${placed.status}`
+              `shares=${sharesToSell.toFixed(4)} worstPrice=${placed.price} status=${placed.status}`
             );
+          } catch (sellErr) {
+            const msg = sellErr instanceof Error ? sellErr.message : String(sellErr);
+            if (sellErr instanceof OrderbookEmptyError) {
+              console.warn(`[trade-executor] ⚠ SELL orderbook vide: ${msg}`);
+              // Pas de buyers — position marquée sell_failed pour retry
+            } else {
+              console.error(`[trade-executor] ❌ SELL on-chain échoué: ${msg}`);
+              sendDiscordAlert(
+                `❌ **REAL SELL échoué** — position \`${position.id.slice(0, 8)}\`\n` +
+                `${position.question.slice(0, 80)}\n` +
+                `Erreur: \`${msg.slice(0, 200)}\`\n` +
+                `_Réessai au prochain monitor-positions._`
+              ).catch(() => {});
+            }
           }
         }
-      } catch (sellErr) {
-        // SELL on-chain échoué — on continue, le P&L DB reste valide.
-        const msg = sellErr instanceof Error ? sellErr.message : String(sellErr);
-        if (sellErr instanceof OrderbookEmptyError) {
-          // Orderbook vide : pas de buyers — skip silencieux, position marquée vendue en DB.
-          console.warn(`[trade-executor] ⚠ SELL orderbook vide: ${msg}`);
-        } else {
-          // Autre erreur — alerte Discord.
-          console.warn(`[trade-executor] ⚠ SELL on-chain échoué (non-bloquant): ${msg}`);
-          sendDiscordAlert(
-            `⚠️ **REAL SELL on-chain échoué** — position \`${position.id.slice(0, 8)}\`\n` +
-            `Marché: ${position.question.slice(0, 80)}\n` +
-            `Erreur: \`${msg.slice(0, 200)}\`\n` +
-            `_Position marquée vendue en DB. Vérifier manuellement sur Polymarket._`
-          ).catch(() => {});
-        }
       }
+    } catch (err) {
+      logRealError(`executeSell pre-flight(${position.id})`, err);
+    }
 
-      // ── Étape 3 : P&L réel ──────────────────────────────────────────────────
-      const rawPnl  = Math.round(
-        ((sellPrice - position.entryPrice) / position.entryPrice) * position.suggestedBet * 100
-      ) / 100;
-      const sellPnl = Math.round((rawPnl - GAS_FEE) * 100) / 100;
-      const now     = new Date().toISOString();
+    const now    = new Date().toISOString();
+    const rawPnl = Math.round(
+      ((sellPrice - position.entryPrice) / position.entryPrice) * position.suggestedBet * 100
+    ) / 100;
+    const sellPnl = Math.round((rawPnl - GAS_FEE) * 100) / 100;
 
-      // ── Étape 4 : mise à jour DB ────────────────────────────────────────────
+    if (sellSucceeded) {
+      // ── Étape 3 : mise à jour DB → vendu ──────────────────────────────────
       const { getClient: getPosClient } = await import("@/lib/db/supabase");
       const posDb = getPosClient();
       const { error: posErr } = await posDb
@@ -478,15 +525,26 @@ export async function executeSell(
       if (posErr) console.warn(`[trade-executor] updatePositionSold: ${posErr.message}`);
 
       console.log(
-        `[trade-executor] ✅ REAL SELL: ${position.marketId}/${position.outcome} ` +
-        `entry=${position.entryPrice} sell=${sellPrice} pnl=${sellPnl}$ (gas=-${GAS_FEE}$)` +
-        (sellOrderId ? ` sellOrderId=${sellOrderId}` : " [no on-chain sell]")
+        `[trade-executor] ✅ REAL SELL done: entry=${position.entryPrice} sell=${sellPrice} ` +
+        `pnl=${sellPnl}$ (gas=-${GAS_FEE}$)` + (sellOrderId ? ` orderId=${sellOrderId}` : " [0-share skip]")
       );
-
       return sellPnl;
-    } catch (err) {
-      logRealError(`executeSell(${position.id})`, err);
-      // Fallback paper
+    } else {
+      // ── SELL échoué : marquer sell_failed pour retry ────────────────────────
+      const attempts = (position.syncAttempts ?? 0) + 1;
+      await updatePosition(position.id, {
+        status:       "sell_failed",
+        sellReason:   `sell_failed attempt ${attempts}: ${reason}`,
+        syncAttempts: attempts,
+        ...(realShares !== null ? { sharesFilled: realShares } : {}),
+      }).catch((e) => console.warn(`[trade-executor] updatePosition sell_failed: ${e instanceof Error ? e.message : e}`));
+
+      console.warn(
+        `[trade-executor] ⚠ SELL on-chain non confirmé — position marquée sell_failed ` +
+        `(attempt ${attempts}), sera retentée au prochain monitor-positions`
+      );
+      // Retourner 0 pour indiquer que le P&L n'est pas réalisé
+      return 0;
     }
   }
 

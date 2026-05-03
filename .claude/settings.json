@@ -16,7 +16,24 @@
       "Bash(curl -s \"https://gamma-api.polymarket.com/events?tag_slug=crypto&active=true&closed=false&order=endDate&ascending=false&limit=10\")",
       "Bash(curl -s \"https://gamma-api.polymarket.com/events?tag_slug=crypto&active=true&closed=false&order=endDate&ascending=false&limit=100\")",
       "Bash(node -e \"require\\('@anthropic-ai/sdk'\\)\")",
-      "Bash(node -e \"const v = require\\('/Users/ziedfekih/Documents/polymarket-agents/node_modules/viem/package.json'\\); console.log\\(v.version\\)\")"
+      "Bash(node -e \"const v = require\\('/Users/ziedfekih/Documents/polymarket-agents/node_modules/viem/package.json'\\); console.log\\(v.version\\)\")",
+      "Bash(curl -s https://raw.githubusercontent.com/Polymarket/py-clob-client/main/py_clob_client/signing/hmac.py)",
+      "Bash(curl -s https://raw.githubusercontent.com/Polymarket/py-clob-client/main/py_clob_client/signing/model.py)",
+      "Bash(curl -s https://raw.githubusercontent.com/Polymarket/py-clob-client/main/py_clob_client/client.py)",
+      "Bash(curl -s https://raw.githubusercontent.com/Polymarket/py-clob-client/main/py_clob_client/constants.py)",
+      "WebFetch(domain:docs.polymarket.com)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(gh run:*)",
+      "Bash(npm install:*)",
+      "Bash(npm show:*)",
+      "Bash(npm uninstall:*)",
+      "Bash(vercel ls:*)",
+      "Bash(gh api:*)",
+      "Bash(curl -s 'https://lmbifmrpkituiavfkpik.supabase.co/rest/v1/positions?question=ilike.*Jeddah*&select=id,market_id,question,outcome,entry_price,current_price,status,is_real,sold_at,opened_at,peak_pnl_percent&order=opened_at.desc&limit=5' -H 'apikey: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImxtYmlmbXJwa2l0dWlhdmZrcGlrIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3NjExODIzMywiZXhwIjoyMDkxNjk0MjMzfQ.4FHREPHedM5TVEzUJj01FVUgGSAc3OBFDw0PdQxlnJY' -H 'Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImxtYmlmbXJwa2l0dWlhdmZrcGlrIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3NjExODIzMywiZXhwIjoyMDkxNjk0MjMzfQ.4FHREPHedM5TVEzUJj01FVUgGSAc3OBFDw0PdQxlnJY' -H 'Content-Type: application/json')",
+      "Bash(curl -s 'https://gamma-api.polymarket.com/markets?conditionIds=0x511e27a54ec50bf9cc442dcf980293479af2ad71bc1162b1c178e8f83022a39d' -H 'Accept: application/json')",
+      "Bash(curl -s 'https://gamma-api.polymarket.com/events?conditionIds=0x511e27a54ec50bf9cc442dcf980293479af2ad71bc1162b1c178e8f83022a39d' -H 'Accept: application/json')",
+      "Bash(curl -s https://clob.polymarket.com/markets/0x511e27a54ec50bf9cc442dcf980293479af2ad71bc1162b1c178e8f83022a39d -H 'Accept: application/json')",
+      "Bash(python3)"
     ]
   }
 }

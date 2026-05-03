@@ -103,6 +103,10 @@ export interface PositionRow {
   clob_order_id: string | null;
   /** Peak P&L % observé depuis entrée — trailing stop Layer 5. */
   peak_pnl_percent: number | null;
+  /** Nombre réel de shares détenues on-chain après le fill BUY. */
+  shares_filled: number | null;
+  /** Nombre de tentatives de sell échouées. */
+  sync_attempts: number | null;
 }
 
 export type OpenPositionInput = {
@@ -145,6 +149,8 @@ function rowToPosition(row: PositionRow): Position {
     isReal:              row.is_real,
     clobOrderId:         row.clob_order_id,
     peakPnlPercent:      row.peak_pnl_percent,
+    sharesFilled:        row.shares_filled,
+    syncAttempts:        row.sync_attempts,
   };
 }
 
@@ -190,7 +196,7 @@ export async function getOpenPositions(): Promise<Position[]> {
   const { data, error } = await db
     .from("positions")
     .select("*")
-    .in("status", ["open", "hold"])
+    .in("status", ["open", "hold", "sell_failed"])
     .order("opened_at", { ascending: false });
 
   if (error) throw new Error(`[positions][getOpenPositions] ${error.message}`);
@@ -208,6 +214,9 @@ export async function updatePosition(
     status: Position["status"];
     sellReason: string;
     peakPnlPercent: number;
+    sharesFilled: number;
+    syncAttempts: number;
+    entryPrice: number;
   }>
 ): Promise<void> {
   const db = getClient();
@@ -217,6 +226,9 @@ export async function updatePosition(
   if (data.status             !== undefined) patch.status              = data.status;
   if (data.sellReason         !== undefined) patch.sell_reason         = data.sellReason;
   if (data.peakPnlPercent     !== undefined) patch.peak_pnl_percent    = data.peakPnlPercent;
+  if (data.sharesFilled       !== undefined) patch.shares_filled       = data.sharesFilled;
+  if (data.syncAttempts       !== undefined) patch.sync_attempts       = data.syncAttempts;
+  if (data.entryPrice         !== undefined) patch.entry_price         = data.entryPrice;
 
   const { error } = await db.from("positions").update(patch).eq("id", id);
   if (error) throw new Error(`[positions][updatePosition] ${error.message}`);

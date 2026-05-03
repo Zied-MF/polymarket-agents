@@ -34,7 +34,7 @@ export interface Position {
   currentPrice:       number | null;
   currentProbability: number | null;
   suggestedBet:       number;
-  status:             "open" | "hold" | "sell_signal" | "sold" | "resolved";
+  status:             "open" | "hold" | "sell_signal" | "sold" | "resolved" | "sell_failed";
   sellReason:         string | null;
   openedAt:           Date;
   resolutionDate:     Date | null;
@@ -44,6 +44,10 @@ export interface Position {
   isReal?:            boolean | null;
   /** CLOB order ID pour annulation lors du sell réel. */
   clobOrderId?:       string | null;
+  /** Nombre réel de shares détenus on-chain (lu depuis ERC-1155 après le BUY). */
+  sharesFilled?:      number | null;
+  /** Nombre de tentatives de sell échouées (pour retry logic). */
+  syncAttempts?:      number | null;
 }
 
 /** Snapshot des prix actuels d'un marché Polymarket. */

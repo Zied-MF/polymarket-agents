@@ -5,9 +5,11 @@
  *
  * Pipeline :
  *   1. Récupère toutes les positions ouvertes (status = 'open' | 'hold')
- *   2. Pour chaque position, fetch les prix actuels via l'API Gamma
+ *   2. Pour chaque position, fetch les prix actuels :
+ *      - conditionId hex (0x...) → CLOB API (token.price par outcome)
+ *      - integer Gamma ID        → Gamma REST API (legacy positions)
  *   3. Évalue avec evaluatePosition()
- *   4. Sell signal → recordSellSignal() + notification Discord
+ *   4. Sell signal → executeSell() + notification Discord
  *   5. Pas de signal → updatePosition() (mise à jour du prix courant)
  *   6. Retourne le résumé complet
  */
@@ -17,9 +19,32 @@ import { evaluatePosition, type MarketSnapshot } from "@/lib/positions/position-
 import { getOpenPositions, updatePosition, markPaperTradeSold } from "@/lib/db/positions";
 import { executeSell } from "@/lib/trade-executor";
 import { sendSellSignals, type SellSignalNotification } from "@/lib/utils/discord";
+import { getClobMarket } from "@/lib/polymarket/clob-api";
 
 // ---------------------------------------------------------------------------
-// Gamma API — fetch prix actuel d'un marché
+// CLOB API — fetch prix actuel via token.price (pour conditionIds hex)
+// ---------------------------------------------------------------------------
+
+async function fetchSnapshotFromClob(conditionId: string): Promise<MarketSnapshot | null> {
+  try {
+    const market = await getClobMarket(conditionId);
+    if (!market || market.tokens.length === 0) return null;
+    return {
+      marketId:      conditionId,
+      outcomes:      market.tokens.map((t) => t.outcome),
+      outcomePrices: market.tokens.map((t) => t.price),
+    };
+  } catch (err) {
+    console.warn(
+      `[monitor-positions] CLOB fetch échoué pour ${conditionId.slice(0, 16)}… :`,
+      err instanceof Error ? err.message : err
+    );
+    return null;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Gamma API — fetch prix actuel (legacy integer market IDs)
 // ---------------------------------------------------------------------------
 
 const GAMMA_BASE = "https://gamma-api.polymarket.com";
@@ -46,7 +71,7 @@ function parseJsonField<T>(raw: string | T[] | undefined): T[] {
   try { return JSON.parse(raw) as T[]; } catch { return []; }
 }
 
-async function fetchMarketSnapshot(marketId: string): Promise<MarketSnapshot | null> {
+async function fetchSnapshotFromGamma(marketId: string): Promise<MarketSnapshot | null> {
   try {
     const url = `${GAMMA_BASE}/markets/${encodeURIComponent(marketId)}`;
     const res  = await fetch(url, { headers: GAMMA_HEADERS });
@@ -57,6 +82,11 @@ async function fetchMarketSnapshot(marketId: string): Promise<MarketSnapshot | n
     }
 
     const raw: GammaMarket = await res.json();
+    // Gamma returns {"type":"validation error","error":"id is invalid"} for hex conditionIds
+    if ("error" in raw) {
+      console.warn(`[monitor-positions] Gamma error pour ${marketId}: ${(raw as {error:string}).error}`);
+      return null;
+    }
     const outcomes      = parseJsonField<string>(raw.outcomes);
     const pricesStrings = parseJsonField<string>(raw.outcomePrices);
     const outcomePrices = pricesStrings.map(Number);
@@ -71,6 +101,22 @@ async function fetchMarketSnapshot(marketId: string): Promise<MarketSnapshot | n
     );
     return null;
   }
+}
+
+/**
+ * Route principale : choisit CLOB ou Gamma selon le format du marketId.
+ * - conditionId hex (0x + 64 chars) → CLOB
+ * - integer Gamma ID                → Gamma REST
+ */
+async function fetchMarketSnapshot(marketId: string): Promise<MarketSnapshot | null> {
+  const isConditionId = marketId.startsWith("0x") && marketId.length > 20;
+  if (isConditionId) {
+    const snap = await fetchSnapshotFromClob(marketId);
+    if (snap) return snap;
+    // Fallback Gamma (cas edge : conditionId listé sur Gamma aussi)
+    return fetchSnapshotFromGamma(marketId);
+  }
+  return fetchSnapshotFromGamma(marketId);
 }
 
 // ---------------------------------------------------------------------------

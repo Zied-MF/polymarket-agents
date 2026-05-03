@@ -177,9 +177,12 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
         rec.action = "corrected";
         rec.note   = `shares: DB ${sharesDB.toFixed(4)} → real ${realShares.toFixed(4)} (${(delta*100).toFixed(1)}% diff); entry_price: ${pos.entry_price} → ${rec.entryPriceReal}`;
         if (!dryRun) {
+          // Reset peak_pnl_percent : il avait été calculé avec l'ancien entry_price erroné.
+          // Sans reset, Layer 5 (trailing stop) voit un "drop" fantôme et vend immédiatement.
           await db.from("positions").update({
-            shares_filled: realShares,
-            entry_price:   rec.entryPriceReal,
+            shares_filled:    realShares,
+            entry_price:      rec.entryPriceReal,
+            peak_pnl_percent: null,
           }).eq("id", pos.id);
           correctedCount++;
         }

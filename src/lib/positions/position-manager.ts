@@ -4,12 +4,12 @@
  * Ce module est purement fonctionnel (pas d'I/O).
  * Il expose evaluatePosition() qui détermine si une position doit être vendue.
  *
- * 5 layers d'exit (+ grace period) :
+ * 4 layers d'exit (+ grace period) :
  *   Layer 1  — Grace period < 5 min → HOLD toujours
  *   Layer 2  — Hard stop-loss à −50% P&L → SELL critique
  *   Layer 3  — Stop-loss à −25% après 15 min → SELL
  *   Layer 4  — Profit target : 80% edge capturé à < 2h résolution → SELL
- *   Layer 5  — Trailing stop : si peak ≥ +30% et redescend à +15% → SELL
+ *   Layer 5  — SUPPRIMÉ (trailing stop — contre-productif sur marchés binaires météo)
  *   Layer 6  — Time decay : < 1h résolution et P&L < −10% → SELL
  *
  * Colonnes DB optionnelles (amélioration trailing stop) :
@@ -166,18 +166,6 @@ export function evaluatePosition(
       `Profit target : prix=${currentPrice.toFixed(3)} ≥ ${profitTarget.toFixed(3)} (80% edge), résolution dans ${hoursToResolution.toFixed(1)}h`,
       4, "medium"
     );
-  }
-
-  // ── Layer 5 : Trailing stop ─────────────────────────────────────────────
-  const peakPnl = position.peakPnlPercent ?? null;
-  if (peakPnl !== null && peakPnl >= 0.30) {
-    const dropFromPeak = peakPnl - pnlPercent;
-    if (dropFromPeak >= 0.15 && ageMinutes >= 15) {
-      return sell(
-        `Trailing stop : peak=${(peakPnl * 100).toFixed(1)}%, now=${(pnlPercent * 100).toFixed(1)}%, drop=${(dropFromPeak * 100).toFixed(1)}%`,
-        5, "medium"
-      );
-    }
   }
 
   // ── Layer 6 : Time decay — proche de résolution avec position perdante ──

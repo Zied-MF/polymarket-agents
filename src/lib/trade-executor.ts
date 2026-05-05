@@ -253,21 +253,51 @@ export async function executeBuy(input: BuyInput): Promise<ExecuteBuyResult> {
       isReal     = true;
 
       // Lire le solde ERC-1155 réel après le fill pour stocker shares_filled
-      // et entry_price exact (= USDC dépensé / shares reçues)
+      // et entry_price exact (= USDC dépensé / shares reçues).
+      //
+      // Problème timing : la tx Polygon prend ~2-5s pour être confirmée.
+      // Si on lit immédiatement, getTokenBalance retourne 0 → entry_price reste
+      // au mid-price Gamma au lieu du vrai prix de fill.
+      //
+      // Fix : lire le solde AVANT le buy (balanceBefore), puis attendre et
+      // relire jusqu'à 3 fois jusqu'à ce que netShares > 0.
+      // Net = balanceAfter - balanceBefore gère aussi les positions existantes.
       const funderAddr = process.env.POLYMARKET_FUNDER_ADDRESS;
       if (funderAddr) {
         try {
-          const realShares = await getTokenBalance(funderAddr, token.tokenId);
-          if (realShares > 0) {
-            actualSharesFilled = realShares;
-            actualEntryPrice   = Math.round(input.suggestedBet / realShares * 10000) / 10000;
+          // Solde avant le buy (peut être > 0 si position existante sur ce token)
+          const balanceBefore = await getTokenBalance(funderAddr, token.tokenId).catch(() => 0);
+
+          // Retry loop : jusqu'à 3 tentatives, 4s d'intervalle (total max ~12s)
+          let netShares = 0;
+          for (let attempt = 1; attempt <= 3; attempt++) {
+            await new Promise<void>((r) => setTimeout(r, 4000));
+            try {
+              const balanceAfter = await getTokenBalance(funderAddr, token.tokenId);
+              netShares = balanceAfter - balanceBefore;
+              console.log(
+                `[EXEC-BUY] ERC-1155 balance attempt ${attempt}/3: ` +
+                `before=${balanceBefore.toFixed(4)} after=${balanceAfter.toFixed(4)} ` +
+                `net=${netShares.toFixed(4)}`
+              );
+              if (netShares > 0.001) break;
+            } catch (balErr) {
+              console.warn(`[EXEC-BUY] ⚠ getTokenBalance attempt ${attempt} échoué: ${balErr instanceof Error ? balErr.message : balErr}`);
+            }
+          }
+
+          if (netShares > 0.001) {
+            actualSharesFilled = netShares;
+            actualEntryPrice   = Math.round(input.suggestedBet / netShares * 10000) / 10000;
             console.log(
-              `[EXEC-BUY] ✅ ERC-1155 balance: ${realShares.toFixed(4)} shares ` +
+              `[EXEC-BUY] ✅ ERC-1155 net shares: ${netShares.toFixed(4)} ` +
               `→ actualEntryPrice=${actualEntryPrice} (vs midPrice=${input.marketPrice})`
             );
+          } else {
+            console.warn(`[EXEC-BUY] ⚠ netShares=0 après 3 tentatives — entry_price non corrigé`);
           }
         } catch (balErr) {
-          console.warn(`[EXEC-BUY] ⚠ getTokenBalance post-buy échoué (non-bloquant): ${balErr instanceof Error ? balErr.message : balErr}`);
+          console.warn(`[EXEC-BUY] ⚠ getTokenBalance pré-buy échoué (non-bloquant): ${balErr instanceof Error ? balErr.message : balErr}`);
         }
       }
 
@@ -499,10 +529,13 @@ export async function executeSell(
       logRealError(`executeSell pre-flight(${position.id})`, err);
     }
 
-    const now    = new Date().toISOString();
-    const rawPnl = Math.round(
-      ((sellPrice - position.entryPrice) / position.entryPrice) * position.suggestedBet * 100
-    ) / 100;
+    const now = new Date().toISOString();
+    // Utiliser sharesFilled (tokens réels détenus) pour le PnL.
+    // Fallback : suggestedBet / entryPrice si sharesFilled non renseigné.
+    const sharesForPnl = (position.sharesFilled != null && position.sharesFilled > 0)
+      ? position.sharesFilled
+      : position.suggestedBet / position.entryPrice;
+    const rawPnl  = Math.round((sellPrice - position.entryPrice) * sharesForPnl * 100) / 100;
     const sellPnl = Math.round((rawPnl - GAS_FEE) * 100) / 100;
 
     if (sellSucceeded) {

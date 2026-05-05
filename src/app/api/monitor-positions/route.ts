@@ -280,7 +280,7 @@ export async function GET(): Promise<NextResponse<MonitorResult>> {
         status:       "hold",
         action:       "HOLD",
         reason:       `Prix inchangé (${(priceChange * 100).toFixed(2)}% < 1%)`,
-        potentialPnl: Math.round((currentPrice - position.entryPrice) * position.suggestedBet * 100) / 100,
+        potentialPnl: Math.round((currentPrice - position.entryPrice) * (position.sharesFilled ?? position.suggestedBet / position.entryPrice) * 100) / 100,
       });
       continue;
     }
@@ -330,17 +330,20 @@ export async function GET(): Promise<NextResponse<MonitorResult>> {
         errors.push({ positionId: position.id, error: msg });
       }
 
-      discordSignals.push({
-        question:     position.question,
-        outcome:      position.outcome,
-        agent:        position.agent,
-        action:       "SELL",
-        reason:       signal.reason,
-        entryPrice:   signal.entryPrice,
-        currentPrice: signal.currentPrice,
-        potentialPnl: signal.potentialPnl,
-        suggestedBet: position.suggestedBet,
-      });
+      // Notifier Discord uniquement pour les positions réelles
+      if (position.isReal) {
+        discordSignals.push({
+          question:     position.question,
+          outcome:      position.outcome,
+          agent:        position.agent,
+          action:       "SELL",
+          reason:       signal.reason,
+          entryPrice:   signal.entryPrice,
+          currentPrice: signal.currentPrice,
+          potentialPnl: signal.potentialPnl,
+          suggestedBet: position.suggestedBet,
+        });
+      }
 
       positionSummaries.push({
         id:           position.id,
@@ -388,7 +391,7 @@ export async function GET(): Promise<NextResponse<MonitorResult>> {
         action:       "HOLD",
         reason:       null,
         potentialPnl: currentPrice !== null
-          ? Math.round((currentPrice - position.entryPrice) * position.suggestedBet * 100) / 100
+          ? Math.round((currentPrice - position.entryPrice) * (position.sharesFilled ?? position.suggestedBet / position.entryPrice) * 100) / 100
           : null,
       });
     }

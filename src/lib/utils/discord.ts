@@ -99,7 +99,7 @@ function buildEmbed(opp: OpportunityNotification, scannedAt: Date): DiscordEmbed
       },
       {
         name: "💵 Mise suggérée",
-        value: opp.suggestedBet > 0 ? `${opp.suggestedBet.toFixed(2)}€` : "—",
+        value: opp.suggestedBet > 0 ? `${opp.suggestedBet.toFixed(2)}$` : "—",
         inline: true,
       },
     ],
@@ -211,7 +211,7 @@ export async function sendResultsSummary(
       { name: "✅ Wins",       value: String(summary.wins),                  inline: true },
       { name: "❌ Losses",     value: String(summary.losses),                inline: true },
       { name: "🎯 Win Rate",   value: `${winRatePct}%`,                      inline: true },
-      { name: "💰 P&L Total",  value: `${pnlSign}${summary.totalPnL.toFixed(2)}€`, inline: false },
+      { name: "💰 P&L Total",  value: `${pnlSign}${summary.totalPnL.toFixed(2)}$`, inline: false },
     ],
     footer: {
       text: `Vérifié le ${checkedAt.toLocaleString("fr-FR", { timeZone: "UTC", timeZoneName: "short" })}`,
@@ -221,7 +221,7 @@ export async function sendResultsSummary(
   // Embeds détail (un par résultat, max 9 pour rester sous la limite de 10 avec le summary)
   const detailEmbeds: DiscordEmbed[] = summary.details.slice(0, 9).map((d) => {
     const tempStr = `${d.actual.toFixed(1)}°${d.unit}`;
-    const pnlStr  = d.pnl >= 0 ? `+${d.pnl.toFixed(2)}€` : `${d.pnl.toFixed(2)}€`;
+    const pnlStr  = d.pnl >= 0 ? `+${d.pnl.toFixed(2)}$` : `${d.pnl.toFixed(2)}$`;
     return {
       title: `${d.result === "WIN" ? "✅" : "❌"} ${d.city} — ${d.date}`,
       color: d.result === "WIN" ? COLOR_GREEN : COLOR_RED,
@@ -284,13 +284,13 @@ export async function sendSellSignals(
   const COLOR_SWITCH = 0xf39c12; // orange
 
   const embeds: DiscordEmbed[] = signals.map((s) => {
-    const pnlStr   = s.potentialPnl >= 0 ? `+${s.potentialPnl.toFixed(2)}€` : `${s.potentialPnl.toFixed(2)}€`;
+    const pnlStr   = s.potentialPnl >= 0 ? `+${s.potentialPnl.toFixed(2)}$` : `${s.potentialPnl.toFixed(2)}$`;
     const priceStr = `${(s.entryPrice * 100).toFixed(1)}% → ${(s.currentPrice * 100).toFixed(1)}%`;
     const fields: DiscordField[] = [
       { name: "🎯 Outcome", value: s.outcome, inline: true },
       { name: "📉 Prix", value: priceStr, inline: true },
       { name: "💰 P&L potentiel", value: pnlStr, inline: true },
-      { name: "💵 Mise", value: `${s.suggestedBet.toFixed(2)}€`, inline: true },
+      { name: "💵 Mise", value: `${s.suggestedBet.toFixed(2)}$`, inline: true },
       { name: "📋 Raison", value: s.reason, inline: false },
     ];
     if (s.action === "SWITCH" && s.switchToOutcome) {

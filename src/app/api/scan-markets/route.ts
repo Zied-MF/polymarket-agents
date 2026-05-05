@@ -463,8 +463,8 @@ export async function GET(): Promise<NextResponse<ScanResult | { status: string;
       console.error("[scan-markets] ✗ incrementDailyOpportunities :", err instanceof Error ? err.message : err)
     );
 
-    // 3. Notification Discord — bet réel après cap bankroll (pas l'uncapped orchestrator bet)
-    if (savedCappedOpps.length > 0) {
+    // 3. Notification Discord — uniquement pour les trades réels
+    if (savedCappedOpps.length > 0 && isRealTradingEnabled()) {
       sendDiscordNotification(
         savedCappedOpps.map((o) => ({
           city:                 o.city,

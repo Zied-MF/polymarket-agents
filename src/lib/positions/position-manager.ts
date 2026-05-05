@@ -108,7 +108,11 @@ export function evaluatePosition(
     : Infinity;
 
   // P&L si on vend maintenant
-  const potentialPnl = Math.round((currentPrice - entryPrice) * position.suggestedBet * 100) / 100;
+  // shares = nombre réel de tokens détenus (sharesFilled si disponible, sinon calculé depuis entry_price)
+  const shares = (position.sharesFilled != null && position.sharesFilled > 0)
+    ? position.sharesFilled
+    : position.suggestedBet / entryPrice;
+  const potentialPnl = Math.round((currentPrice - entryPrice) * shares * 100) / 100;
 
   // P&L projeté si on garde jusqu'à résolution
   const projectedPnl = Math.round(

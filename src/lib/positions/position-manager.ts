@@ -4,11 +4,11 @@
  * Ce module est purement fonctionnel (pas d'I/O).
  * Il expose evaluatePosition() qui détermine si une position doit être vendue.
  *
- * 4 layers d'exit (+ grace period) :
+ * 3 layers d'exit (+ grace period) :
  *   Layer 1  — Grace period < 5 min → HOLD toujours
  *   Layer 2  — Hard stop-loss à −50% P&L → SELL critique
  *   Layer 3  — Stop-loss à −25% après 15 min → SELL
- *   Layer 4  — Profit target : 80% edge capturé à < 2h résolution → SELL
+ *   Layer 4  — SUPPRIMÉ (profit target — inutile, resolvePosition() ferme à $1.00)
  *   Layer 5  — SUPPRIMÉ (trailing stop — contre-productif sur marchés binaires météo)
  *   Layer 6  — Time decay : < 1h résolution et P&L < −10% → SELL
  *
@@ -155,16 +155,6 @@ export function evaluatePosition(
     return sell(
       `Stop-loss : P&L = ${(pnlPercent * 100).toFixed(1)}% (≤ −25%, age=${Math.round(ageMinutes)}min)`,
       3, "high"
-    );
-  }
-
-  // ── Layer 4 : Profit target — 80% edge capturé proche de résolution ─────
-  // "80% edge capturé" ≈ currentPrice ≥ entryPrice + 0.8 × (1 - entryPrice)
-  const profitTarget = entryPrice + 0.80 * (1 - entryPrice);
-  if (hoursToResolution < 2 && currentPrice >= profitTarget) {
-    return sell(
-      `Profit target : prix=${currentPrice.toFixed(3)} ≥ ${profitTarget.toFixed(3)} (80% edge), résolution dans ${hoursToResolution.toFixed(1)}h`,
-      4, "medium"
     );
   }
 

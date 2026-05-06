@@ -4,13 +4,13 @@
  * Ce module est purement fonctionnel (pas d'I/O).
  * Il expose evaluatePosition() qui détermine si une position doit être vendue.
  *
- * 3 layers d'exit (+ grace period) :
+ * 2 layers d'exit (+ grace period) :
  *   Layer 1  — Grace period < 5 min → HOLD toujours
  *   Layer 2  — Hard stop-loss à −50% P&L → SELL critique
  *   Layer 3  — Stop-loss à −25% après 15 min → SELL
  *   Layer 4  — SUPPRIMÉ (profit target — inutile, resolvePosition() ferme à $1.00)
  *   Layer 5  — SUPPRIMÉ (trailing stop — contre-productif sur marchés binaires météo)
- *   Layer 6  — Time decay : < 1h résolution et P&L < −10% → SELL
+ *   Layer 6  — SUPPRIMÉ (time decay — risque de vendre des gagnants sur du bruit)
  *
  * Colonnes DB optionnelles (amélioration trailing stop) :
  *   ALTER TABLE positions ADD COLUMN IF NOT EXISTS peak_pnl_percent DECIMAL;
@@ -155,14 +155,6 @@ export function evaluatePosition(
     return sell(
       `Stop-loss : P&L = ${(pnlPercent * 100).toFixed(1)}% (≤ −25%, age=${Math.round(ageMinutes)}min)`,
       3, "high"
-    );
-  }
-
-  // ── Layer 6 : Time decay — proche de résolution avec position perdante ──
-  if (hoursToResolution < 1 && pnlPercent < -0.10) {
-    return sell(
-      `Time decay : résolution dans ${(hoursToResolution * 60).toFixed(0)}min, P&L = ${(pnlPercent * 100).toFixed(1)}%`,
-      6, "high"
     );
   }
 

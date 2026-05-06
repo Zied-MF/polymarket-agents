@@ -317,6 +317,37 @@ export async function markPaperTradeSold(paperTradeId: string, sellPnl: number):
 }
 
 /**
+ * Marque une position comme résolue à expiration du marché (prix → 0 ou 1).
+ * Calcule le P&L réel basé sur les shares détenus.
+ *
+ * @param won       true si l'outcome de la position a gagné (prix → 1)
+ * @param sellPnl   P&L réel = (1 − entryPrice) × shares si gagné, −entryPrice × shares si perdu
+ * @param sellPrice 1.0 si gagné, 0.0 si perdu
+ */
+export async function resolvePosition(
+  id:        string,
+  won:       boolean,
+  sellPnl:   number,
+  sellPrice: number
+): Promise<void> {
+  const db  = getClient();
+  const now = new Date().toISOString();
+  const { error } = await db
+    .from("positions")
+    .update({
+      status:              "resolved",
+      sell_reason:         won ? "Marché résolu — WIN" : "Marché résolu — LOSS",
+      sold_at:             now,
+      sell_price:          sellPrice,
+      sell_pnl:            sellPnl,
+      current_price:       sellPrice,
+      current_probability: sellPrice,
+    })
+    .eq("id", id);
+  if (error) throw new Error(`[positions][resolvePosition] ${error.message}`);
+}
+
+/**
  * Retourne la position associée à un paper trade donné.
  * Retourne null si introuvable ou en cas d'erreur (best-effort).
  */

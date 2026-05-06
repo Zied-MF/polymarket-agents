@@ -33,7 +33,7 @@ export const TRADING_MODES: Record<TradingMode, ModeConfig> = {
     yesMaxPrice:   0.15,   // YES seulement < 15¢
     noMinYesPrice: 0.45,   // NO seulement si YES > 45¢
     maxBetPercent: 0.05,   // 5% max du bankroll
-    minEdge:       0.10,   // 10% edge minimum
+    minEdge:       0.25,   // 25% edge minimum (vs CLOB bestAsk — couvre spread bid/ask ~15¢)
     minConfidence: "MEDIUM",
   },
   aggressive: {
@@ -42,7 +42,7 @@ export const TRADING_MODES: Record<TradingMode, ModeConfig> = {
     yesMaxPrice:   0.50,   // YES jusqu'à 50¢
     noMinYesPrice: 0.50,   // NO si YES > 50¢
     maxBetPercent: 0.10,   // 10% max du bankroll
-    minEdge:       0.08,   // 8% edge minimum
+    minEdge:       0.25,   // 25% edge minimum (vs CLOB bestAsk)
     minConfidence: "LOW",
   },
   high_conviction: {
@@ -51,7 +51,7 @@ export const TRADING_MODES: Record<TradingMode, ModeConfig> = {
     yesMaxPrice:   0.15,   // YES seulement < 15¢
     noMinYesPrice: 0.90,   // NO seulement si YES > 90¢ (quasi impossible)
     maxBetPercent: 0.05,   // 5% max
-    minEdge:       0.15,   // 15% edge minimum
+    minEdge:       0.30,   // 30% edge minimum (vs CLOB bestAsk)
     minConfidence: "VERY_HIGH",
   },
 };

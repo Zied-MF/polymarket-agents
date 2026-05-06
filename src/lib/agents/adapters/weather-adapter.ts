@@ -27,6 +27,7 @@ import { fetchMultiModelForecast, calculateMultiModelProbability,
          type MultiModelForecast }                                               from "@/lib/data-sources/multi-model-weather";
 import { TRADING_MODES, getCurrentMode, isConfidenceAtLeast }                   from "@/lib/config/trading-modes";
 import { hasRecentTradeForCityDate }                                             from "@/lib/db/supabase";
+import { getClobMarket, getOrderBook }                                           from "@/lib/polymarket/clob-api";
 import {
   getRecentLessons,
   getConfidenceCalibration,
@@ -322,20 +323,59 @@ export const weatherAdapter: AgentConfig = {
       return { skipReason: reason };
     }
 
+    // === CLOB bestAsk — prix réel d'achat (remplace le mid-price Gamma pour l'edge) ===
+    // Le bestAsk CLOB est ce qu'on paie réellement. Gamma mid-price est ~2× trop bas.
+    let realBuyPrice = best.marketPrice;  // fallback mid-price Gamma
+    let realSpread   = spreadEstimate;    // fallback spread estimé
+    let clobTokenId: string | null = null;
+    if (m.id.startsWith("0x")) {
+      try {
+        const clobMkt = await getClobMarket(m.id);
+        const clobTok = clobMkt?.tokens.find(
+          (t) => t.outcome.toLowerCase() === best.outcome.toLowerCase()
+        );
+        if (clobTok) {
+          clobTokenId = clobTok.tokenId;
+          const book = await getOrderBook(clobTok.tokenId);
+          if (book.bestAsk !== null) {
+            realBuyPrice = book.bestAsk;
+            if (book.spread !== null) realSpread = book.spread;
+            console.log(
+              `${debugPrefix}: 📒 CLOB bestAsk=${book.bestAsk.toFixed(3)} ` +
+              `bid=${book.bestBid?.toFixed(3) ?? "N/A"} spread=${book.spread?.toFixed(3) ?? "N/A"} ` +
+              `(Gamma mid=${best.marketPrice.toFixed(3)})`
+            );
+          } else {
+            console.warn(`${debugPrefix}: ⚠️ CLOB orderbook vide (pas d'ask), fallback Gamma mid`);
+          }
+        }
+      } catch (err) {
+        console.warn(`${debugPrefix}: ⚠️ CLOB orderbook échoué, fallback Gamma mid: ${err instanceof Error ? err.message : err}`);
+      }
+    }
+
+    // Edge calculé sur le vrai prix d'achat CLOB (bestAsk)
+    const realEdge    = round(best.estimatedProbability - realBuyPrice, 4);
+    const realEdgeNet = round(realEdge - realSpread, 4);
+    console.log(
+      `${debugPrefix}: edge CLOB: gross=${(realEdge * 100).toFixed(1)}% net=${(realEdgeNet * 100).toFixed(1)}%` +
+      ` (buy@${(realBuyPrice * 100).toFixed(0)}¢, prob=${(best.estimatedProbability * 100).toFixed(1)}%)`
+    );
+
     // Forte conviction sur YES cheap (< 20¢, forecast > 70%) → STRONG BUY
     let confidenceOverride: "high" | "medium" | "low" | undefined = forecast.confidenceLevel;
-    if (best.outcome === "Yes" && best.marketPrice < 0.20 && best.estimatedProbability > 0.70) {
+    if (best.outcome === "Yes" && realBuyPrice < 0.20 && best.estimatedProbability > 0.70) {
       console.log(
-        `${debugPrefix}: 🎯 STRONG BUY: YES à ${(best.marketPrice * 100).toFixed(0)}¢ ` +
+        `${debugPrefix}: 🎯 STRONG BUY: YES à ${(realBuyPrice * 100).toFixed(0)}¢ ` +
         `avec forecast ${(best.estimatedProbability * 100).toFixed(0)}%`
       );
       confidenceOverride = "high";
     }
 
-    // Filtre edge (mode-based, après spread)
-    if (edgeNet < mode.minEdge) {
-      const reason = `Edge net ${(edgeNet * 100).toFixed(1)}% < ${(mode.minEdge * 100).toFixed(0)}% (mode: ${mode.name})`;
-      console.log(`${debugPrefix}: SKIP: ${reason} (gross=${(best.edge * 100).toFixed(1)}% spread=${(spreadEstimate * 100).toFixed(1)}%)`);
+    // Filtre edge avec prix CLOB réel (mode-based)
+    if (realEdgeNet < mode.minEdge) {
+      const reason = `Edge CLOB net ${(realEdgeNet * 100).toFixed(1)}% < ${(mode.minEdge * 100).toFixed(0)}% (mode: ${mode.name})`;
+      console.log(`${debugPrefix}: SKIP: ${reason} (gross=${(realEdge * 100).toFixed(1)}% buy@${(realBuyPrice * 100).toFixed(0)}¢)`);
       return { skipReason: reason };
     }
 
@@ -501,16 +541,16 @@ export const weatherAdapter: AgentConfig = {
         : "low";
     confidenceOverride = claudeConfidence;
 
-    // Probabilité estimée : préférer l'edge de Claude si fourni
-    const finalEdge  = claudeAnalysis.edgeEstimate ?? best.edge;
-    const finalProb  = round(best.marketPrice + finalEdge, 4);
+    // Probabilité estimée : préférer l'edge de Claude si fourni (calculé sur realBuyPrice)
+    const finalEdge  = claudeAnalysis.edgeEstimate ?? realEdge;
+    const finalProb  = round(realBuyPrice + finalEdge, 4);
 
     return {
       dominated: {
         marketId:             m.id,
         question:             m.question,
         outcome:              targetOutcome,
-        marketPrice:          round(best.marketPrice, 4),
+        marketPrice:          round(realBuyPrice, 4),   // prix CLOB bestAsk (vrai prix d'achat)
         estimatedProbability: Math.min(0.99, Math.max(0.01, finalProb)),
         edge:                 round(finalEdge, 4),
         suggestedBet:         Math.round(adjustedBet * 100) / 100,
@@ -521,15 +561,18 @@ export const weatherAdapter: AgentConfig = {
         targetDate:           m.targetDate.toISOString().slice(0, 10),
         targetDateTime:       m.targetDate.toISOString(),
         marketContext: {
-          liquidity:       m.liquidity,
-          spread_estimate: spreadEstimate,
-          edge_net:        round(edgeNet, 4),
-          all_outcomes:    m.outcomes,
-          all_prices:      m.outcomePrices,
-          station_code:    m.stationCode,
-          measure_type:    m.measureType,
-          unit:            m.unit,
-          timestamp:       new Date().toISOString(),
+          liquidity:        m.liquidity,
+          spread_estimate:  round(realSpread, 4),       // spread CLOB réel (ou estimé si fallback)
+          edge_net:         round(realEdgeNet, 4),      // edge net CLOB
+          gamma_mid_price:  round(best.marketPrice, 4), // mid-price Gamma (archivé pour référence)
+          clob_best_ask:    round(realBuyPrice, 4),     // vrai prix d'achat CLOB
+          clob_token_id:    clobTokenId,                // tokenId pour getOrderBook/executeBuy
+          all_outcomes:     m.outcomes,
+          all_prices:       m.outcomePrices,
+          station_code:     m.stationCode,
+          measure_type:     m.measureType,
+          unit:             m.unit,
+          timestamp:        new Date().toISOString(),
           data_source: {
             provider:      "open-meteo",
             high_temp:     forecast.highTemp,

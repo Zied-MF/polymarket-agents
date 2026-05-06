@@ -16,7 +16,7 @@
 
 import { NextResponse }                          from "next/server";
 import { evaluatePosition, type MarketSnapshot } from "@/lib/positions/position-manager";
-import { getOpenPositions, updatePosition, markPaperTradeSold } from "@/lib/db/positions";
+import { getOpenPositions, updatePosition, markPaperTradeSold, resolvePosition } from "@/lib/db/positions";
 import { executeSell } from "@/lib/trade-executor";
 import { sendSellSignals, type SellSignalNotification } from "@/lib/utils/discord";
 import { getClobMarket } from "@/lib/polymarket/clob-api";
@@ -131,7 +131,7 @@ interface PositionSummary {
   entryPrice: number;
   currentPrice: number | null;
   status: string;
-  action: "SELL" | "SWITCH" | "HOLD" | "NO_DATA";
+  action: "SELL" | "SWITCH" | "HOLD" | "NO_DATA" | "RESOLVED";
   reason: string | null;
   potentialPnl: number | null;
 }
@@ -143,6 +143,7 @@ interface MonitorResult {
   switchSignals: number;
   holds: number;
   noData: number;
+  resolved: number;
   positions: PositionSummary[];
   errors: { positionId: string; error: string }[];
 }
@@ -182,7 +183,7 @@ export async function GET(): Promise<NextResponse<MonitorResult>> {
     return NextResponse.json(
       {
         checkedAt: checkedAt.toISOString(),
-        totalOpen: 0, sellSignals: 0, switchSignals: 0, holds: 0, noData: 0,
+        totalOpen: 0, sellSignals: 0, switchSignals: 0, holds: 0, noData: 0, resolved: 0,
         positions: [],
         errors: [{ positionId: "N/A", error: msg }],
       },
@@ -229,7 +230,68 @@ export async function GET(): Promise<NextResponse<MonitorResult>> {
       continue;
     }
 
-    // 2b. Trouver le prix actuel de l'outcome de la position
+    // 2b. Détection de résolution — un outcome à ≥ 0.99 signifie marché résolu
+    const maxOutcomePrice = Math.max(...snapshot.outcomePrices);
+    if (maxOutcomePrice >= 0.99) {
+      const winningOutcome  = snapshot.outcomes[snapshot.outcomePrices.indexOf(maxOutcomePrice)];
+      const won             = winningOutcome.toLowerCase() === position.outcome.toLowerCase();
+      const resolvedPrice   = won ? 1.0 : 0.0;
+      const shares          = (position.sharesFilled != null && position.sharesFilled > 0)
+        ? position.sharesFilled
+        : position.suggestedBet / position.entryPrice;
+      const sellPnl         = Math.round((resolvedPrice - position.entryPrice) * shares * 100) / 100;
+
+      console.log(
+        `${tag} RESOLVED — outcome gagnant="${winningOutcome}" → ${won ? "WIN" : "LOSS"} ` +
+        `entry=${position.entryPrice.toFixed(3)} shares=${shares.toFixed(3)} ` +
+        `pnl=${sellPnl >= 0 ? "+" : ""}${sellPnl.toFixed(2)}`
+      );
+
+      try {
+        await resolvePosition(position.id, won, sellPnl, resolvedPrice);
+
+        if (position.paperTradeId) {
+          await markPaperTradeSold(position.paperTradeId, sellPnl).catch((err) =>
+            console.error(`${tag} ✗ markPaperTradeSold (résolution) : ${err instanceof Error ? err.message : err}`)
+          );
+        }
+
+        // Notification Discord pour les positions réelles
+        if (position.isReal) {
+          discordSignals.push({
+            question:     position.question,
+            outcome:      position.outcome,
+            agent:        position.agent,
+            action:       "SELL",
+            reason:       won ? "Marché résolu — WIN" : "Marché résolu — LOSS",
+            entryPrice:   position.entryPrice,
+            currentPrice: resolvedPrice,
+            potentialPnl: sellPnl,
+            suggestedBet: position.suggestedBet,
+          });
+        }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error(`${tag} ✗ resolvePosition : ${msg}`);
+        errors.push({ positionId: position.id, error: msg });
+      }
+
+      positionSummaries.push({
+        id:           position.id,
+        question:     position.question,
+        outcome:      position.outcome,
+        agent:        position.agent,
+        entryPrice:   position.entryPrice,
+        currentPrice: resolvedPrice,
+        status:       "resolved",
+        action:       "RESOLVED",
+        reason:       won ? `WIN — ${winningOutcome}` : `LOSS — ${winningOutcome} a gagné`,
+        potentialPnl: sellPnl,
+      });
+      continue;
+    }
+
+    // 2c. Trouver le prix actuel de l'outcome de la position
     const outcomeIdx   = snapshot.outcomes.findIndex(
       (o) => o.toLowerCase() === position.outcome.toLowerCase()
     );
@@ -412,10 +474,11 @@ export async function GET(): Promise<NextResponse<MonitorResult>> {
   const switchSignals = positionSummaries.filter((p) => p.action === "SWITCH").length;
   const holds         = positionSummaries.filter((p) => p.action === "HOLD").length;
   const noData        = positionSummaries.filter((p) => p.action === "NO_DATA").length;
+  const resolved      = positionSummaries.filter((p) => p.action === "RESOLVED").length;
 
   console.log(
     `[monitor-positions] ■ Terminé — ${positions.length} positions : ` +
-    `${sellSignals} SELL, ${switchSignals} SWITCH, ${holds} HOLD, ${noData} NO_DATA, ${errors.length} erreurs`
+    `${resolved} RESOLVED, ${sellSignals} SELL, ${switchSignals} SWITCH, ${holds} HOLD, ${noData} NO_DATA, ${errors.length} erreurs`
   );
 
   return NextResponse.json({
@@ -425,6 +488,7 @@ export async function GET(): Promise<NextResponse<MonitorResult>> {
     switchSignals,
     holds,
     noData,
+    resolved,
     positions:    positionSummaries,
     errors,
   });

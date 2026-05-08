@@ -317,6 +317,48 @@ export async function markPaperTradeSold(paperTradeId: string, sellPnl: number):
 }
 
 /**
+ * Retourne le nombre de positions réelles actuellement ouvertes (is_real=true, status open/hold).
+ * Utilisé par le circuit breaker de positions max simultanées.
+ */
+export async function countOpenRealPositions(): Promise<number> {
+  const db = getClient();
+  const { count, error } = await db
+    .from("positions")
+    .select("id", { count: "exact", head: true })
+    .eq("is_real", true)
+    .in("status", ["open", "hold", "sell_failed"]);
+  if (error) {
+    console.warn(`[positions][countOpenRealPositions] ${error.message}`);
+    return 0; // fail-open
+  }
+  return count ?? 0;
+}
+
+/**
+ * Retourne le P&L total des positions réelles fermées aujourd'hui (UTC).
+ * Utilisé par le circuit breaker journalier.
+ */
+export async function getDailyRealPnl(): Promise<number> {
+  const db      = getClient();
+  const todayUTC = new Date();
+  todayUTC.setUTCHours(0, 0, 0, 0);
+
+  const { data, error } = await db
+    .from("positions")
+    .select("sell_pnl")
+    .eq("is_real", true)
+    .in("status", ["sold", "resolved"])
+    .gte("sold_at", todayUTC.toISOString());
+
+  if (error) {
+    console.warn(`[positions][getDailyRealPnl] ${error.message}`);
+    return 0; // fail-open
+  }
+  const total = (data ?? []).reduce((sum, r) => sum + (Number(r.sell_pnl) || 0), 0);
+  return Math.round(total * 100) / 100;
+}
+
+/**
  * Marque une position comme résolue à expiration du marché (prix → 0 ou 1).
  * Calcule le P&L réel basé sur les shares détenus.
  *

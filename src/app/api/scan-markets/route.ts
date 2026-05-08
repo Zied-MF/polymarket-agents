@@ -31,7 +31,7 @@ import {
 import { cleanOldLogs }                    from "@/lib/logger";
 import { executeBuy, isRealTradingEnabled } from "@/lib/trade-executor";
 import { savePaperTrade }                   from "@/lib/db/supabase";
-import { openPosition }                    from "@/lib/db/positions";
+import { openPosition, countOpenRealPositions, getDailyRealPnl } from "@/lib/db/positions";
 import { getAccountBalance }               from "@/lib/polymarket/clob-api";
 import { MIN_BET_AMOUNT }                  from "@/lib/utils/sizing";
 
@@ -142,6 +142,16 @@ export async function GET(): Promise<NextResponse<ScanResult | { status: string;
   const botState = await getBotState().catch(() => null);
   if (botState && !botState.isRunning) {
     return NextResponse.json({ status: "skipped", reason: "Bot is stopped", state: botState });
+  }
+
+  // Circuit breaker journalier — stop si perte réelle > $4 aujourd'hui
+  if (isRealTradingEnabled()) {
+    const dailyPnl = await getDailyRealPnl().catch(() => 0);
+    if (dailyPnl <= -4) {
+      console.warn(`[scan-markets] 🛑 Circuit breaker journalier : PnL du jour = ${dailyPnl.toFixed(2)}$ ≤ -$4 — scan annulé`);
+      return NextResponse.json({ status: "skipped", reason: `Daily loss limit reached (${dailyPnl.toFixed(2)}$)` });
+    }
+    console.log(`[scan-markets] ✅ Circuit breaker OK : PnL du jour = ${dailyPnl >= 0 ? "+" : ""}${dailyPnl.toFixed(2)}$`);
   }
 
   // Verrou anti-double exécution
@@ -281,6 +291,9 @@ export async function GET(): Promise<NextResponse<ScanResult | { status: string;
     // Opps réellement sauvegardées (après caps), utilisées pour Discord notification.
     const savedCappedOpps: Array<{ city: string; outcome: string; marketPrice: number; estimatedProbability: number; edge: number; suggestedBet: number }> = [];
 
+    // Cap positions simultanées réelles — ne pas ouvrir si déjà 3 positions ouvertes
+    const MAX_OPEN_REAL_POSITIONS = parseInt(process.env.MAX_OPEN_REAL_POSITIONS ?? "3", 10);
+
     for (const opp of toSave) {
       // Champs dérivés non stockés dans Opportunity pour garder l'interface propre
       const stationCode = opp.ticker ?? opp.city ?? "";
@@ -341,6 +354,19 @@ export async function GET(): Promise<NextResponse<ScanResult | { status: string;
         continue;
       }
       console.log(`[scan-markets] ✅ PASS-OPEN-POSITION ${label}/${opp.outcome} openCount=${openCount}`);
+
+      // 2d-bis. Guard : cap global positions réelles simultanées
+      if (isRealTradingEnabled()) {
+        const totalOpenReal = await countOpenRealPositions();
+        if (totalOpenReal >= MAX_OPEN_REAL_POSITIONS) {
+          console.log(
+            `[scan-markets] ⏭ SKIP-MAX-REAL-POSITIONS ${label}/${opp.outcome}: ` +
+            `${totalOpenReal} positions réelles ouvertes (max=${MAX_OPEN_REAL_POSITIONS})`
+          );
+          continue;
+        }
+        console.log(`[scan-markets] ✅ PASS-MAX-REAL ${label}/${opp.outcome} totalOpen=${totalOpenReal}/${MAX_OPEN_REAL_POSITIONS}`);
+      }
 
       // 2e. paper_trade + position (+ ordre CLOB réel si REAL_TRADING_ENABLED)
       // potentialPnl recalculé sur le bet cappé

@@ -1,19 +1,18 @@
 /**
  * Weather Adapter — adaptateur AgentConfig pour le Weather Agent
  *
- * Aligné sur WeatherBot.finance (3 modes via TRADING_MODE env var) :
- *   balanced       — gopfan2, YES < 15¢ seulement, 10% edge min
- *   aggressive     — YES jusqu'à 50¢, 8% edge min
- *   high_conviction — YES < 15¢, 15% edge min, VERY_HIGH confiance
+ * DEUX MODES :
  *
- * Pipeline :
- *   fetchMarkets() → marchés météo filtrés (consensus < 90%, anti-doublon)
- *   fetchData(market) → GFS + Ensemble + Multi-model (ECMWF/UKMO/GFS) en //
- *   analyze(market, data) → filtres mode + accord modèles + edge + Claude → trade
+ * 1. ARBITRAGE (< 4h résolution) — stratégie principale
+ *    Utilise les températures déjà observées aujourd'hui (pas de prévision).
+ *    Si la temp a clairement dépassé le seuil (marge ≥ 5°C), on achète l'outcome
+ *    gagnant. Win rate attendu > 80%. Pas de Claude (résultat déterministe).
+ *
+ * 2. FORECAST (≥ 4h résolution) — stratégie secondaire (filtre strict 35% edge)
+ *    GFS + Ensemble + Multi-model (ECMWF/UKMO/GFS) + Claude validation.
+ *    Edge calculé sur CLOB bestAsk. Très peu de trades passent ce filtre.
  *
  * Anti-churn : une seule position par ville/date (hasRecentTradeForCityDate).
- * Spread estimé en fonction de la liquidité :
- *   ≥ $10 000 → 2 %   |   ≥ $2 000 → 3 %   |   sinon → 4 %
  */
 
 import { fetchAllWeatherMarkets, type WeatherMarket }                           from "@/lib/polymarket/gamma-api";
@@ -28,6 +27,7 @@ import { fetchMultiModelForecast, calculateMultiModelProbability,
 import { TRADING_MODES, getCurrentMode, isConfidenceAtLeast }                   from "@/lib/config/trading-modes";
 import { hasRecentTradeForCityDate }                                             from "@/lib/db/supabase";
 import { getClobMarket, getOrderBook }                                           from "@/lib/polymarket/clob-api";
+import { fetchObservedDayTemps }                                                 from "@/lib/data-sources/weather-observed";
 import {
   getRecentLessons,
   getConfidenceCalibration,
@@ -88,6 +88,233 @@ function estimateSpread(liquidity: number): number {
   if (liquidity >= 10_000) return 0.02;
   if (liquidity >= 2_000)  return 0.03;
   return 0.04;
+}
+
+// ---------------------------------------------------------------------------
+// Arbitrage — seuils de confiance basés sur la marge temp vs seuil
+// ---------------------------------------------------------------------------
+
+/** Marge minimale (°C) entre temp observée et seuil pour trader. */
+const ARB_MIN_MARGIN_C = 5.0;
+
+/** Heure locale minimale pour valider que le max journalier est établi. */
+const ARB_MIN_LOCAL_HOUR_FOR_HIGH = 15;  // 15h00 local = max généralement établi
+const ARB_MIN_LOCAL_HOUR_FOR_LOW  = 8;   // 08h00 local = min overnight établi
+
+/** Edge minimum en mode arbitrage (plus bas que forecast car proba ~0.95). */
+const ARB_MIN_EDGE = 0.10;
+
+/**
+ * Analyse une opportunité d'arbitrage de résolution.
+ * Retourne un AnalyzeResult si l'outcome est clair, null sinon.
+ *
+ * Logique :
+ *   - Fetch les températures observées aujourd'hui (Open-Meteo near-real-time)
+ *   - Si max_so_far > seuil + ARB_MIN_MARGIN_C → outcome YES très probable
+ *   - Si max_so_far < seuil − ARB_MIN_MARGIN_C et heure > 15h → outcome NO très probable
+ *   - Edge calculé sur CLOB bestAsk
+ */
+async function analyzeArbitrage(
+  m:                  WeatherMarket,
+  hoursToResolution:  number
+): Promise<AnalyzeResult> {
+  const tag = `[arb] ${m.city}`;
+
+  const airportStation = getAirportStation(m.city);
+  if (!airportStation) {
+    return { skipReason: `${tag} Coordonnées inconnues` };
+  }
+
+  const targetDateStr = m.targetDate.toISOString().slice(0, 10);
+  const observed = await fetchObservedDayTemps(airportStation.lat, airportStation.lon, targetDateStr);
+
+  if (!observed) {
+    return { skipReason: `${tag} Données observées non disponibles` };
+  }
+
+  // Déterminer quel outcome est gagnant pour chaque outcome du marché
+  for (let i = 0; i < m.outcomes.length; i++) {
+    const outcomeLabel = m.outcomes[i];
+    const marketPrice  = m.outcomePrices[i];
+
+    if (marketPrice < 0.01 || marketPrice > 0.99) continue;
+
+    const parsed = parseOutcomeForMarket(m.question, outcomeLabel);
+    if (!parsed || parsed.type === "unknown") continue;
+
+    // Convertir le seuil du marché en °C (Open-Meteo retourne toujours °C)
+    const toC = (v: number) => isUSCity(m.city) || m.unit === "F" ? (v - 32) * 5 / 9 : v;
+
+    let observedRef: number;  // valeur de référence à comparer (max ou min)
+    let thresholdC:  number;
+    let isHighMeasure: boolean;
+
+    if (m.measureType === "high") {
+      observedRef   = observed.maxSoFar;
+      isHighMeasure = true;
+    } else {
+      observedRef   = observed.minSoFar;
+      isHighMeasure = false;
+    }
+
+    // Vérifier que l'heure locale est suffisamment avancée
+    const minHour = isHighMeasure ? ARB_MIN_LOCAL_HOUR_FOR_HIGH : ARB_MIN_LOCAL_HOUR_FOR_LOW;
+    if (observed.localHour < minHour) {
+      console.log(`${tag} ⏭ Trop tôt (${observed.localHour}h < ${minHour}h) pour ${isHighMeasure ? "high" : "low"}`);
+      return { skipReason: `${tag} Heure locale ${observed.localHour}h < ${minHour}h — max journalier pas encore établi` };
+    }
+
+    let estimatedProbability: number | null = null;
+    let winnerOutcome: string | null = null;
+
+    if (parsed.type === "above" && parsed.threshold != null) {
+      thresholdC = toC(parsed.threshold);
+      const margin = observedRef - thresholdC;
+      if (margin >= ARB_MIN_MARGIN_C) {
+        // Clearly above threshold → this outcome wins
+        estimatedProbability = 0.96;
+        winnerOutcome        = outcomeLabel;
+        console.log(`${tag} 🎯 ABOVE WIN: obs=${observedRef.toFixed(1)}°C > seuil=${thresholdC.toFixed(1)}°C (marge=+${margin.toFixed(1)}°C)`);
+      } else if (-margin >= ARB_MIN_MARGIN_C) {
+        // Clearly below threshold → this outcome loses, skip (the other outcome wins)
+        console.log(`${tag} ⏭ ABOVE LOSS: obs=${observedRef.toFixed(1)}°C << seuil=${thresholdC.toFixed(1)}°C (marge=${margin.toFixed(1)}°C)`);
+        continue;
+      } else {
+        console.log(`${tag} ⏭ Marge insuffisante: obs=${observedRef.toFixed(1)}°C vs seuil=${thresholdC.toFixed(1)}°C (marge=${margin.toFixed(1)}°C < ${ARB_MIN_MARGIN_C}°C)`);
+        return { skipReason: `Marge ${margin.toFixed(1)}°C insuffisante (< ${ARB_MIN_MARGIN_C}°C)` };
+      }
+    } else if (parsed.type === "below" && parsed.threshold != null) {
+      thresholdC = toC(parsed.threshold);
+      const margin = thresholdC - observedRef;
+      if (margin >= ARB_MIN_MARGIN_C) {
+        estimatedProbability = 0.96;
+        winnerOutcome        = outcomeLabel;
+        console.log(`${tag} 🎯 BELOW WIN: obs=${observedRef.toFixed(1)}°C < seuil=${thresholdC.toFixed(1)}°C (marge=+${margin.toFixed(1)}°C)`);
+      } else if (-margin >= ARB_MIN_MARGIN_C) {
+        console.log(`${tag} ⏭ BELOW LOSS: obs=${observedRef.toFixed(1)}°C >> seuil=${thresholdC.toFixed(1)}°C`);
+        continue;
+      } else {
+        console.log(`${tag} ⏭ Marge insuffisante BELOW: ${margin.toFixed(1)}°C < ${ARB_MIN_MARGIN_C}°C`);
+        return { skipReason: `Marge below ${margin.toFixed(1)}°C insuffisante` };
+      }
+    } else {
+      // range / exact / unknown — trop complexe pour l'arbitrage
+      continue;
+    }
+
+    if (estimatedProbability === null || winnerOutcome === null) continue;
+
+    // Anti-churn
+    try {
+      const alreadyOpen = await hasRecentTradeForCityDate(m.city, targetDateStr);
+      if (alreadyOpen) {
+        return { skipReason: `Anti-churn: position déjà ouverte pour ${m.city} le ${targetDateStr}` };
+      }
+    } catch { /* non-bloquant */ }
+
+    // CLOB bestAsk — vrai prix d'achat
+    let realBuyPrice = marketPrice;
+    let clobTokenId: string | null = null;
+    if (m.id.startsWith("0x")) {
+      try {
+        const clobMkt = await getClobMarket(m.id);
+        const clobTok = clobMkt?.tokens.find(
+          (t) => t.outcome.toLowerCase() === winnerOutcome!.toLowerCase()
+        );
+        if (clobTok) {
+          clobTokenId = clobTok.tokenId;
+          const book  = await getOrderBook(clobTok.tokenId);
+          if (book.bestAsk !== null) {
+            realBuyPrice = book.bestAsk;
+            console.log(`${tag} 📒 CLOB bestAsk=${book.bestAsk.toFixed(3)} (Gamma mid=${marketPrice.toFixed(3)})`);
+          }
+        }
+      } catch (err) {
+        console.warn(`${tag} ⚠️ CLOB fetch échoué:`, err instanceof Error ? err.message : err);
+      }
+    }
+
+    const edge    = round(estimatedProbability - realBuyPrice, 4);
+    const spread  = estimateSpread(m.liquidity);
+    const edgeNet = round(edge - spread, 4);
+
+    console.log(`${tag} edge ARBITRAGE: gross=${(edge * 100).toFixed(1)}% net=${(edgeNet * 100).toFixed(1)}% buy@${(realBuyPrice * 100).toFixed(0)}¢`);
+
+    if (edgeNet < ARB_MIN_EDGE) {
+      return { skipReason: `Arbitrage edge net ${(edgeNet * 100).toFixed(1)}% < ${(ARB_MIN_EDGE * 100).toFixed(0)}% (marché déjà pricé, buy@${(realBuyPrice * 100).toFixed(0)}¢)` };
+    }
+
+    // Sizing
+    const currentModeName = _activeScanMode;
+    const mode            = TRADING_MODES[currentModeName];
+    const paperBankroll   = await getCurrentBankroll();
+    const bankroll        = _realBankroll ?? paperBankroll;
+    const inRealMode      = _realBankroll !== null;
+    const sizePercent     = (5 / 10) * mode.maxBetPercent; // taille fixe 5/10 pour arbitrage
+    const kellyBet        = bankroll * sizePercent;
+    const adjustedBet     = calculateBetSize(kellyBet, m.liquidity, bankroll, mode.maxBetPercent);
+
+    if (adjustedBet < MIN_BET_AMOUNT) {
+      return { skipReason: `Bet trop petit: $${adjustedBet.toFixed(2)} < min $${MIN_BET_AMOUNT}` };
+    }
+
+    console.log(
+      `${tag} ✅ ARBITRAGE TRADE: ${winnerOutcome} @${(realBuyPrice * 100).toFixed(0)}¢ ` +
+      `prob=${(estimatedProbability * 100).toFixed(0)}% edge=${(edgeNet * 100).toFixed(1)}% ` +
+      `bet=$${adjustedBet.toFixed(2)} (${hoursToResolution.toFixed(1)}h to resolution)`
+    );
+
+    let paperSuggestedBet: number | undefined;
+    if (inRealMode && paperBankroll > bankroll) {
+      const paperAdjusted = calculateBetSize(paperBankroll * sizePercent, m.liquidity, paperBankroll, mode.maxBetPercent);
+      if (paperAdjusted >= MIN_BET_AMOUNT) paperSuggestedBet = Math.round(paperAdjusted * 100) / 100;
+    }
+
+    return {
+      dominated: {
+        marketId:             m.id,
+        question:             m.question,
+        outcome:              winnerOutcome,
+        marketPrice:          round(realBuyPrice, 4),
+        estimatedProbability: estimatedProbability,
+        edge:                 round(edgeNet, 4),
+        suggestedBet:         Math.round(adjustedBet * 100) / 100,
+        paperSuggestedBet,
+        confidence:           "high",
+        agent:                "weather",
+        city:                 m.city,
+        targetDate:           targetDateStr,
+        targetDateTime:       m.targetDate.toISOString(),
+        marketContext: {
+          liquidity:          m.liquidity,
+          spread_estimate:    round(spread, 4),
+          edge_net:           round(edgeNet, 4),
+          gamma_mid_price:    round(marketPrice, 4),
+          clob_best_ask:      round(realBuyPrice, 4),
+          clob_token_id:      clobTokenId,
+          all_outcomes:       m.outcomes,
+          all_prices:         m.outcomePrices,
+          station_code:       m.stationCode,
+          measure_type:       m.measureType,
+          unit:               m.unit,
+          timestamp:          new Date().toISOString(),
+          arbitrage_mode:     true,
+          observed_max:       observed.maxSoFar,
+          observed_min:       observed.minSoFar,
+          observed_local_hour: observed.localHour,
+          data_source: {
+            provider:      "open-meteo-observed",
+            high_temp:     observed.maxSoFar,
+            low_temp:      observed.minSoFar,
+            confidence:    "high",
+            dynamic_sigma: null,
+          },
+        },
+      },
+    };
+  }
+
+  return { skipReason: `${tag} Aucun outcome clairement gagnant (marge insuffisante ou type non supporté)` };
 }
 
 // ---------------------------------------------------------------------------
@@ -177,6 +404,14 @@ export const weatherAdapter: AgentConfig = {
     if (hoursToResolution < 1) {
       console.log(`[weather-adapter] ⏭ Résolution trop proche: ${Math.round(hoursToResolution * 60)}min — ${m.city}`);
       return { skipReason: "Too close to resolution (< 1h)" };
+    }
+
+    // ── MODE ARBITRAGE (< 4h résolution) ────────────────────────────────────
+    // Stratégie principale : températures déjà observées → outcome déterministe.
+    // Pas de prévision, pas de Claude. Win rate attendu > 80%.
+    if (hoursToResolution <= 4) {
+      console.log(`[weather-adapter] 🔍 MODE ARBITRAGE: ${m.city} (${hoursToResolution.toFixed(1)}h to resolution)`);
+      return analyzeArbitrage(m, hoursToResolution);
     }
 
     // Mode-dependent horizon cap
